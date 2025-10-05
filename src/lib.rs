@@ -33,7 +33,8 @@ fn train_bpe<'py>(
     let in_string = unsafe { std::str::from_utf8_unchecked(in_string.as_bytes()) };
 
     // Train BPE
-    let bpe_train::BPEResult { vocab, merges } = bpe_train::train_bpe(in_string, vocab_size, special_tokens);
+    let bpe_train::BPEResult { vocab, merges } =
+        bpe_train::train_bpe(in_string, vocab_size, special_tokens);
 
     // Convert vocab to Python
     let vocab_py = vocab
@@ -237,7 +238,6 @@ impl RustTokenizer {
     }
 }
 
-
 // #[pyclass]
 // struct Pretokenizer {
 //     filename: String,
@@ -272,12 +272,13 @@ impl PretokenizerIter {
 }
 
 #[pyfunction]
-fn pretokenizer<'py>(
-    text: Bound<'py, PyBytes>,
-) -> PyResult<PretokenizerIter> {
+fn pretokenizer<'py>(text: Bound<'py, PyBytes>) -> PyResult<PretokenizerIter> {
     // let text = text.as_bytes();
     let tokens_iter = pretokenize::pretokenize_as_iter(&[]);
-    Ok(PretokenizerIter { pretokenizer_iter: tokens_iter, bytes: text.into() })
+    Ok(PretokenizerIter {
+        pretokenizer_iter: tokens_iter,
+        bytes: text.into(),
+    })
 }
 
 #[pyfunction]
@@ -298,7 +299,7 @@ fn pretokenized_counts<'py>(
 
 /// A Python module implemented in Rust.
 #[pymodule]
-fn rustsrc<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
+fn toker_rs<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
     // m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
     m.add_class::<RustTokenizer>()?;
     m.add_function(wrap_pyfunction!(train_bpe, m)?)?;

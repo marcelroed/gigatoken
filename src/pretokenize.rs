@@ -1,6 +1,8 @@
+use itertools::Itertools;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::cmp::min;
+use std::hash::Hash;
+use std::{cmp::min, io::BufRead};
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 #[derive(Clone, Debug)]
@@ -49,7 +51,10 @@ impl<'a> UTF8Iterator<'a> {
     }
 
     pub fn replace_bytes<'b>(&self, bytes: &'b [u8]) -> UTF8Iterator<'b> {
-        UTF8Iterator { bytes, pos: self.pos }
+        UTF8Iterator {
+            bytes,
+            pos: self.pos,
+        }
     }
 
     /// Returns the next codepoint as a char (u32) and its length in bytes.
@@ -79,7 +84,8 @@ impl<'a> UTF8Iterator<'a> {
                 _ => StartResult::Nonchar,
             })
         } else {
-            let (next_codepoint, len) = self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
+            let (next_codepoint, len) =
+                self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
             Ok(match next_codepoint.general_category_group() {
                 GeneralCategoryGroup::Letter => StartResult::Letter,
                 GeneralCategoryGroup::Number => StartResult::Number,
@@ -107,13 +113,14 @@ impl<'a> UTF8Iterator<'a> {
                 _ => WhitespaceResult::Neither,
             })
         } else {
-            let (next_codepoint, len) = self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
+            let (next_codepoint, len) =
+                self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
             Ok(match next_codepoint.general_category_group() {
                 GeneralCategoryGroup::Separator => WhitespaceResult::Whitespace(len as u8),
                 _ => {
                     self.pos -= len;
                     WhitespaceResult::Neither
-                },
+                }
             })
         }
     }
@@ -190,7 +197,9 @@ impl<'a> UTF8Iterator<'a> {
                     self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
                 if matches!(
                     next_codepoint.general_category_group(),
-                    GeneralCategoryGroup::Letter | GeneralCategoryGroup::Number | GeneralCategoryGroup::Separator
+                    GeneralCategoryGroup::Letter
+                        | GeneralCategoryGroup::Number
+                        | GeneralCategoryGroup::Separator
                 ) {
                     self.pos -= len;
                     return Ok(()); // We matched a letter or number, so we stop here
@@ -256,13 +265,15 @@ pub fn pretokenize_par(bytes: &[u8]) -> HashMap<&[u8], usize, rustc_hash::FxBuil
         .map(|window| {
             let start = window[0];
             let end = window[1];
-            pretokenize(&bytes[start..end])
+            pretokenize_count(&bytes[start..end])
         })
         .reduce(
-            || HashMap::with_hasher(rustc_hash::FxBuildHasher{}),
+            || HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
             |mut acc, counts| {
-                if acc.is_empty() { return counts; }
-                
+                if acc.is_empty() {
+                    return counts;
+                }
+
                 for (k, v) in counts {
                     *acc.entry(k).or_insert(0) += v;
                 }
@@ -276,16 +287,61 @@ pub fn pretokenize_par(bytes: &[u8]) -> HashMap<&[u8], usize, rustc_hash::FxBuil
     merged_counts
 }
 
-
 /// Return counts of all pretokens.
-pub fn pretokenize(bytes: &[u8]) -> HashMap<&[u8], usize, rustc_hash::FxBuildHasher> {
+pub fn pretokenize_count(bytes: &[u8]) -> HashMap<&[u8], usize, rustc_hash::FxBuildHasher> {
     let iter = pretokenize_as_iter(bytes);
-    let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher{});
+
+    let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
     iter.for_each(|token| {
         hashmap.entry(token).and_modify(|e| *e += 1).or_insert(1);
     });
     hashmap
-    // pretokenize_as_iter(bytes).counts()
+}
+
+pub fn count_pretokens<'a>(
+    pretoken_iter: impl Iterator<Item = &'a [u8]>,
+) -> HashMap<&'a [u8], usize, rustc_hash::FxBuildHasher> {
+    let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+    pretoken_iter.for_each(|token| {
+        hashmap.entry(token).and_modify(|e| *e += 1).or_insert(1);
+    });
+    hashmap
+}
+
+pub fn count_pretokens_weighted<'a>(
+    pretoken_weight_iter: impl Iterator<Item = (&'a [u8], usize)>,
+) -> HashMap<&'a [u8], usize, rustc_hash::FxBuildHasher> {
+    let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+    pretoken_weight_iter.for_each(|(token, weight)| {
+        hashmap
+            .entry(token)
+            .and_modify(|e| *e += weight)
+            .or_insert(weight);
+    });
+    hashmap
+}
+
+pub fn pretokenize_doc_iterable<'a>(
+    docs: impl Iterator<Item = &'a [u8]>,
+) -> impl Iterator<Item = &'a [u8]> {
+    docs.flat_map(|doc| pretokenize_as_iter(doc.as_ref()))
+}
+
+pub fn pretokenize_with_endoftext(
+    bytes: &[u8],
+) -> HashMap<&[u8], usize, rustc_hash::FxBuildHasher> {
+    let string = unsafe { std::str::from_utf8_unchecked(bytes) };
+
+    let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+
+    string
+        .split("<|endoftext|>")
+        .flat_map(|part| pretokenize_as_iter(part.as_bytes()))
+        .for_each(|token| {
+            hashmap.entry(token).and_modify(|e| *e += 1).or_insert(1);
+        });
+
+    hashmap
 }
 
 pub struct PretokenizerIter<'a> {
@@ -342,7 +398,8 @@ impl<'a> Iterator for PretokenizerIter<'a> {
                     Ok(WhitespaceResult::AsciiSpace) => PretokenizerState::AsciiSpace,
                     Ok(WhitespaceResult::Whitespace(wslen)) => PretokenizerState::Whitespace(wslen),
                     Ok(WhitespaceResult::Neither) => {
-                        let saved_token = &self.iter.bytes[self.starting..self.iter.pos - (prev_wslen as usize)];
+                        let saved_token =
+                            &self.iter.bytes[self.starting..self.iter.pos - (prev_wslen as usize)];
                         self.starting = self.iter.pos - (prev_wslen as usize);
                         if saved_token.is_empty() {
                             PretokenizerState::Save
@@ -397,7 +454,8 @@ impl<'a> PretokenizerIter<'a> {
     }
 }
 
-impl PretokenizerIter<'static> {  // If we contain a 'static, assume it's a dummy
+impl PretokenizerIter<'static> {
+    // If we contain a 'static, assume it's a dummy
     pub fn py_next<'a>(&mut self, bytes: &'a [u8]) -> Option<&'a [u8]> {
         let mut py_self = self.replace_bytes(bytes);
         let result = py_self.next();
@@ -405,7 +463,6 @@ impl PretokenizerIter<'static> {  // If we contain a 'static, assume it's a dumm
         result
     }
 }
-
 
 pub fn pretokenize_as_iter<'a>(bytes: &'a [u8]) -> PretokenizerIter<'a> {
     PretokenizerIter {
@@ -425,7 +482,7 @@ mod test {
 
     use super::*;
 
-        #[test]
+    #[test]
     fn test_pretokenizer_ts_timing() {
         let file_bytes = fs::read(
             "/home/marcel/projects/spring2024-assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
@@ -444,20 +501,20 @@ mod test {
             r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
             // onig::RegexOptions::REGEX_OPTION_NONE,
             // onig::Syntax::oniguruma(),
-        ).unwrap();
+        )
+        .unwrap();
         // let re = Regex::new(r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
         //     .unwrap();
         let input = fs::read(
             "/home/marcel/projects/spring2024-assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
-        ).unwrap();
+        )
+        .unwrap();
 
         // let input = input[..10_000_000].to_vec();
-
 
         // let pretokens = pretokenize_as_list(&input);
         // let mut last_match: Option<(usize, usize)> = None;
         for _ in (0..100).progress() {
-
             let mut previous_tokens: Vec<(String, String)> = vec![];
 
             const WINDOW_SIZE: usize = 1_000_000;
@@ -470,9 +527,12 @@ mod test {
                     itertools::EitherOrBoth::Both(first, second) => (first, second),
                     itertools::EitherOrBoth::Left(first) => panic!(
                         "No match found for token {token_idx} at bytes {first:?}, {:?}, {:?}",
-                        str::from_utf8(&input[input.len().saturating_sub(10)..]).unwrap(), &previous_tokens[previous_tokens.len().saturating_sub(10)..]
+                        str::from_utf8(&input[input.len().saturating_sub(10)..]).unwrap(),
+                        &previous_tokens[previous_tokens.len().saturating_sub(10)..]
                     ),
-                    itertools::EitherOrBoth::Right(second) => panic!("No token found for match {token_idx} at byte {second:?}"),
+                    itertools::EitherOrBoth::Right(second) => {
+                        panic!("No token found for match {token_idx} at byte {second:?}")
+                    }
                 };
                 // last_match = Some((start, end));
                 // let (&token, (start, end)) = eorb.both().unwrap();
@@ -482,21 +542,27 @@ mod test {
                 // if pretokens.len() > 1000 {
                 //     pretokens.truncate(1000);
                 // }
-                assert_eq!(token_str, match_str, "Token {token_idx} (byte {start}) does not match regex, see last few {:?}\n Byte representation: {:02X?}{:02X?}\nExtended{:02X?}", &previous_tokens[previous_tokens.len().saturating_sub(10)..], token, &input[start..end], &input[start.saturating_sub(5)..end+5]);
+                assert_eq!(
+                    token_str,
+                    match_str,
+                    "Token {token_idx} (byte {start}) does not match regex, see last few {:?}\n Byte representation: {:02X?}{:02X?}\nExtended{:02X?}",
+                    &previous_tokens[previous_tokens.len().saturating_sub(10)..],
+                    token,
+                    &input[start..end],
+                    &input[start.saturating_sub(5)..end + 5]
+                );
             }
         }
-        
     }
 
     #[test]
     fn test_pretokenizer_ts() {
-        let file_bytes = fs::read(
-            "/home/marcel/projects/spring2024-assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
-        )
-        .unwrap();
+        let file_bytes = fs::read("../../data/TinyStoriesV2-GPT4-train.txt").unwrap();
 
         // let pretokenized_counts = pretokenize_par(&file_bytes);
-        let pretokenized_counts = pretokenize_as_iter(&file_bytes).progress_count(644752805).counts();
+        let pretokenized_counts = pretokenize_as_iter(&file_bytes)
+            .progress_count(644752805)
+            .counts();
         eprintln!("Pretokenized {} tokens", pretokenized_counts.len());
         // eprintln!("Pretokenized counts: {:?}", pretokenized_counts);
         // Print counts sorted by frequency
@@ -516,7 +582,9 @@ mod test {
         .unwrap();
 
         // let pretokenized_counts = pretokenize_par(&file_bytes);
-        let pretokens = pretokenize_as_iter(&file_bytes).progress_count(644752805).count();
+        let pretokens = pretokenize_as_iter(&file_bytes)
+            .progress_count(644752805)
+            .count();
         eprintln!("Pretokenized {} tokens", pretokens);
     }
 
@@ -531,32 +599,40 @@ mod test {
         let pretokens_count = pretokenize_as_iter(&file_bytes).count();
         eprintln!("Pretokenized {pretokens_count} tokens");
         // Check that the total length of all tokens is equal to the input length
-        assert_eq!(pretokens_count, 544752805, "Total number of pretokens does not match expected count");
+        assert_eq!(
+            pretokens_count, 544752805,
+            "Total number of pretokens does not match expected count"
+        );
     }
 
     #[test]
     fn test_pretokenizer_owt_length() {
-        let file_bytes = fs::read(
-            "/home/marcel/projects/spring2024-assignment1-basics/data/owt_train.txt",
-        )
-        .unwrap();
+        let file_bytes =
+            fs::read("/home/marcel/projects/spring2024-assignment1-basics/data/owt_train.txt")
+                .unwrap();
 
         let pretokens_count = pretokenize_as_iter(&file_bytes).count();
         eprintln!("Pretokenized {pretokens_count} tokens");
         // Check that the total length of all tokens is equal to the input length
         // assert_eq!(pretokens_count, 544752805, "Total number of pretokens does not match expected count");
-        assert_eq!(pretokens_count, 123456789, "Total number of pretokens does not match expected count");
+        assert_eq!(
+            pretokens_count, 123456789,
+            "Total number of pretokens does not match expected count"
+        );
     }
 
     #[test]
     fn minimal_tokenization() {
         let input = vec![0x74, 0x75, 0x72, 0x65, 0x73, 0x2E, 0xC2, 0xA0, 0x0A, 0x4F];
         let pretokens: Vec<_> = pretokenize_as_iter(&input).collect();
-        let re = Regex::new(
-            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
-        ).unwrap();
+        let re =
+            Regex::new(r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
+                .unwrap();
 
-        for (&token, (start, end)) in pretokens.iter().zip(re.find_iter(str::from_utf8(&input).unwrap())) {
+        for (&token, (start, end)) in pretokens
+            .iter()
+            .zip(re.find_iter(str::from_utf8(&input).unwrap()))
+        {
             let token_str = String::from_utf8_lossy(token).into_owned();
             let match_str = String::from_utf8_lossy(&input[start..end]).into_owned();
             assert_eq!(token_str, match_str, "Token does not match regex");
