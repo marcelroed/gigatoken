@@ -1,4 +1,5 @@
 use indicatif::{ProgressBar, ProgressIterator};
+use itertools::Itertools;
 use rayon::prelude::*;
 use std::cmp::min;
 use std::collections::HashMap;
@@ -7,6 +8,7 @@ use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::bpe_train::PretokenizeableSpec;
 mod pretokenize_traits;
+mod simd;
 
 #[derive(Clone, Debug)]
 pub enum PretokenizerState {
@@ -238,10 +240,10 @@ impl<'a> UTF8Iterator<'a> {
     }
 }
 
-fn find_boundaries(bytes: &[u8]) -> Vec<usize> {
+pub fn find_boundaries(bytes: &[u8]) -> Vec<usize> {
     fn advance_to_boundary(input: &[u8]) -> usize {
-        for (i, b) in input.iter().enumerate() {
-            if *b == b'>' {
+        for (i, (first, second)) in input.iter().tuple_windows().enumerate() {
+            if matches!((first, second), (b'.', b' ')) {
                 return i + 1;
             }
         }
@@ -312,7 +314,7 @@ pub fn pretokenize_par_parquet(
 
     let length = df.select([len()]).collect().unwrap();
     let length_value = length.get(0).unwrap();
-    let length_value = length_value.get(0).unwrap();
+    let length_value = length_value.first().unwrap();
     let length_value = match length_value {
         AnyValue::UInt32(v) => *v,
         _ => panic!("Unexpected length value type"),
@@ -429,7 +431,7 @@ pub fn count_pretokens_weighted<'a>(
 pub fn pretokenize_doc_iterable<'a>(
     docs: impl Iterator<Item = &'a [u8]>,
 ) -> impl Iterator<Item = &'a [u8]> {
-    docs.flat_map(|doc| pretokenize_as_iter(doc.as_ref()))
+    docs.flat_map(|doc| pretokenize_as_iter(doc))
 }
 
 pub fn pretokenize_with_endoftext(
@@ -578,28 +580,36 @@ pub fn pretokenize_as_iter<'a>(bytes: &'a [u8]) -> PretokenizerIter<'a> {
     }
 }
 
+struct Pretokenizer {
+    special_tokens: Vec<(Vec<u8>, u32)>, // Split on these tokens, keep them in the stream
+}
+
+impl Pretokenizer {
+    pub fn new(special_tokens: Vec<(Vec<u8>, u32)>) -> Self {
+        Pretokenizer { special_tokens }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use indicatif::ProgressIterator;
     use itertools::Itertools;
-    // use onig::Regex;
-    use rand::prelude::*;
     use std::fs;
 
     use super::*;
 
-    #[test]
-    fn test_pretokenizer_ts_timing() {
-        let file_bytes = fs::read(
-            "/home/marcel/projects/spring2024-assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
-        )
-        .unwrap();
+    // #[test]
+    // fn test_pretokenizer_ts_timing() {
+    //     let file_bytes = fs::read(
+    //         "/home/marcel/projects/spring2024-assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
+    //     )
+    //     .unwrap();
 
-        let pretokenized_counts = pretokenize_par(&file_bytes);
-        eprintln!("Pretokenized {} tokens", pretokenized_counts.len());
-        // eprintln!("Pretokenized counts: {:?}", pretokenized_counts);
-        // Print counts sorted by frequency
-    }
+    //     let pretokenized_counts = pretokenize_par(&file_bytes);
+    //     eprintln!("Pretokenized {} tokens", pretokenized_counts.len());
+    //     // eprintln!("Pretokenized counts: {:?}", pretokenized_counts);
+    //     // Print counts sorted by frequency
+    // }
 
     // #[test]
     // fn test_pretokenizer_matches_regex() {

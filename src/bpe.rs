@@ -6,7 +6,7 @@ use crate::{
     bpe_train::PretokenizeableSpec,
     pretokenize::{find_boundaries, pretokenize_as_iter},
 };
-use std::{borrow::Borrow, collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, rc::Rc};
 
 // pub fn encode_par(pretokenizeable: PretokenizeableSpec) {
 //     match pretokenizeable {
@@ -68,10 +68,10 @@ impl ByteRemapping {
 
 pub struct Tokenizer {
     merges: HashMap<(u32, u32), u32>, // Maps pairs of token ids to merged token id
-    vocab: Vec<Arc<[u8]>>,            // Maps token ids to byte sequences
-    vocab_inv: HashMap<Arc<[u8]>, u32>, // Maps byte sequences to token ids
+    vocab: Vec<Rc<[u8]>>,             // Maps token ids to byte sequences
+    vocab_inv: HashMap<Rc<[u8]>, u32>, // Maps byte sequences to token ids
     byte_remapping: Option<ByteRemapping>, // Remaps bytes, because some tokenizers do this for some reason
-    pretoken_cache: DashMap<Arc<[u8]>, Arc<[u32]>, rustc_hash::FxBuildHasher>,
+    pretoken_cache: HashMap<Rc<[u8]>, Rc<[u32]>, rustc_hash::FxBuildHasher>,
 }
 
 /// Tokenize a single pretoken by repeatedly applying BPE merges in order.
@@ -103,14 +103,14 @@ impl Tokenizer {
         vocab: Vec<Vec<u8>>,
         byte_remapping: Option<ByteRemapping>,
     ) -> Self {
-        let vocab = vocab.into_iter().map(Into::into).collect::<Vec<Arc<_>>>();
+        let vocab = vocab.into_iter().map(Into::into).collect::<Vec<Rc<_>>>();
         let vocab_inv = vocab.iter().cloned().zip(0..).collect();
         Tokenizer {
             merges,
             vocab_inv,
             vocab,
             byte_remapping,
-            pretoken_cache: DashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
         }
     }
 
@@ -119,10 +119,7 @@ impl Tokenizer {
     /// There are a few exceptions to this being correct, so make sure that this is only used on tokenizers that don't package merges.
     pub fn from_ranks(vocab: Vec<Vec<u8>>) -> Result<Self, String> {
         let mut merges = HashMap::new();
-        let vocab = vocab
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<Arc<[u8]>>>();
+        let vocab = vocab.into_iter().map(Into::into).collect::<Vec<Rc<[u8]>>>();
         let vocab_inv = vocab.iter().cloned().zip(0..).collect::<HashMap<_, u32>>();
 
         for (token_idx, token_bytes) in vocab.iter().cloned().enumerate() {
@@ -143,13 +140,17 @@ impl Tokenizer {
             byte_remapping: ByteRemapping::from_byte_vocab(&vocab)?,
             vocab,
             vocab_inv,
-            pretoken_cache: DashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
         })
     }
 
-    pub fn encode_pretoken(&self, pretoken: &[u8]) -> Vec<u32> {
+    pub fn encode_pretoken(
+        byte_remapping: &Option<ByteRemapping>,
+        merges: &HashMap<(u32, u32), u32>,
+        pretoken: &[u8],
+    ) -> Vec<u32> {
         // TODO improve
-        let pretoken = if let Some(byte_remapping) = &self.byte_remapping {
+        let pretoken = if let Some(byte_remapping) = &byte_remapping {
             pretoken
                 .iter()
                 .map(|&b| byte_remapping.mapping[b as usize])
@@ -157,18 +158,21 @@ impl Tokenizer {
         } else {
             pretoken.to_vec()
         };
-        simple_bpe_merge(&self.merges, &pretoken)
+        simple_bpe_merge(&merges, &pretoken)
     }
 
     /// For each pretoken in the input iterator, looks up the string in the cache, and if not found, encodes it and inserts it into the cache.
     pub fn memoized_encode<'i>(
-        &self,
+        &mut self,
         pretoken_iter: impl Iterator<Item = &'i [u8]>,
-    ) -> impl Iterator<Item = Arc<[u32]>> {
+    ) -> impl Iterator<Item = Rc<[u32]>> {
+        let pretoken_cache = &mut self.pretoken_cache;
         pretoken_iter.map(|pretoken: &[u8]| {
-            self.pretoken_cache
+            pretoken_cache
                 .entry(pretoken.into())
-                .or_insert_with(|| self.encode_pretoken(pretoken).into())
+                .or_insert_with(|| {
+                    Self::encode_pretoken(&self.byte_remapping, &self.merges, pretoken).into()
+                })
                 .clone()
         })
     }
@@ -248,7 +252,7 @@ pub fn load_tiktoken(file_path: impl AsRef<Path>) -> Result<Tokenizer, String> {
 //         .for_each(|(start, end)| {
 //             let slice = &bytes[start..end];
 //             pretokenize_as_iter(slice).for_each(|token| {
-//                 pretoken_mapping.entry(token).or_insert_with(|| Arc::new(token));
+//                 pretoken_mapping.entry(token).or_insert_with(|| Rc::new(token));
 //             })
 //         });
 // }
