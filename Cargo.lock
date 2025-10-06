@@ -3441,6 +3441,7 @@ name = "tokers"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "base64",
  "dashmap",
  "indicatif",
  "itertools",

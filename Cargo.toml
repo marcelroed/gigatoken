@@ -25,6 +25,7 @@ parquet = "56.2.0"
 arrow = "56.2.0"
 polars = { version = "0.51.0", features = ["lazy", "parquet"] }
 memmap2 = { version = "0.9.8", features = ["stable_deref_trait"] }
+base64 = "0.22.1"
 
 [profile.release]
 # lto = "fat"

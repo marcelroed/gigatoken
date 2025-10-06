@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "toker"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -31,10 +31,16 @@ cache-keys = [
 
 [dependency-groups]
 dev = [
+    "altair>=5.4.1",
     "ipython>=8.12.3",
+    "marimo>=0.8.22",
+    "matplotlib>=3.7.5",
     "polars>=1.8.2",
+    "protobuf>=5.29.5",
     "pytest>=8.3.5",
     "rich>=14.1.0",
+    "tiktoken>=0.7.0",
     "tokenizers>=0.21.0",
     "tqdm>=4.67.1",
+    "transformers>=4.17.0",
 ]
