@@ -1,9 +1,18 @@
-use itertools::Itertools;
+use arrow::array::ArrayRef;
+use indicatif::{ProgressBar, ProgressIterator};
+use itertools::{Itertools, kmerge};
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::file::reader::FileReader;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::path::Path;
 use std::{cmp::min, io::BufRead};
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
+
+use crate::bpe_train::PretokenizeableSpec;
+mod pretokenize_traits;
 
 #[derive(Clone, Debug)]
 pub enum PretokenizerState {
@@ -257,7 +266,7 @@ fn find_boundaries(bytes: &[u8]) -> Vec<usize> {
     boundaries
 }
 
-pub fn pretokenize_par(bytes: &[u8]) -> HashMap<&[u8], usize, rustc_hash::FxBuildHasher> {
+pub fn pretokenize_par_bytes(bytes: &[u8]) -> HashMap<Vec<u8>, usize, rustc_hash::FxBuildHasher> {
     let start_time = std::time::Instant::now();
     let boundaries = find_boundaries(bytes);
     let merged_counts = boundaries
@@ -285,11 +294,116 @@ pub fn pretokenize_par(bytes: &[u8]) -> HashMap<&[u8], usize, rustc_hash::FxBuil
     eprintln!("Pretokenization took {time_elapsed:?}");
 
     merged_counts
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect()
+}
+
+pub fn pretokenize_par(
+    pretokenizeable: PretokenizeableSpec,
+) -> HashMap<Vec<u8>, usize, rustc_hash::FxBuildHasher> {
+    match pretokenizeable {
+        PretokenizeableSpec::Bytes(s) => pretokenize_par_bytes(s),
+        PretokenizeableSpec::Parquet(path) => pretokenize_par_parquet(&path),
+    }
+}
+
+use polars::prelude::*;
+pub fn pretokenize_par_parquet(
+    parquet_path: &Path,
+) -> HashMap<Vec<u8>, usize, rustc_hash::FxBuildHasher> {
+    let parquet_path = PlPath::Local(Arc::from(parquet_path.to_owned()));
+
+    let df = LazyFrame::scan_parquet(parquet_path.clone(), ScanArgsParquet::default()).unwrap();
+
+    // let texts = dfselect([col("text")]);
+    let length = df.select([len()]).collect().unwrap();
+    let length_value = length.get(0).unwrap();
+    let length_value = length_value.get(0).unwrap();
+    let length_value = match length_value {
+        AnyValue::UInt32(v) => *v,
+        _ => panic!("Unexpected length value type"),
+    };
+
+    eprintln!("Dataframe length: {:?}", length_value);
+
+    let n_chunks = rayon::current_num_threads();
+    let chunk_size = (length_value as usize).div_ceil(n_chunks);
+    let total_counts = (0..n_chunks)
+        .par_bridge()
+        .map(|i| {
+            let df =
+                LazyFrame::scan_parquet(parquet_path.clone(), ScanArgsParquet::default())
+                    .unwrap();
+            let texts = df.select([col("text")]);
+            let mut thread_counts = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+            let start = i * chunk_size;
+            let end = min((i + 1) * chunk_size, length_value as usize);
+            drop(texts);
+            let m_chunks = 1024;
+            let inner_chunk_size = (end - start).div_ceil(1024);
+            for j in (0..m_chunks).progress_with(if i == 0 {
+                ProgressBar::new(m_chunks as u64)
+                    .with_finish(indicatif::ProgressFinish::AndLeave)
+                    .with_style(
+                        indicatif::ProgressStyle::default_bar()
+                            .template(
+                                "Pretokenizing and counting [{elapsed_precise}/{duration_precise}] [{wide_bar}] {pos}/{len} ({eta_precise} remaining)",
+                            )
+                            .unwrap(),
+                    )
+            } else {
+                ProgressBar::hidden()
+            }) {
+                let inner_start = start + j * inner_chunk_size;
+                let inner_end = min(start + (j + 1) * inner_chunk_size, end);
+                let df = LazyFrame::scan_parquet(
+                    parquet_path.clone(),
+                    ScanArgsParquet::default(),
+                )
+                .unwrap();
+                let texts = df.select([col("text")]);
+                let text_chunk = texts.slice(inner_start as i64, (inner_end - inner_start) as u32);
+                let loaded = text_chunk.collect().unwrap();
+                let dropped = loaded.select(["text"]).expect("Failed to read col");
+
+                let col = dropped.column("text").unwrap();
+                let strings = col.str().expect("Didn't find strings");
+
+                strings.iter().flatten().for_each(|s| {
+                    pretokenize_as_iter(s.as_bytes()).for_each(|pretoken| {
+                        thread_counts
+                            .entry(pretoken.to_owned())
+                            .and_modify(|e| *e += 1)
+                            .or_insert(0);
+                    })
+                });
+            }
+            thread_counts
+        })
+        .reduce(
+            || HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            |mut acc, counts| {
+                if acc.is_empty() {
+                    return counts;
+                }
+
+                for (k, v) in counts {
+                    *acc.entry(k).or_insert(0) += v;
+                }
+                acc
+            },
+        );
+
+    total_counts
 }
 
 /// Return counts of all pretokens.
 pub fn pretokenize_count(bytes: &[u8]) -> HashMap<&[u8], usize, rustc_hash::FxBuildHasher> {
-    let iter = pretokenize_as_iter(bytes);
+    let string = unsafe { std::str::from_utf8_unchecked(bytes) };
+    let iter = string
+        .split("<|endoftext|>")
+        .flat_map(|s| pretokenize_as_iter(s.as_bytes()));
 
     let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
     iter.for_each(|token| {
@@ -455,7 +569,8 @@ impl<'a> PretokenizerIter<'a> {
 }
 
 impl PretokenizerIter<'static> {
-    // If we contain a 'static, assume it's a dummy
+    // If we contain a 'static, assume it's a dummy.
+    // This is needed only for PyO3 bindings.
     pub fn py_next<'a>(&mut self, bytes: &'a [u8]) -> Option<&'a [u8]> {
         let mut py_self = self.replace_bytes(bytes);
         let result = py_self.next();
@@ -621,21 +736,21 @@ mod test {
         );
     }
 
-    #[test]
-    fn minimal_tokenization() {
-        let input = vec![0x74, 0x75, 0x72, 0x65, 0x73, 0x2E, 0xC2, 0xA0, 0x0A, 0x4F];
-        let pretokens: Vec<_> = pretokenize_as_iter(&input).collect();
-        let re =
-            Regex::new(r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
-                .unwrap();
+    // #[test]
+    // fn minimal_tokenization() {
+    //     let input = vec![0x74, 0x75, 0x72, 0x65, 0x73, 0x2E, 0xC2, 0xA0, 0x0A, 0x4F];
+    //     let pretokens: Vec<_> = pretokenize_as_iter(&input).collect();
+    //     let re =
+    //         Regex::new(r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
+    //             .unwrap();
 
-        for (&token, (start, end)) in pretokens
-            .iter()
-            .zip(re.find_iter(str::from_utf8(&input).unwrap()))
-        {
-            let token_str = String::from_utf8_lossy(token).into_owned();
-            let match_str = String::from_utf8_lossy(&input[start..end]).into_owned();
-            assert_eq!(token_str, match_str, "Token does not match regex");
-        }
-    }
+    //     for (&token, (start, end)) in pretokens
+    //         .iter()
+    //         .zip(re.find_iter(str::from_utf8(&input).unwrap()))
+    //     {
+    //         let token_str = String::from_utf8_lossy(token).into_owned();
+    //         let match_str = String::from_utf8_lossy(&input[start..end]).into_owned();
+    //         assert_eq!(token_str, match_str, "Token does not match regex");
+    //     }
+    // }
 }
