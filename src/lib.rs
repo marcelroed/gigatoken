@@ -1,23 +1,23 @@
-mod bpe;
-mod bpe_train;
-mod pretokenize;
-mod utils;
+pub(crate) mod bpe;
+pub(crate) mod bpe_train;
+pub(crate) mod pretokenize;
+pub(crate) mod utils;
 use itertools::Itertools;
 use numpy::PyArray1;
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyBytes, PyDict};
+use pyo3::types::{IntoPyDict, PyBytes, PyDict, PyString};
 use rayon::prelude::*;
-use regex::Regex as FastRegex;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 /// Formats the sum of two numbers as string.
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 fn train_bpe<'py>(
     py: Python<'py>,
-    in_string: Bound<'py, PyBytes>,
+    in_data: Bound<'py, PyAny>,
     vocab_size: usize,
     special_tokens: Vec<String>,
 ) -> PyResult<(
@@ -26,14 +26,52 @@ fn train_bpe<'py>(
 )> {
     println!("Started function");
     assert!(
-        vocab_size <= 2_usize.pow(16),
-        "vocab_size must be less than 2^16"
+        vocab_size <= 2_usize.pow(32),
+        "vocab_size must be less than 2^32"
     );
-    let in_string = unsafe { std::str::from_utf8_unchecked(in_string.as_bytes()) };
+    // Check which input we got for
+    let mut bytes_memmapped = None;
+    let pretokenizeable = if in_data.is_instance_of::<PyBytes>() {
+        bpe_train::PretokenizeableSpec::Bytes(in_data.extract::<&[u8]>()?)
+    } else if let Ok(path) = in_data.extract::<PathBuf>() {
+        println!("Input is a path");
+        // let path = in_data.extract::<&str>()?;
+        // if path.len() > 200 {
+        //     eprintln!(
+        //         "Path is quite long ({} characters), maybe you meant to pass in data and not a path? Use bytes for data.",
+        //         path.len()
+        //     );
+        // }
+        if let Some(ext) = path.extension()
+            && ext == "parquet"
+        {
+            eprintln!("Path is a parquet file");
+            bpe_train::PretokenizeableSpec::Parquet(path)
+        } else {
+            // Memmap the file and treat it as a slice of bytes
+            let file = std::fs::File::open(&path).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to open file {:?}: {}",
+                    path, e
+                ))
+            })?;
+            bytes_memmapped = Some(unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to mmap file {:?}: {}",
+                    path, e
+                ))
+            })?);
+            bpe_train::PretokenizeableSpec::Bytes(&bytes_memmapped.unwrap())
+        }
+    } else {
+        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "in_data must be bytes or a path",
+        ));
+    };
 
     // Train BPE
     let bpe_train::BPEResult { vocab, merges } =
-        bpe_train::train_bpe(in_string, vocab_size, special_tokens);
+        bpe_train::train_bpe(pretokenizeable, vocab_size, special_tokens);
 
     // Convert vocab to Python
     let vocab_py = vocab
@@ -284,13 +322,13 @@ fn pretokenizer<'py>(text: Bound<'py, PyBytes>) -> PyResult<PretokenizerIter> {
 fn pretokenized_counts<'py>(
     text: Bound<'py, PyBytes>,
 ) -> PyResult<Vec<(Bound<'py, PyBytes>, usize)>> {
-    // let text = text.as_bytes();
-    let tokens_counts = pretokenize::pretokenize_par(text.as_bytes());
+    let tokens_counts =
+        pretokenize::pretokenize_par(bpe_train::PretokenizeableSpec::Bytes(text.as_bytes()));
     // Convert keys to PyBytes
 
     let tokens_counts = tokens_counts
         .into_iter()
-        .map(|(k, v)| (PyBytes::new(text.py(), k), v))
+        .map(|(k, v)| (PyBytes::new(text.py(), &k), v))
         .collect::<Vec<_>>();
 
     Ok(tokens_counts)

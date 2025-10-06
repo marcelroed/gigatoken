@@ -3,17 +3,20 @@ use indicatif::ProgressBar;
 use itertools::Itertools;
 use priority_queue::PriorityQueue;
 use rayon::prelude::*;
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 use crate::pretokenize::pretokenize_par;
 
 #[derive(Clone)]
 pub struct Word {
-    pub symbols: Vec<u16>,
+    pub symbols: Vec<u32>,
     pub word_count: isize,
 }
 
-type Pair = (u16, u16);
+type Pair = (u32, u32);
 
 fn count_pairs(words: &[Word]) -> HashMap<Pair, isize> {
     let mut symbol_counts: HashMap<Pair, isize> = HashMap::new();
@@ -27,7 +30,7 @@ fn count_pairs(words: &[Word]) -> HashMap<Pair, isize> {
     symbol_counts
 }
 
-fn update_word(w: &mut Word, pair: Pair, new_symbol: u16) -> Vec<(Pair, isize)> {
+fn update_word(w: &mut Word, pair: Pair, new_symbol: u32) -> Vec<(Pair, isize)> {
     let mut i = 0;
     let mut count_changes = vec![];
     while i < w.symbols.len() - 1 {
@@ -60,46 +63,48 @@ unsafe impl Send for PtrHolder {}
 
 fn update_words(
     words: &mut [Word],
-    contained_in_words: &mut HashMap<(u16, u16), BTreeSet<u16>>,
+    contained_in_words: &mut HashMap<(u32, u32), BTreeSet<u32>>,
     pair: Pair,
-    new_symbol: u16,
-) -> DashMap<(u16, u16), isize> {
-    let count_changes: DashMap<(u16, u16), isize> = DashMap::new();
+    new_symbol: u32,
+) -> DashMap<(u32, u32), isize> {
+    let count_changes: DashMap<(u32, u32), isize> = DashMap::new();
 
     let n_threads = rayon::current_num_threads();
-    // let chunk_size = std::cmp::min(words.len().div_ceil(n_threads), 5_000);
-    // let n_threads = 32;
-    // let n_threads = 1;
 
     // Iterate through all words containing first or second
     let word_idcs = &contained_in_words[&(pair.0, pair.1)];
     let words_ptr = PtrHolder {
         ptr: words.as_mut_ptr(),
     };
-    let contained_updates: DashMap<(u16, u16), BTreeSet<u16>> = DashMap::new();
+    let contained_updates: DashMap<(u32, u32), BTreeSet<u32>> = DashMap::new();
 
-    word_idcs.iter().copied().collect::<Vec<_>>()
+    word_idcs
+        .iter()
+        .copied()
+        .collect::<Vec<_>>()
         .par_chunks(word_idcs.len().div_ceil(n_threads))
         .for_each(|idcs_chunk| {
             for &i in idcs_chunk {
                 // Smuggle in a mutable reference to the word
                 let local_words_ptr = words_ptr.clone();
+                // SAFETY: Only this thread has access to this word, since word_idcs is a set of unique indices.
                 let word = unsafe { &mut *local_words_ptr.ptr.add(i as usize) };
                 let count_changes_word = update_word(word, pair, new_symbol);
                 for (pair, change) in count_changes_word {
-                    if change > 0 { // Was added to the word, need to track this
+                    if change > 0 {
+                        // Was added to the word, need to track this
                         contained_updates.entry(pair).or_default().insert(i);
                     }
                     *count_changes.entry(pair).or_insert(0) += change;
                 }
             }
         });
-    
+
     for (pair, mut word_idcs) in contained_updates.into_iter() {
         let set = contained_in_words.entry(pair).or_default();
         set.append(&mut word_idcs);
     }
-    
+
     // word_idcs.iter().copied().for_each(|i| {
     //     contained_in_words[new_symbol as usize].insert(i);
     // });
@@ -125,7 +130,7 @@ fn update_words(
     count_changes
 }
 
-pub fn assemble_token(token: u16, symbols: &[Vec<u8>]) -> String {
+pub fn assemble_token(token: u32, symbols: &[Vec<u8>]) -> String {
     symbols[token as usize]
         .iter()
         .map(|x| *x as char)
@@ -133,16 +138,21 @@ pub fn assemble_token(token: u16, symbols: &[Vec<u8>]) -> String {
 }
 
 pub struct BPEResult {
-    pub vocab: HashMap<u16, Vec<u8>>,
+    pub vocab: HashMap<u32, Vec<u8>>,
     pub merges: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+pub enum PretokenizeableSpec<'a> {
+    Bytes(&'a [u8]),
+    Parquet(PathBuf),
+}
+
 pub fn train_bpe(
-    in_string: &str,
+    pretokenizeable: PretokenizeableSpec,
     vocab_size: usize,
     special_tokens: Vec<String>,
 ) -> BPEResult {
-    let counts = pretokenize_par(in_string.as_bytes());
+    let counts = pretokenize_par(pretokenizeable);
 
     // println!("Gathering to a single vector");
 
@@ -153,16 +163,16 @@ pub fn train_bpe(
     // let mut words = count_words(&words);
 
     // Indicates which word indices contain a given symbol
-    let mut contained_in_words: HashMap<(u16, u16), BTreeSet<u16>> = HashMap::new();
+    let mut contained_in_words: HashMap<(u32, u32), BTreeSet<u32>> = HashMap::new();
     let mut contained_in_words_arr = vec![vec![vec![]; 256]; 256];
     let mut words: Vec<Word> = counts
         .into_iter()
         .enumerate()
         .map(|(word_i, (word, count))| {
-            // At first we have only bytes, so we won't need to hash the u16 pairs
-            let word_symbols: Vec<u16> = word.iter().map(|&b| b as u16).collect();
-            for c in word_symbols.iter().copied().tuple_windows::<(u16, u16)>() {
-                contained_in_words_arr[c.0 as usize][c.1 as usize].push(word_i as u16);
+            // At first we have only bytes, so we won't need to hash the u32 pairs
+            let word_symbols: Vec<u32> = word.iter().map(|&b| b as u32).collect();
+            for c in word_symbols.iter().copied().tuple_windows::<(u32, u32)>() {
+                contained_in_words_arr[c.0 as usize][c.1 as usize].push(word_i as u32);
             }
             Word {
                 symbols: word_symbols,
@@ -173,11 +183,14 @@ pub fn train_bpe(
 
     for (i, j) in (0..256).cartesian_product(0..256) {
         if !contained_in_words_arr[i][j].is_empty() {
-            contained_in_words.insert((i as u16, j as u16), BTreeSet::from_iter(contained_in_words_arr[i][j].iter().copied()));
+            contained_in_words.insert(
+                (i as u32, j as u32),
+                BTreeSet::from_iter(contained_in_words_arr[i][j].iter().copied()),
+            );
         }
     }
     drop(contained_in_words_arr);
-        
+
     println!("{} unique words", words.len());
     let max_symbols = vocab_size;
 
@@ -204,6 +217,7 @@ pub fn train_bpe(
             .template("[{elapsed_precise}] [{bar}] {pos}/{len} ({eta})")
             .unwrap(),
     );
+    // let mut seen_tied = HashSet::new();
     while !pq.is_empty() && symbols.len() < max_symbols {
         bar.set_position(symbols.len() as u64);
         let pair = {
@@ -215,26 +229,45 @@ pub fn train_bpe(
                 }
                 tied_pairs.push(pq.pop().unwrap().0);
             }
-            // Find the greatest pair lexicographically
-            let mut greatest_pair = first_pair;
+            // Find the smallest pair lexicographically
+            let mut smallest_pair = first_pair;
             let assemble_pair =
                 |(p0, p1)| (assemble_token(p0, &symbols), assemble_token(p1, &symbols));
 
             for pair in tied_pairs.iter().copied() {
-                if assemble_pair(pair) > assemble_pair(greatest_pair) {
-                    greatest_pair = pair;
+                if assemble_pair(pair) < assemble_pair(smallest_pair) {
+                    smallest_pair = pair;
                 }
             }
+
+            // if tied_pairs.len() > 1 {
+            //     if tied_pairs.iter().all(|&p| !seen_tied.contains(&p)) {
+            //         println!(
+            //             "Tied pairs at {} occurrences (choosing {:?}): {:?}",
+            //             first_count,
+            //             assemble_pair(smallest_pair),
+            //             tied_pairs
+            //                 .iter()
+            //                 .map(|&p| assemble_pair(p))
+            //                 .collect::<Vec<_>>()
+            //         );
+            //         tied_pairs.iter().copied().for_each(|p| {
+            //             seen_tied.insert(p);
+            //         });
+            //     }
+            // }
+
+            // Tied pairs at 196 occurrences (choosing (" E", "ven")): [(" de", "er"), (" pr", "o"), (" s", "il"), (" cra", "ck"), (" esc", "ape"), (" E", "ven"), ("H", "ow")]
 
             // println!("Tied pairs");
             for pair in tied_pairs {
                 // println!("{:?}", assemble_pair(pair));
-                if pair != greatest_pair {
+                if pair != smallest_pair {
                     pq.push(pair, first_count);
                 }
             }
 
-            greatest_pair
+            smallest_pair
         };
 
         // Merge the pair
@@ -255,7 +288,7 @@ pub fn train_bpe(
             &mut words,
             &mut contained_in_words,
             pair,
-            symbols.len() as u16 - 1,
+            symbols.len() as u32 - 1,
         );
 
         for (pair, change) in count_changes.into_iter() {
@@ -270,7 +303,7 @@ pub fn train_bpe(
     let vocab: HashMap<_, _> = symbols
         .into_iter()
         .enumerate()
-        .map(|(i, v)| (i as u16, v))
+        .map(|(i, v)| (i as u32, v))
         .collect();
 
     BPEResult { vocab, merges }
