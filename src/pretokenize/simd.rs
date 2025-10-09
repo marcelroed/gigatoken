@@ -1,3 +1,3 @@
-#![feature(portable_simd)]
+// #![feature(portable_simd)]
 
-use std::simd as s;
+// use std::simd as s;
