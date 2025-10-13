@@ -47,17 +47,17 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             }
         });
     });
-    group.bench_with_input(
-        "unicode_properties",
-        chars_input.as_slice(),
-        |b, chars: &[char]| {
-            b.iter(|| {
-                for c in chars {
-                    unicode_properties_classify(*c);
-                }
-            });
-        },
-    );
+    // group.bench_with_input(
+    //     "unicode_properties",
+    //     chars_input.as_slice(),
+    //     |b, chars: &[char]| {
+    //         b.iter(|| {
+    //             for c in chars {
+    //                 unicode_properties_classify(*c);
+    //             }
+    //         });
+    //     },
+    // );
     group.bench_with_input(
         "icu4x table",
         chars_input.as_slice(),
