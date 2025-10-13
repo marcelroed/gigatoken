@@ -39,6 +39,12 @@ impl<'a> From<&'a [u8]> for DocRef<'a> {
     }
 }
 
+impl<'a> From<&'a Document<'a>> for DocRef<'a> {
+    fn from(value: &'a Document<'a>) -> Self {
+        DocRef(value.as_ref())
+    }
+}
+
 impl<'a> Deref for DocRef<'a> {
     type Target = &'a [u8];
     fn deref(&self) -> &Self::Target {
@@ -86,3 +92,11 @@ pub fn iterate_files(
         })
         .map(|r| r.map_err(|e| format!("Failed to open file: {e}")))
 }
+
+// /// Create a parallel iterator over num_chunks number of inputs using a closure to find boundaries
+// pub(crate) trait DocumentParallelCoarse<'a> {
+//     fn par_iter_coarse(
+//         &self,
+//         first_boundary_fn: impl FnOnce(&[u8], usize) -> usize,
+//     ) -> impl ParallelIterator<Item = impl Iterator<Item = Document<'a>>>;
+// }
