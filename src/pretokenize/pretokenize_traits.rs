@@ -1,35 +1,58 @@
-use std::collections::HashMap;
+use rayon::prelude::*;
+use std::{
+    collections::HashMap,
+    hash::{BuildHasher, Hash},
+    ops::AddAssign,
+};
 
 use crate::pretokenize::pretokenize_as_iter;
 
-trait Pretokenizeable<'a> {
-    fn pretokenize(self) -> HashMap<&'a [u8], usize, rustc_hash::FxBuildHasher>;
+pub(crate) trait ParallelPretokenCountable<'a, S: BuildHasher + Default> {
+    /// Count pretokens and
+    /// Should only be used with chunked parallel iterators, meaning where the number of parallel elements ≈ number of threads
+    fn par_pretoken_count(self) -> HashMap<&'a [u8], usize, S>;
 }
 
-trait PretokenizeableWeighted<'a> {
-    fn pretokenize(self) -> HashMap<&'a [u8], usize, rustc_hash::FxBuildHasher>;
+pub(crate) trait PretokenCountable<'a, S: BuildHasher + Default> {
+    fn pretoken_count(self) -> HashMap<&'a [u8], usize, S>;
 }
 
-impl<'a, T> Pretokenizeable<'a> for T
+pub(crate) trait PretokenCountableWeighted<'a, S: BuildHasher + Default> {
+    fn pretoken_count(self) -> HashMap<&'a [u8], usize, S>;
+}
+
+impl<'a, T, S> PretokenCountable<'a, S> for T
 where
     T: Iterator<Item = &'a [u8]>,
+    S: BuildHasher + Default,
 {
-    fn pretokenize(self) -> HashMap<&'a [u8], usize, rustc_hash::FxBuildHasher> {
-        let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
-        self.flat_map(|doc| pretokenize_as_iter(doc))
-            .for_each(|token| {
-                hashmap.entry(token).and_modify(|e| *e += 1).or_insert(1);
-            });
-        hashmap
+    fn pretoken_count(self) -> HashMap<&'a [u8], usize, S> {
+        self.fold(HashMap::default(), |mut counts, token| {
+            *counts.entry(token).or_default() += 1;
+            counts
+        })
     }
 }
 
-impl<'a, T> PretokenizeableWeighted<'a> for T
+impl<'a, T, I, S> ParallelPretokenCountable<'a, S> for I
+where
+    I: ParallelIterator<Item = T>,
+    T: Iterator<Item = &'a [u8]>,
+    S: BuildHasher + Default + Send,
+{
+    fn par_pretoken_count(self) -> HashMap<&'a [u8], usize, S> {
+        self.map(PretokenCountable::pretoken_count)
+            .par_merge_counts()
+    }
+}
+
+impl<'a, T, S> PretokenCountableWeighted<'a, S> for T
 where
     T: Iterator<Item = (&'a [u8], usize)>,
+    S: BuildHasher + Default,
 {
-    fn pretokenize(self) -> HashMap<&'a [u8], usize, rustc_hash::FxBuildHasher> {
-        let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+    fn pretoken_count(self) -> HashMap<&'a [u8], usize, S> {
+        let mut hashmap = HashMap::default();
         self.map(|doc| (pretokenize_as_iter(doc.0), doc.1))
             .for_each(|(pretoken_iter, count)| {
                 pretoken_iter.for_each(|pretoken| {
@@ -40,5 +63,30 @@ where
                 });
             });
         hashmap
+    }
+}
+
+pub(crate) trait ParallelMergeCounts<K, V, S> {
+    fn par_merge_counts(self) -> HashMap<K, V, S>;
+}
+
+impl<T, K, V, S> ParallelMergeCounts<K, V, S> for T
+where
+    T: ParallelIterator<Item = HashMap<K, V, S>>,
+    K: Eq + Hash,
+    V: AddAssign + Default,
+    S: BuildHasher + Default,
+{
+    fn par_merge_counts(self) -> HashMap<K, V, S> {
+        self.reduce(HashMap::default, |mut acc, counts| {
+            if acc.is_empty() {
+                return counts;
+            }
+
+            for (k, v) in counts {
+                *acc.entry(k).or_default() += v;
+            }
+            acc
+        })
     }
 }

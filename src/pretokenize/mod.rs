@@ -4,6 +4,10 @@ use std::cmp::min;
 use std::collections::HashMap;
 
 use crate::bpe_train::PretokenizeableSpec;
+use crate::pretokenize::pretokenize_traits::{
+    ParallelMergeCounts, ParallelPretokenCountable, PretokenCountable,
+};
+mod pretoken;
 mod pretokenize_traits;
 mod simd;
 mod unicode;
@@ -272,19 +276,7 @@ pub fn pretokenize_par_bytes(bytes: &[u8]) -> HashMap<Vec<u8>, usize, rustc_hash
             let end = window[1];
             pretokenize_count(&bytes[start..end])
         })
-        .reduce(
-            || HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
-            |mut acc, counts| {
-                if acc.is_empty() {
-                    return counts;
-                }
-
-                for (k, v) in counts {
-                    *acc.entry(k).or_insert(0) += v;
-                }
-                acc
-            },
-        );
+        .par_merge_counts();
 
     let time_elapsed = start_time.elapsed();
     eprintln!("Pretokenization took {time_elapsed:?}");
@@ -398,26 +390,21 @@ pub fn pretokenize_par_parquet(
 /// Return counts of all pretokens.
 pub fn pretokenize_count(bytes: &[u8]) -> HashMap<&[u8], usize, rustc_hash::FxBuildHasher> {
     let string = unsafe { std::str::from_utf8_unchecked(bytes) };
-    let iter = string
+    string
         .split("<|endoftext|>")
-        .flat_map(|s| pretokenize_as_iter(s.as_bytes()));
-
-    let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
-    iter.for_each(|token| {
-        hashmap.entry(token).and_modify(|e| *e += 1).or_insert(1);
-    });
-    hashmap
+        .flat_map(|s| pretokenize_as_iter(s.as_bytes()))
+        .pretoken_count()
 }
 
-pub fn count_pretokens<'a>(
-    pretoken_iter: impl Iterator<Item = &'a [u8]>,
-) -> HashMap<&'a [u8], usize, rustc_hash::FxBuildHasher> {
-    let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
-    pretoken_iter.for_each(|token| {
-        hashmap.entry(token).and_modify(|e| *e += 1).or_insert(1);
-    });
-    hashmap
-}
+// pub fn count_pretokens<'a>(
+//     pretoken_iter: impl Iterator<Item = &'a [u8]>,
+// ) -> HashMap<&'a [u8], usize, rustc_hash::FxBuildHasher> {
+//     let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+//     pretoken_iter.for_each(|token| {
+//         hashmap.entry(token).and_modify(|e| *e += 1).or_insert(1);
+//     });
+//     hashmap
+// }
 
 pub fn count_pretokens_weighted<'a>(
     pretoken_weight_iter: impl Iterator<Item = (&'a [u8], usize)>,
