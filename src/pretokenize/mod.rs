@@ -1,12 +1,14 @@
+use crate::bpe_train::PretokenizeableSpec;
+use crate::input::DocRef;
+pub(crate) use crate::pretokenize::pretoken::Pretoken;
+use crate::pretokenize::pretokenize_traits::{
+    ParallelMergeCounts, ParallelPretokenCountable, PretokenCountable,
+};
 use itertools::Itertools;
 use rayon::prelude::*;
 use std::cmp::min;
 use std::collections::HashMap;
 
-use crate::bpe_train::PretokenizeableSpec;
-use crate::pretokenize::pretokenize_traits::{
-    ParallelMergeCounts, ParallelPretokenCountable, PretokenCountable,
-};
 mod pretoken;
 mod pretokenize_traits;
 mod simd;
@@ -26,7 +28,7 @@ pub enum PretokenizerState {
 }
 
 struct UTF8Iterator<'a> {
-    bytes: &'a [u8],
+    bytes: DocRef<'a>,
     pos: usize,
 }
 
@@ -53,13 +55,13 @@ enum ApostropheResult {
 struct OutOfBytesError {}
 
 impl<'a> UTF8Iterator<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
+    fn new(doc: DocRef<'a>) -> Self {
+        Self { bytes: doc, pos: 0 }
     }
 
     pub fn replace_bytes<'b>(&self, bytes: &'b [u8]) -> UTF8Iterator<'b> {
         UTF8Iterator {
-            bytes,
+            bytes: bytes.into(),
             pos: self.pos,
         }
     }
@@ -76,7 +78,7 @@ impl<'a> UTF8Iterator<'a> {
     }
 
     pub fn start_check(&mut self) -> Result<StartResult, OutOfBytesError> {
-        if self.pos >= self.bytes.len() {
+        if self.pos >= self.bytes.0.len() {
             return Err(OutOfBytesError {});
         }
         let byte = self.bytes[self.pos];
@@ -266,7 +268,9 @@ pub fn find_boundaries(bytes: &[u8]) -> Vec<usize> {
     boundaries
 }
 
-pub fn pretokenize_par_bytes(bytes: &[u8]) -> HashMap<Vec<u8>, usize, rustc_hash::FxBuildHasher> {
+pub fn pretokenize_par_bytes(
+    bytes: &[u8],
+) -> HashMap<Pretoken<'_>, usize, rustc_hash::FxBuildHasher> {
     let start_time = std::time::Instant::now();
     let boundaries = find_boundaries(bytes);
     let merged_counts = boundaries
@@ -282,14 +286,15 @@ pub fn pretokenize_par_bytes(bytes: &[u8]) -> HashMap<Vec<u8>, usize, rustc_hash
     eprintln!("Pretokenization took {time_elapsed:?}");
 
     merged_counts
-        .into_iter()
-        .map(|(k, v)| (k.to_owned(), v))
-        .collect()
+    // merged_counts
+    //     .into_iter()
+    //     .map(|(k, v)| (k.to_owned(), v))
+    //     .collect()
 }
 
 pub fn pretokenize_par(
     pretokenizeable: PretokenizeableSpec,
-) -> HashMap<Vec<u8>, usize, rustc_hash::FxBuildHasher> {
+) -> HashMap<Pretoken, usize, rustc_hash::FxBuildHasher> {
     match pretokenizeable {
         PretokenizeableSpec::Bytes(s) => pretokenize_par_bytes(s),
         #[cfg(feature = "parquet")]
@@ -388,11 +393,11 @@ pub fn pretokenize_par_parquet(
 }
 
 /// Return counts of all pretokens.
-pub fn pretokenize_count(bytes: &[u8]) -> HashMap<&[u8], usize, rustc_hash::FxBuildHasher> {
+pub fn pretokenize_count(bytes: &[u8]) -> HashMap<Pretoken<'_>, usize, rustc_hash::FxBuildHasher> {
     let string = unsafe { std::str::from_utf8_unchecked(bytes) };
     string
         .split("<|endoftext|>")
-        .flat_map(|s| pretokenize_as_iter(s.as_bytes()))
+        .flat_map(|s| pretokenize_as_iter(s.as_bytes().into()))
         .pretoken_count()
 }
 
@@ -421,20 +426,20 @@ pub fn count_pretokens_weighted<'a>(
 
 pub fn pretokenize_doc_iterable<'a>(
     docs: impl Iterator<Item = &'a [u8]>,
-) -> impl Iterator<Item = &'a [u8]> {
-    docs.flat_map(|doc| pretokenize_as_iter(doc))
+) -> impl Iterator<Item = Pretoken<'a>> {
+    docs.flat_map(|doc| pretokenize_as_iter(doc.into()))
 }
 
 pub fn pretokenize_with_endoftext(
     bytes: &[u8],
-) -> HashMap<&[u8], usize, rustc_hash::FxBuildHasher> {
+) -> HashMap<Pretoken<'_>, usize, rustc_hash::FxBuildHasher> {
     let string = unsafe { std::str::from_utf8_unchecked(bytes) };
 
-    let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+    let mut hashmap = HashMap::default();
 
     string
         .split("<|endoftext|>")
-        .flat_map(|part| pretokenize_as_iter(part.as_bytes()))
+        .flat_map(|part| pretokenize_as_iter(part.as_bytes().into()))
         .for_each(|token| {
             hashmap.entry(token).and_modify(|e| *e += 1).or_insert(1);
         });
@@ -449,7 +454,7 @@ pub struct PretokenizerIter<'a> {
 }
 
 impl<'a> Iterator for PretokenizerIter<'a> {
-    type Item = &'a [u8];
+    type Item = Pretoken<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let (state_after, new_pretoken) = loop {
@@ -537,7 +542,7 @@ impl<'a> Iterator for PretokenizerIter<'a> {
         if new_pretoken.is_empty() {
             return None;
         }
-        Some(new_pretoken)
+        Some(Pretoken(new_pretoken))
     }
 }
 
@@ -559,13 +564,13 @@ impl PretokenizerIter<'static> {
         let mut py_self = self.replace_bytes(bytes);
         let result = py_self.next();
         *self = py_self.replace_bytes(&[]);
-        result
+        Some(result?.0)
     }
 }
 
-pub fn pretokenize_as_iter<'a>(bytes: &'a [u8]) -> PretokenizerIter<'a> {
+pub fn pretokenize_as_iter(bytes: &[u8]) -> PretokenizerIter<'_> {
     PretokenizerIter {
-        iter: UTF8Iterator::new(bytes),
+        iter: UTF8Iterator::new(bytes.into()),
         starting: 0,
         state: PretokenizerState::Start,
     }
@@ -677,7 +682,7 @@ mod test {
         sorted_counts.sort_by_key(|&(_, &v)| v);
         sorted_counts.reverse();
         for &(&token, &count) in sorted_counts.iter().take(100) {
-            eprintln!("{1}: {0}", String::from_utf8_lossy(token), count);
+            eprintln!("{1}: {0}", String::from_utf8_lossy(&token), count);
         }
     }
 

@@ -6,6 +6,7 @@ mod bpe;
 mod bpe_train;
 mod input;
 mod pretokenize;
+mod token;
 
 pub fn main() {
     // Get args (path to file, vocab size)

@@ -1,7 +1,9 @@
 // Different ways to construct (parallel) document iterators from file or Python input
 use memmap2::Mmap;
 use rayon::prelude::*;
+use std::ops::Deref;
 use std::{borrow::Cow, error::Error, path::Path};
+
 mod bytes;
 mod jsonl;
 mod py;
@@ -9,9 +11,36 @@ mod py;
 #[derive(Debug, Clone)]
 pub(crate) struct Document<'a>(Cow<'a, [u8]>);
 
-impl<'a> std::ops::Deref for Document<'a> {
-    type Target = Cow<'a, [u8]>;
+impl<'a> From<&'a [u8]> for Document<'a> {
+    fn from(value: &'a [u8]) -> Self {
+        Document(Cow::Borrowed(value))
+    }
+}
+impl<'a> From<Vec<u8>> for Document<'a> {
+    fn from(value: Vec<u8>) -> Self {
+        Document(value.into())
+    }
+}
 
+impl<'a> Deref for Document<'a> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DocRef<'a>(pub &'a [u8]);
+
+impl<'a> From<&'a [u8]> for DocRef<'a> {
+    fn from(value: &'a [u8]) -> Self {
+        DocRef(value)
+    }
+}
+
+impl<'a> Deref for DocRef<'a> {
+    type Target = &'a [u8];
     fn deref(&self) -> &Self::Target {
         &self.0
     }

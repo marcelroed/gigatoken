@@ -1,14 +1,10 @@
-use dashmap::{DashMap, Map};
+use dashmap::DashMap;
 use indicatif::ProgressBar;
 use itertools::Itertools;
 use priority_queue::PriorityQueue;
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    path::PathBuf,
-    sync::atomic::{AtomicIsize, Ordering},
-};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::pretokenize::pretokenize_par;
 
@@ -203,7 +199,7 @@ pub fn train_bpe(
         .enumerate()
         .map(|(word_i, (word, count))| {
             // At first we have only bytes, so we won't need to hash the u32 pairs
-            let word_symbols: Vec<u32> = word.iter().map(|&b| b as u32).collect();
+            let word_symbols: Vec<u32> = word.as_ref().iter().map(|&b| b as u32).collect();
             for c in word_symbols.iter().copied().tuple_windows::<(u32, u32)>() {
                 contained_in_words_arr[c.0 as usize][c.1 as usize].push(word_i as u32);
             }

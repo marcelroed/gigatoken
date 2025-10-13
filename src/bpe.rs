@@ -1,7 +1,8 @@
 use itertools::Itertools;
 
+use crate::pretokenize::Pretoken;
+use crate::token::TokenId;
 use std::{collections::HashMap, path::Path, rc::Rc};
-
 // pub fn encode_par(pretokenizeable: PretokenizeableSpec) {
 //     match pretokenizeable {
 //         PretokenizeableSpec::Bytes(b) => {
@@ -61,16 +62,19 @@ impl ByteRemapping {
 }
 
 pub struct Tokenizer {
-    merges: HashMap<(u32, u32), u32>, // Maps pairs of token ids to merged token id
-    vocab: Vec<Rc<[u8]>>,             // Maps token ids to byte sequences
-    vocab_inv: HashMap<Rc<[u8]>, u32>, // Maps byte sequences to token ids
+    merges: HashMap<(TokenId, TokenId), TokenId>, // Maps pairs of token ids to merged token id
+    vocab: Vec<Rc<[u8]>>,                         // Maps token ids to byte sequences
+    vocab_inv: HashMap<Rc<[u8]>, TokenId>,        // Maps byte sequences to token ids
     byte_remapping: Option<ByteRemapping>, // Remaps bytes, because some tokenizers do this for some reason
-    pretoken_cache: HashMap<Rc<[u8]>, Rc<[u32]>, rustc_hash::FxBuildHasher>,
+    pretoken_cache: HashMap<Rc<[u8]>, Rc<[TokenId]>, rustc_hash::FxBuildHasher>,
 }
 
 /// Tokenize a single pretoken by repeatedly applying BPE merges in order.
-pub fn simple_bpe_merge(merges: &HashMap<(u32, u32), u32>, pre_token: &[u8]) -> Vec<u32> {
-    let mut symbols: Vec<u32> = pre_token.iter().map(|&b| b as u32).collect();
+pub fn simple_bpe_merge(
+    merges: &HashMap<(TokenId, TokenId), TokenId>,
+    pre_token: &[u8],
+) -> Vec<TokenId> {
+    let mut symbols: Vec<TokenId> = pre_token.iter().map(|&b| TokenId::from(b as u32)).collect();
 
     loop {
         let candidate_merges = symbols
@@ -93,12 +97,16 @@ pub fn simple_bpe_merge(merges: &HashMap<(u32, u32), u32>, pre_token: &[u8]) -> 
 
 impl Tokenizer {
     pub fn new(
-        merges: HashMap<(u32, u32), u32>,
+        merges: HashMap<(TokenId, TokenId), TokenId>,
         vocab: Vec<Vec<u8>>,
         byte_remapping: Option<ByteRemapping>,
     ) -> Self {
         let vocab = vocab.into_iter().map(Into::into).collect::<Vec<Rc<_>>>();
-        let vocab_inv = vocab.iter().cloned().zip(0..).collect();
+        let vocab_inv = vocab
+            .iter()
+            .cloned()
+            .zip((0..).map(TokenId::from))
+            .collect();
         Tokenizer {
             merges,
             vocab_inv,
@@ -114,7 +122,11 @@ impl Tokenizer {
     pub fn from_ranks(vocab: Vec<Vec<u8>>) -> Result<Self, String> {
         let mut merges = HashMap::new();
         let vocab = vocab.into_iter().map(Into::into).collect::<Vec<Rc<[u8]>>>();
-        let vocab_inv = vocab.iter().cloned().zip(0..).collect::<HashMap<_, u32>>();
+        let vocab_inv = vocab
+            .iter()
+            .cloned()
+            .zip((0..).map(TokenId::from))
+            .collect::<HashMap<_, TokenId>>();
 
         for (token_idx, token_bytes) in vocab.iter().cloned().enumerate() {
             if token_bytes.len() < 2 {
@@ -122,11 +134,11 @@ impl Tokenizer {
             }
             let byte_symbols: Vec<u8> = token_bytes
                 .iter()
-                .map(|b| *vocab_inv.get(std::slice::from_ref(b)).unwrap() as u8)
+                .map(|b| vocab_inv.get(std::slice::from_ref(b)).unwrap().0 as u8)
                 .collect();
             let tokenized = simple_bpe_merge(&merges, &byte_symbols);
-            assert!(tokenized.len() == 2);
-            merges.insert((tokenized[0], tokenized[1]), token_idx as u32);
+            assert_eq!(tokenized.len(), 2);
+            merges.insert((tokenized[0], tokenized[1]), TokenId::from(token_idx));
         }
 
         Ok(Tokenizer {
@@ -140,9 +152,9 @@ impl Tokenizer {
 
     pub fn encode_pretoken(
         byte_remapping: &Option<ByteRemapping>,
-        merges: &HashMap<(u32, u32), u32>,
-        pretoken: &[u8],
-    ) -> Vec<u32> {
+        merges: &HashMap<(TokenId, TokenId), TokenId>,
+        pretoken: Pretoken,
+    ) -> Vec<TokenId> {
         // TODO improve
         let pretoken = if let Some(byte_remapping) = &byte_remapping {
             pretoken
@@ -158,12 +170,12 @@ impl Tokenizer {
     /// For each pretoken in the input iterator, looks up the string in the cache, and if not found, encodes it and inserts it into the cache.
     pub fn memoized_encode<'i>(
         &mut self,
-        pretoken_iter: impl Iterator<Item = &'i [u8]>,
-    ) -> impl Iterator<Item = Rc<[u32]>> {
+        pretoken_iter: impl Iterator<Item = Pretoken<'i>>,
+    ) -> impl Iterator<Item = Rc<[TokenId]>> {
         let pretoken_cache = &mut self.pretoken_cache;
-        pretoken_iter.map(|pretoken: &[u8]| {
+        pretoken_iter.map(|pretoken: Pretoken| {
             pretoken_cache
-                .entry(pretoken.into())
+                .entry(pretoken.as_ref().into())
                 .or_insert_with(|| {
                     Self::encode_pretoken(&self.byte_remapping, &self.merges, pretoken).into()
                 })
@@ -171,10 +183,10 @@ impl Tokenizer {
         })
     }
 
-    pub fn decode(&self, v: &[u32]) -> impl Iterator<Item = u8> {
+    pub fn decode(&self, v: &[TokenId]) -> impl Iterator<Item = u8> {
         v.iter()
             .flat_map(|&token| {
-                self.vocab[token as usize].as_ref()
+                self.vocab[token.0 as usize].as_ref()
                 // if let Some(byte_remapping) = &self.byte_remapping {
                 //     return byte_remapping.unmap_bytes(&self.vocab[token as usize]);
                 // }
@@ -324,20 +336,20 @@ mod tests {
             .merges
             .iter()
             .map(|((a, b), c)| (*c, (*a, *b)))
-            .collect::<HashMap<u32, (u32, u32)>>();
+            .collect::<HashMap<TokenId, (TokenId, TokenId)>>();
 
-        let decode_token = |token_id: u32| -> String {
-            String::from_utf8_lossy(&tokenizer.vocab[token_id as usize]).into_owned()
+        let decode_token = |token_id: TokenId| -> String {
+            String::from_utf8_lossy(&tokenizer.vocab[token_id.0 as usize]).into_owned()
         };
 
         eprintln!("Merges:");
         for i in 256..=300 {
-            let (a, b) = *merges_inv.get(&i).unwrap();
+            let (a, b) = *merges_inv.get(&i.into()).unwrap();
             eprintln!(
                 "Merge {i}: \"{}\" + \"{}\" -> \"{}\"",
                 decode_token(a),
                 decode_token(b),
-                decode_token(i),
+                decode_token(i.into()),
             )
         }
         // for ((a, b), c) in merges.iter().take(20) {

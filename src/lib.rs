@@ -2,6 +2,7 @@ pub(crate) mod bpe;
 pub(crate) mod bpe_train;
 pub(crate) mod input;
 pub(crate) mod pretokenize;
+pub(crate) mod token;
 pub(crate) mod utils;
 use itertools::Itertools;
 use pyo3::prelude::*;
@@ -312,7 +313,7 @@ impl PretokenizerIter {
 #[pyfunction]
 fn pretokenizer<'py>(text: Bound<'py, PyBytes>) -> PyResult<PretokenizerIter> {
     // let text = text.as_bytes();
-    let tokens_iter = pretokenize::pretokenize_as_iter(&[]);
+    let tokens_iter = pretokenize::pretokenize_as_iter((&[]).as_slice().into());
     Ok(PretokenizerIter {
         pretokenizer_iter: tokens_iter,
         bytes: text.into(),
@@ -329,7 +330,7 @@ fn pretokenized_counts<'py>(
 
     let tokens_counts = tokens_counts
         .into_iter()
-        .map(|(k, v)| (PyBytes::new(text.py(), &k), v))
+        .map(|(k, v)| (PyBytes::new(text.py(), k.as_ref()), v))
         .collect::<Vec<_>>();
 
     Ok(tokens_counts)

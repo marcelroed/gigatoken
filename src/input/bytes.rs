@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 
 use crate::input::Document;
+use crate::token::TokenId;
 use regex::bytes::Regex;
 
 /// Bytes are always just a single document
@@ -14,7 +15,7 @@ use regex::bytes::Regex;
 
 #[derive(Default, Debug, Clone)]
 pub(crate) struct BytesDocIterSpec {
-    special_tokens: Vec<(Vec<u8>, u32)>,
+    special_tokens: Vec<(Vec<u8>, TokenId)>,
     regex: Option<Regex>,
 }
 

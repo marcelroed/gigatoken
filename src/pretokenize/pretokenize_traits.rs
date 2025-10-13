@@ -1,3 +1,6 @@
+use crate::input::DocRef;
+use crate::pretokenize::pretoken::Pretoken;
+use crate::pretokenize::{pretokenize_as_iter, PretokenizerIter};
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
@@ -5,28 +8,26 @@ use std::{
     ops::AddAssign,
 };
 
-use crate::pretokenize::pretokenize_as_iter;
-
 pub(crate) trait ParallelPretokenCountable<'a, S: BuildHasher + Default> {
     /// Count pretokens and
     /// Should only be used with chunked parallel iterators, meaning where the number of parallel elements ≈ number of threads
-    fn par_pretoken_count(self) -> HashMap<&'a [u8], usize, S>;
+    fn par_pretoken_count(self) -> HashMap<Pretoken<'a>, usize, S>;
 }
 
 pub(crate) trait PretokenCountable<'a, S: BuildHasher + Default> {
-    fn pretoken_count(self) -> HashMap<&'a [u8], usize, S>;
+    fn pretoken_count(self) -> HashMap<Pretoken<'a>, usize, S>;
 }
 
 pub(crate) trait PretokenCountableWeighted<'a, S: BuildHasher + Default> {
-    fn pretoken_count(self) -> HashMap<&'a [u8], usize, S>;
+    fn pretoken_count(self) -> HashMap<Pretoken<'a>, usize, S>;
 }
 
 impl<'a, T, S> PretokenCountable<'a, S> for T
 where
-    T: Iterator<Item = &'a [u8]>,
+    T: Iterator<Item = Pretoken<'a>>,
     S: BuildHasher + Default,
 {
-    fn pretoken_count(self) -> HashMap<&'a [u8], usize, S> {
+    fn pretoken_count(self) -> HashMap<Pretoken<'a>, usize, S> {
         self.fold(HashMap::default(), |mut counts, token| {
             *counts.entry(token).or_default() += 1;
             counts
@@ -37,10 +38,10 @@ where
 impl<'a, T, I, S> ParallelPretokenCountable<'a, S> for I
 where
     I: ParallelIterator<Item = T>,
-    T: Iterator<Item = &'a [u8]>,
+    T: Iterator<Item = Pretoken<'a>>,
     S: BuildHasher + Default + Send,
 {
-    fn par_pretoken_count(self) -> HashMap<&'a [u8], usize, S> {
+    fn par_pretoken_count(self) -> HashMap<Pretoken<'a>, usize, S> {
         self.map(PretokenCountable::pretoken_count)
             .par_merge_counts()
     }
@@ -48,13 +49,13 @@ where
 
 impl<'a, T, S> PretokenCountableWeighted<'a, S> for T
 where
-    T: Iterator<Item = (&'a [u8], usize)>,
+    T: Iterator<Item = (DocRef<'a>, usize)>,
     S: BuildHasher + Default,
 {
-    fn pretoken_count(self) -> HashMap<&'a [u8], usize, S> {
+    fn pretoken_count(self) -> HashMap<Pretoken<'a>, usize, S> {
         let mut hashmap = HashMap::default();
-        self.map(|doc| (pretokenize_as_iter(doc.0), doc.1))
-            .for_each(|(pretoken_iter, count)| {
+        self.map(|doc| (pretokenize_as_iter(doc.0.as_ref()), doc.1))
+            .for_each(|(pretoken_iter, count): (PretokenizerIter, usize)| {
                 pretoken_iter.for_each(|pretoken| {
                     hashmap
                         .entry(pretoken)
