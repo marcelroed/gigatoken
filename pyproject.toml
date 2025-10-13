@@ -11,7 +11,10 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
-dependencies = ["numpy>=1.24.4"]
+dependencies = [
+    "awkward>=2.8.9",
+    "numpy>=1.24.4",
+]
 
 [tool.maturin]
 
