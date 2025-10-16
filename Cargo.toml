@@ -6,7 +6,7 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "toker_rs"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [features]
 parquet = ["dep:polars"]
@@ -36,17 +36,22 @@ clap = { version = "4.5.48", features = [
 thiserror = "2.0.17"
 eyre = "0.6.12"
 color-eyre = "0.6.5"
+winnow = { version = "0.7.13", features = ["simd"] }
 
 [profile.release]
-# lto = "fat"
+lto = "fat"
 # debug = "line-tables-only"
 
 [dev-dependencies]
 criterion = "0.7.0"
 
 
+# [[bench]]
+# name = "unicode"
+# harness = false
+
 [[bench]]
-name = "unicode"
+name = "pretokenize"
 harness = false
 
 [lints.rust]
