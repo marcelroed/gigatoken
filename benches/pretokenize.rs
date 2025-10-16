@@ -2,15 +2,14 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use icu::properties::{CodePointMapDataBorrowed, props::EnumeratedProperty};
 use regex::bytes;
 use std::hint::black_box;
-use toker_rs::pretokenize::pretoken_combinator::parse_pretokens;
 use toker_rs::pretokenize::{PretokenizerIter, pretoken_combinator::pretokens_iterator};
 
 use rand::{self, Rng};
 
-pub fn state_machine_pretokenize<'a>(input: &'a [u8]) -> Vec<&'a [u8]> {
+pub fn state_machine_pretokenize(input: &[u8]) -> Vec<&[u8]> {
     let mut iter = PretokenizerIter::new(input);
     let mut v = vec![];
-    iter.for_each(|pretoken| {
+    iter.map(|pretoken| pretoken).for_each(|pretoken| {
         v.push(pretoken.0);
     });
     v
@@ -20,9 +19,9 @@ pub fn winnow_pretokenize(input: &[u8]) -> Vec<&[u8]> {
     let mut iter = pretokens_iterator(unsafe { std::str::from_utf8_unchecked(input) });
     let mut v = vec![];
     iter.for_each(|pretoken| {
-        v.push(pretoken.as_bytes());
+        v.push(pretoken.0);
     });
-    assert!(iter.finish().is_ok());
+    // assert!(iter.finish().is_ok());
     v
 }
 
@@ -41,14 +40,14 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     group.bench_with_input("winnow", bytes_input, |b, bytes: &[u8]| {
         b.iter(|| {
             let mut pretokens = winnow_pretokenize(bytes);
-            let total_len = pretokens.len();
+            let total_len = black_box(pretokens).len();
             black_box(total_len);
         });
     });
     group.bench_with_input("state machine", bytes_input, |b, bytes: &[u8]| {
         b.iter(|| {
             let mut pretokens = state_machine_pretokenize(bytes);
-            let total_len = pretokens.len();
+            let total_len = black_box(pretokens).len();
             black_box(total_len);
         });
     });

@@ -53,10 +53,10 @@ enum ApostropheResult {
     NotMatched,
 }
 
-struct OutOfBytesError {}
+pub(crate) struct OutOfBytesError {}
 
 impl<'a> UTF8Iterator<'a> {
-    pub fn new(doc: DocRef<'a>) -> Self {
+    pub(crate) fn new(doc: DocRef<'a>) -> Self {
         Self { bytes: doc, pos: 0 }
     }
 
@@ -79,7 +79,7 @@ impl<'a> UTF8Iterator<'a> {
     }
 
     // #[inline(never)]
-    pub fn start_check(&mut self) -> Result<StartResult, OutOfBytesError> {
+    fn start_check(&mut self) -> Result<StartResult, OutOfBytesError> {
         if self.pos >= self.bytes.0.len() {
             return Err(OutOfBytesError {});
         }
@@ -225,7 +225,7 @@ impl<'a> UTF8Iterator<'a> {
         }
     }
     // #[inline(never)]
-    pub fn apostrophe_check(&mut self) -> Result<ApostropheResult, OutOfBytesError> {
+    fn apostrophe_check(&mut self) -> Result<ApostropheResult, OutOfBytesError> {
         if self.pos >= self.bytes.len() {
             return Err(OutOfBytesError {});
         }

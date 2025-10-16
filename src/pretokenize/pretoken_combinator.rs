@@ -1,23 +1,18 @@
 //! Implement the regex
 //! '(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
 //! using winnow parser combinators.
-use crate::pretokenize::unicode;
-use core::fmt;
+use crate::pretokenize::{unicode, Pretoken};
 use std::cmp::min;
-use std::time::Instant;
 
-use eyre::{Context, Result, anyhow};
+use eyre::Context;
 use itertools::Itertools;
 use rayon::prelude::*;
-use winnow::Parser;
-use winnow::combinator::{
-    alt, delimited, dispatch, fail, iterator, not, opt, peek, preceded, repeat, repeat_till,
-    terminated, trace,
-};
+use winnow::combinator::{alt, iterator, opt, peek, repeat_till, trace};
 use winnow::prelude::*;
-use winnow::token::{any, one_of, take, take_until, take_while};
+use winnow::token::{one_of, take_while};
+use winnow::Parser;
 
-fn contraction<'a>(input: &mut &'a str) -> ModalResult<()> {
+fn contraction(input: &mut &str) -> ModalResult<()> {
     ('\'', alt(("s", "d", "m", "t", "ll", "ve", "re")))
         .void()
         .parse_next(input)
@@ -28,7 +23,7 @@ fn contraction<'a>(input: &mut &'a str) -> ModalResult<()> {
 //     unicode::is_letter.void().parse_next(input)
 // }
 
-fn letter_run<'a>(input: &mut &'a str) -> ModalResult<()> {
+fn letter_run(input: &mut &str) -> ModalResult<()> {
     trace(
         "letter_run",
         (opt(' '), take_while(1.., unicode::is_letter_complete)),
@@ -37,7 +32,7 @@ fn letter_run<'a>(input: &mut &'a str) -> ModalResult<()> {
     .parse_next(input)
 }
 
-fn number_run<'a>(input: &mut &'a str) -> ModalResult<()> {
+fn number_run(input: &mut &str) -> ModalResult<()> {
     trace(
         "number_run",
         (opt(' '), take_while(1.., unicode::is_number_complete)),
@@ -46,7 +41,7 @@ fn number_run<'a>(input: &mut &'a str) -> ModalResult<()> {
     .parse_next(input)
 }
 
-fn whitespace_run<'a>(input: &mut &'a str) -> ModalResult<()> {
+fn whitespace_run(input: &mut &str) -> ModalResult<()> {
     trace(
         "whitespace_run",
         repeat_till::<_, (), (), _, _, _, _>(
@@ -69,7 +64,7 @@ fn single_whitespace(input: &mut &str) -> ModalResult<()> {
         .parse_next(input)
 }
 
-fn other_run<'a>(input: &mut &'a str) -> ModalResult<()> {
+fn other_run(input: &mut &str) -> ModalResult<()> {
     trace(
         "other_run",
         (opt(' '), take_while(1.., |c| unicode::is_other_complete(c))),
@@ -78,7 +73,7 @@ fn other_run<'a>(input: &mut &'a str) -> ModalResult<()> {
     .parse_next(input)
 }
 
-fn pretoken<'a>(input: &mut &'a str) -> ModalResult<&'a str> {
+fn pretoken<'a>(input: &mut &'a str) -> ModalResult<Pretoken<'a>> {
     alt((
         contraction,
         letter_run,
@@ -88,25 +83,26 @@ fn pretoken<'a>(input: &mut &'a str) -> ModalResult<&'a str> {
         single_whitespace,
     ))
     .take()
+    .map(|s: &str| Pretoken(s.as_bytes()))
     .parse_next(input)
 }
 
-pub fn pretokens<'a>(input: &mut &'a str) -> ModalResult<Vec<&'a str>> {
-    repeat::<_, &str, Vec<&str>, _, _>(1.., pretoken).parse_next(input)
-}
+// pub fn pretokens<'a>(input: &mut &'a str) -> ModalResult<Vec<&'a str>> {
+//     repeat::<_, &str, Vec<&str>, _, _>(1.., pretoken).parse_next(input)
+// }
 
-pub fn parse_pretokens(input: &[u8]) -> Result<Vec<&str>> {
-    let mut slice: &str = unsafe { std::str::from_utf8_unchecked(input) };
-    let result = pretokens(&mut slice).map_err(|e| anyhow!("Parse error: {}", e));
-    if slice.len() != 0 {
-        Err(anyhow!(
-            "Did not consume all input, remaining: {:?}",
-            &slice[..min(32, slice.len())]
-        ))
-    } else {
-        result
-    }
-}
+// pub fn parse_pretokens(input: &[u8]) -> Result<Vec<&str>> {
+//     let mut slice: &str = unsafe { std::str::from_utf8_unchecked(input) };
+//     let result = pretokens(&mut slice).map_err(|e| anyhow!("Parse error: {}", e));
+//     if slice.len() != 0 {
+//         Err(anyhow!(
+//             "Did not consume all input, remaining: {:?}",
+//             &slice[..min(32, slice.len())]
+//         ))
+//     } else {
+//         result
+//     }
+// }
 
 pub struct PretokenIterator<'a> {
     input: &'a [u8],
@@ -117,10 +113,11 @@ pub fn pretokens_iterator<'a>(
 ) -> winnow::combinator::ParserIterator<
     impl FnMut(
         &mut &'a str,
-    ) -> std::result::Result<&'a str, winnow::error::ErrMode<winnow::error::ContextError>>
+    )
+        -> std::result::Result<Pretoken<'a>, winnow::error::ErrMode<winnow::error::ContextError>>
     + 'a,
     &'a str,
-    &'a str,
+    Pretoken<'a>,
     winnow::error::ErrMode<winnow::error::ContextError>,
 > {
     iterator(input, pretoken)
@@ -130,12 +127,12 @@ pub fn pretokens_iterator<'a>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_pretokens() {
-        let input = "Hello, world!";
-        let pretokens = parse_pretokens(input.as_bytes()).unwrap();
-        eprintln!("{:?}", pretokens);
-    }
+    // #[test]
+    // fn test_parse_pretokens() {
+    //     let input = "Hello, world!";
+    //     let pretokens = parse_pretokens(input.as_bytes()).unwrap();
+    //     eprintln!("{:?}", pretokens);
+    // }
 
     #[test]
     fn combinator_compare() {
@@ -147,12 +144,16 @@ mod tests {
         for eorb in standard_iterator.zip_longest(&mut combinator_iterator) {
             match eorb {
                 itertools::EitherOrBoth::Both(a, b) => {
-                    if a.0 != b.as_bytes() {
-                        eprintln!("Mismatch: {:?} != {:?}", String::from_utf8_lossy(a.0), b);
+                    if a.0 != b.0 {
+                        eprintln!(
+                            "Mismatch: {:?} != {:?}",
+                            String::from_utf8_lossy(a.0),
+                            String::from_utf8_lossy(b.0)
+                        );
 
                         // Find text before and after the mismatch by comparing pointers from a.0 and input_bytes
                         let a_start = a.0.as_ptr() as usize;
-                        let b_start = b.as_ptr() as usize;
+                        let b_start = b.0.as_ptr() as usize;
                         let input_start = input_bytes.as_ptr() as usize;
                         let a_offset = a_start - input_start;
 
@@ -178,7 +179,7 @@ mod tests {
                     assert!(false);
                 }
                 itertools::EitherOrBoth::Right(b) => {
-                    eprintln!("Right only: {:?}", b);
+                    eprintln!("Right only: {:?}", String::from_utf8_lossy(b.0));
 
                     // Find text before and after the mismatch by comparing pointers from b and input_bytes
                     let b_start = b.as_ptr() as usize;
