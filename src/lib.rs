@@ -1,13 +1,16 @@
 pub(crate) mod bpe;
 pub(crate) mod bpe_train;
 pub(crate) mod input;
-pub(crate) mod pretokenize;
+pub mod pretokenize;
 pub(crate) mod token;
 pub(crate) mod utils;
+use crate::bpe::Tokenizer;
+use crate::pretokenize::pretokenize_as_iter;
+pub(crate) mod load_tokenizer;
 use itertools::Itertools;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyDict};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Formats the sum of two numbers as string.
 #[pyfunction]
@@ -291,6 +294,43 @@ fn train_bpe<'py>(
 // }
 
 #[pyclass]
+struct BPETokenizer {
+    tokenizer: Tokenizer,
+}
+
+#[pymethods]
+impl BPETokenizer {
+    #[new]
+    fn __new__() -> PyResult<Self> {
+        Ok(Self {
+            tokenizer: load_tokenizer::tiktoken::load_tiktoken(
+                "/Users/marcel/data/tokenizers/r50k_base.tiktoken",
+            )?,
+        })
+    }
+    #[staticmethod]
+    fn from_tiktoken(path: &str) -> PyResult<Self> {
+        Ok(Self {
+            tokenizer: load_tokenizer::tiktoken::load_tiktoken(path)?,
+        })
+    }
+    fn encode(&mut self, input: &[u8]) -> PyResult<Vec<u32>> {
+        let iter = self.tokenizer.memoized_encode(pretokenize_as_iter(input));
+        let mut v = vec![];
+        for arc in iter {
+            for &e in arc.into_iter() {
+                v.push(e.into())
+            }
+        }
+        Ok(v)
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        Ok(format!("{:?}", self.tokenizer))
+    }
+}
+
+#[pyclass]
 struct PretokenizerIter {
     pretokenizer_iter: pretokenize::PretokenizerIter<'static>,
     bytes: Py<PyBytes>,
@@ -343,6 +383,7 @@ fn toker_rs<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
     // m.add_class::<RustTokenizer>()?;
     m.add_function(wrap_pyfunction!(train_bpe, m)?)?;
     m.add_class::<PretokenizerIter>()?;
+    m.add_class::<BPETokenizer>()?;
     m.add_function(wrap_pyfunction!(pretokenizer, m)?)?;
     m.add_function(wrap_pyfunction!(pretokenized_counts, m)?)?;
     Ok(())
