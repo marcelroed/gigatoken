@@ -1,6 +1,6 @@
 use indicatif::ProgressIterator;
 
-use crate::{pretokenize::Pretoken, token::TokenId};
+use crate::token::TokenId;
 
 // use clap::
 
@@ -45,12 +45,12 @@ pub fn main() {
     let path = "/Users/marcel/data/TinyStoriesV2-GPT4-train.txt";
     let file = std::fs::File::open(path).unwrap();
     let bytes_memmapped = unsafe { memmap2::Mmap::map(&file) }.unwrap();
-    // let pretoken_iter = pretokenize::pretokenize_as_iter(bytes_memmapped.as_ref());
-    let mut pretoken_iter = pretokenize::pretoken_combinator::pretokens_iterator(unsafe {
-        std::str::from_utf8_unchecked(bytes_memmapped.as_ref())
-    });
-    // let token_ids = tokenizer.memoized_encode(pretoken_iter);
-    let token_ids = tokenizer.memoized_encode(&mut pretoken_iter);
+    let pretoken_iter = pretokenize::pretokenize_as_iter(bytes_memmapped.as_ref());
+    // let mut pretoken_iter = pretokenize::pretoken_combinator::pretokens_iterator(unsafe {
+    //     std::str::from_utf8_unchecked(bytes_memmapped.as_ref())
+    // });
+    let token_ids = tokenizer.memoized_encode(pretoken_iter);
+    // let token_ids = tokenizer.memoized_encode(&mut pretoken_iter);
     let mut out: Vec<u32> = vec![];
     let start_time = std::time::Instant::now();
     // let bar = ProgressBar::new(bytes_memmapped.len() as u64).with_style(

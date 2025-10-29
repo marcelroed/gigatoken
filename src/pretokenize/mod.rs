@@ -1,3 +1,5 @@
+//! The pretokenizer is responsible for taking a single document and producing an iterator of
+//! pretokens.
 use crate::bpe_train::PretokenizeableSpec;
 use crate::input::DocRef;
 pub(crate) use crate::pretokenize::pretoken::Pretoken;
