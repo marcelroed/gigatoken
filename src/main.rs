@@ -46,6 +46,8 @@ pub fn main() {
     let mut tokenizer = load_tokenizer::tiktoken::load_tiktoken(dir).unwrap();
     // Memmap the file and treat it as a slice of bytes
     let path = data_dir.join("TinyStoriesV2-GPT4-train.txt");
+    // let path = data_dir.join("owt_valid.txt");
+
     let file = std::fs::File::open(path).unwrap();
     let bytes_memmapped = unsafe { memmap2::Mmap::map(&file) }.unwrap();
     let pretoken_iter = pretokenize::pretokenize_as_iter(bytes_memmapped.as_ref());
@@ -72,9 +74,11 @@ pub fn main() {
     // let out = unsafe { std::mem::transmute::<Vec<TokenId>, Vec<u32>>(out) };
     let end_time = std::time::Instant::now();
     println!(
-        "Tokenized {} bytes into {} tokens in {:?}",
+        "Tokenized {} bytes into {} tokens in {:?} ({:.3} MB/s), with {} total pretokens",
         bytes_memmapped.len(),
         out.len(),
-        end_time - start_time
+        end_time - start_time,
+        bytes_memmapped.len() as f64 / (end_time - start_time).as_secs_f64() / 1024.0 / 1024.0,
+        tokenizer.pretoken_cache_size(),
     );
 }

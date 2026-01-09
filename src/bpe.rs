@@ -1,10 +1,13 @@
+use bumpalo::collections::CollectIn;
 use itertools::Itertools;
 
 use crate::pretokenize::Pretoken;
 use crate::token::TokenId;
 use eyre::{Context, Result, anyhow};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::rc::Rc;
 use std::sync::Arc;
 // pub fn encode_par(pretokenizeable: PretokenizeableSpec) {
 //     match pretokenizeable {
@@ -70,14 +73,48 @@ pub struct Tokenizer {
     vocab_inv: HashMap<Arc<[u8]>, TokenId>,       // Maps byte sequences to token ids
     byte_remapping: Option<ByteRemapping>, // Remaps bytes, because some tokenizers do this for some reason
     pretoken_cache: HashMap<Arc<[u8]>, Arc<[TokenId]>, rustc_hash::FxBuildHasher>,
+    // merge_arena: bumpalo::Bump, // Arena to use for BPE merging (avoid tons of alloc/dealloc)
 }
 
+use bumpalo::collections::Vec as BumpVec;
+
 /// Tokenize a single pretoken by repeatedly applying BPE merges in order.
-pub fn simple_bpe_merge(
+pub fn simple_bpe_merge<'a>(
     merges: &HashMap<(TokenId, TokenId), TokenId>,
     pre_token: &[u8],
 ) -> Vec<TokenId> {
     let mut symbols: Vec<TokenId> = pre_token.iter().map(|&b| TokenId::from(b as u32)).collect();
+
+    loop {
+        let candidate_merges = symbols
+            .iter()
+            .copied()
+            .tuple_windows()
+            .enumerate()
+            .filter_map(|(i, (a, b))| merges.get(&(a, b)).map(|&v| (i, v)));
+
+        let best_merge = candidate_merges.min_by_key(|(_index, merged_token)| *merged_token); // Earliest merge in list of merges
+
+        if let Some((merge_index, merge_token)) = best_merge {
+            symbols[merge_index] = merge_token;
+            symbols.remove(merge_index + 1); // O(n) worst case
+        } else {
+            break;
+        }
+    }
+    symbols
+}
+
+/// Tokenize a single pretoken by repeatedly applying BPE merges in order.
+pub fn simple_bpe_merge_in_arena<'a>(
+    merges: &HashMap<(TokenId, TokenId), TokenId>,
+    pre_token: &[u8],
+    merge_arena: &'a bumpalo::Bump,
+) -> BumpVec<'a, TokenId> {
+    let mut symbols: BumpVec<TokenId> = pre_token
+        .iter()
+        .map(|&b| TokenId::from(b as u32))
+        .collect_in(merge_arena);
 
     loop {
         let candidate_merges = symbols
@@ -95,6 +132,7 @@ pub fn simple_bpe_merge(
             break;
         }
     }
+    symbols.shrink_to_fit();
     symbols
 }
 
@@ -116,6 +154,7 @@ impl Tokenizer {
             vocab,
             byte_remapping,
             pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            // merge_arena: bumpalo::Bump::new(),
         }
     }
 
@@ -153,29 +192,30 @@ impl Tokenizer {
             vocab,
             vocab_inv,
             pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            // merge_arena: bumpalo::Bump::new(),
         })
     }
 
     pub fn encode_pretoken(
-        byte_remapping: &Option<ByteRemapping>,
+        byte_remapping: Option<&ByteRemapping>,
         merges: &HashMap<(TokenId, TokenId), TokenId>,
         pretoken: Pretoken,
     ) -> Vec<TokenId> {
         // TODO improve
-        let pretoken = if let Some(byte_remapping) = &byte_remapping {
+        let pretoken: Cow<[u8]> = if let Some(byte_remapping) = byte_remapping {
             pretoken
                 .iter()
                 .map(|&b| byte_remapping.mapping[b as usize])
-                .collect::<Vec<u8>>()
+                .collect::<Cow<[u8]>>()
         } else {
-            pretoken.to_vec()
+            Cow::Borrowed(pretoken.0)
         };
         simple_bpe_merge(merges, &pretoken)
     }
 
     /// For each pretoken in the input iterator, looks up the string in the cache, and if not found, encodes it and inserts it into the cache.
-    pub fn memoized_encode<'i>(
-        &mut self,
+    pub fn memoized_encode<'a, 'i>(
+        &'a mut self,
         pretoken_iter: impl Iterator<Item = Pretoken<'i>>,
     ) -> impl Iterator<Item = Arc<[TokenId]>> {
         let pretoken_cache = &mut self.pretoken_cache;
@@ -185,7 +225,7 @@ impl Tokenizer {
                 return v.clone();
             }
             let inserted_value: Arc<[TokenId]> =
-                Self::encode_pretoken(&self.byte_remapping, &self.merges, pretoken).into();
+                Self::encode_pretoken(self.byte_remapping.as_ref(), &self.merges, pretoken).into();
             pretoken_cache.insert(pretoken.as_ref().into(), inserted_value.clone());
             inserted_value
         })
@@ -201,6 +241,11 @@ impl Tokenizer {
                 // return base_symbols;
             })
             .copied()
+    }
+
+    /// Get the number of pretokens currently in the cache
+    pub fn pretoken_cache_size(&self) -> usize {
+        self.pretoken_cache.len()
     }
 }
 
