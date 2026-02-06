@@ -66,7 +66,7 @@ pub trait ScalarGatherTable {
 
 impl ScalarGatherTable for &[u8] {
     type Element = u8;
-    #[unsafe(no_mangle)]
+    // #[unsafe(no_mangle)]
     unsafe fn scalar_gather_lookup(self, indices: s::u16x8) -> s::Simd<Self::Element, 8> {
         unsafe {
             let base = self.as_ptr();
@@ -100,6 +100,7 @@ impl ScalarGatherTable for &[u8] {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use rand::{Rng, RngCore};

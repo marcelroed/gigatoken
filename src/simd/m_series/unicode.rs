@@ -1,15 +1,10 @@
-// /// Look up a set of indices in a table using vpgatherdd from AVX512VL/AVX512F.
-// use core::arch::x86_64::_mm512_i32gather_epi32 as vpgatherdd;
-// use core::arch::x86_64::_mm512_permutex2var_epi8 as vpermi2b;
-// use std::simd as s;
+//! Look up a set of indices in a table using scalar gather lookups (fastest on M-series).
+//! This module constructs a table of general category lookups for all Unicode characters.
+//! Hopefully, a small subset of this table will be needed and can fit in cache.
 
-// unsafe fn vpgather_table_lookup(table: &[i32], offsets: s::i32x16) -> s::i32x16 {
-//     unsafe { vpgatherdd::<4>(offsets.into(), table.as_ptr()) }.into()
-// }
+use super::table::ScalarGatherTable;
 
-// unsafe fn vpermi2b_table_lookup(table1: s::u8x64, table2: s::u8x64, indices: s::u8x64) -> s::u8x64 {
-//     unsafe { vpermi2b(table1.into(), indices.into(), table2.into()) }.into()
-// }
+
 
 // mod tests {
 //     use super::*;
