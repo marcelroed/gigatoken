@@ -10,7 +10,7 @@
 
 import marimo
 
-__generated_with = "0.17.0"
+__generated_with = "0.17.4"
 app = marimo.App(width="full")
 
 
@@ -274,13 +274,11 @@ def _(Bits, Sentence, mo):
 
 @app.cell
 def _(mo):
-    mo.md(
-        r"""
+    mo.md(r"""
     ### Notes
     It seems like we need 3 tokens from the past, and 3 tokens into the future, both for finding contractions.
     Maybe then we just load 8 tokens extra and slap 4 onto each side?
-    """
-    )
+    """)
     return
 
 
@@ -291,13 +289,11 @@ def _():
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md(
-        r"""
+    mo.md(r"""
     ### New Notes
     It seems like we can handle the unicode case with not too much of a hassle.
     If we enumerate all the unicode code points in utf-32, they break down into ~910 ranges of Letter/Number/Other general category groups. We can handle this size of classification within SIMDJson style of processing.
-    """
-    )
+    """)
     return
 
 

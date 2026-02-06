@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.17.2"
+__generated_with = "0.17.4"
 app = marimo.App(width="full")
 
 
@@ -96,6 +96,8 @@ def _(CLASS_L, CLASS_N, CLASS_O, CLASS_Z):
     def _codepoints():
         res = []
         for cp in range(0x110000):
+            # if category(chr(cp)) in ('Cs', 'Co', 'Cn'):
+            #     continue
             res.append(Codepoint.from_utf32(cp))
 
         by_length: list[list[Codepoint]] = [[] for _ in range(5)]
@@ -138,8 +140,7 @@ def _():
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md(
-        r"""
+    mo.md(r"""
     ## Compressed Byte DFA
 
     We want to scan byte by byte through each 4-tuple of the text, (comparing lane shifted `b0, b1, b2, b3`), producing the class of the sequence that starts at `b0`.
@@ -148,15 +149,14 @@ def _(mo):
     * What is the output type of the bytes I've processed (we're done)
     * What is the minimum state I need to disambiguate between byte sequences that share the next few bytes
 
-    The table lookups need to be in 
+    The table lookups need to be in
 
     ### How do we construct this state machine?
     To begin with, we have to store all the necessary information about previous bytes (and no more!).
     If we do this with each byte processed, we need to do lookups with the byte _and_ the carried context, which is more than we can look up using SIMD.
     Instead we want to process each nibble along with a state nibble that we carry along with us (4 * 2 = 8) lookups.
     We can layout our sequences in bit strings + class.
-    """
-    )
+    """)
     return
 
 
@@ -355,7 +355,9 @@ def _(codepoints):
 
 @app.cell
 def _(mo):
-    mo.md(r"""### Code to construct real tables from the merges we hypothesized above""")
+    mo.md(
+        r"""### Code to construct real tables from the merges we hypothesized above"""
+    )
     return
 
 
@@ -365,7 +367,7 @@ def _(codepoints, defaultdict):
         # Build tables to map between constructed states
 
         states_by_length = []
-    
+
         by_prefix_length = []
         with_shared_prefix = defaultdict(list)
         for prefix_len in range(0, 33):
@@ -589,7 +591,6 @@ def _(CLASS, IntEnum, codepoints3_with_emoji, dataclass, defaultdict):
     print(dfa.describe())
     print("Classify (1,0):", dfa.classify((1,0)))
     print("Classify (1,1):", dfa.classify((1,1)))  # -> None (not in set)
-
     return
 
 
