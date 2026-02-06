@@ -4,16 +4,16 @@ use std::hint::black_box;
 
 use rand::{self, Rng};
 
-pub fn fibonacci(n: u64) -> u64 {
-    let mut a = 0;
-    let mut b = 1;
-    for _ in 0..n {
-        let c = a + b;
-        a = b;
-        b = c;
-    }
-    a
-}
+// pub fn fibonacci(n: u64) -> u64 {
+//     let mut a = 0;
+//     let mut b = 1;
+//     for _ in 0..n {
+//         let c = a + b;
+//         a = b;
+//         b = c;
+//     }
+//     a
+// }
 
 // Removed dependency since icu is ~95% faster
 // use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
