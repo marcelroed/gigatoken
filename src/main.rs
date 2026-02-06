@@ -15,6 +15,7 @@ mod output;
 mod pretokenize;
 pub(crate) mod simd;
 mod token;
+pub(crate) mod unicode_tables;
 
 pub fn main() {
     // Get args (path to file, vocab size)
@@ -47,12 +48,16 @@ pub fn main() {
     let mut tokenizer = load_tokenizer::tiktoken::load_tiktoken(dir).unwrap();
     // Memmap the file and treat it as a slice of bytes
     // let path = data_dir.join("TinyStoriesV2-GPT4-train.txt");
-    let path = data_dir.join("owt_valid.txt");
+    let path = data_dir.join("TinyStoriesV2-GPT4-train.txt");
+
+    // We process in chunks, then compute the total number of tokens we need to write (as well as offsets to write them at).
+    const PARALLEL_CHUNK_READ_SIZE: usize = 1024 * 1024 * 1024; // 1GB read each iteration
 
     let file = std::fs::File::open(path).unwrap();
     let bytes_memmapped = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+    // for window in bytes_memmapped.as_ref().windows(PARALLEL_CHUNK_READ_SIZE) {
     let pretoken_iter = pretokenize::pretokenize_as_iter(bytes_memmapped.as_ref());
-    // let mut pretoken_iter = pretokenize::pretoken_combinator::pretokens_iterator(unsafe {
+    // let mut pretoken_iter = pretokenize::pretoken
     //     std::str::from_utf8_unchecked(bytes_memmapped.as_ref())
     // });
     let token_ids = tokenizer.memoized_encode(pretoken_iter);

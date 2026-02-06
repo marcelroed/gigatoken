@@ -191,7 +191,6 @@ impl Tokenizer {
             vocab,
             vocab_inv,
             pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
-            // merge_arena: bumpalo::Bump::new(),
         })
     }
 
@@ -200,7 +199,7 @@ impl Tokenizer {
         merges: &HashMap<(TokenId, TokenId), TokenId>,
         pretoken: Pretoken,
     ) -> Vec<TokenId> {
-        // TODO improve
+        // TODO(marcelroed): improve if this is ever a bottleneck
         let pretoken: Cow<[u8]> = if let Some(byte_remapping) = byte_remapping {
             pretoken
                 .iter()
