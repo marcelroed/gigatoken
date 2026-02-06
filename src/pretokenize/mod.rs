@@ -12,6 +12,7 @@ use std::cmp::min;
 use std::collections::HashMap;
 
 mod pretoken;
+mod pretoken_chunks;
 pub mod pretoken_combinator;
 mod pretokenize_traits;
 mod simd;
