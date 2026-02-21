@@ -1,16 +1,16 @@
 //! Implement the regex
 //! '(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
 //! using winnow parser combinators.
-use crate::pretokenize::{unicode, Pretoken};
+use crate::pretokenize::{Pretoken, unicode};
 use std::cmp::min;
 
 use eyre::Context;
 use itertools::Itertools;
 use rayon::prelude::*;
+use winnow::Parser;
 use winnow::combinator::{alt, iterator, opt, peek, repeat_till, trace};
 use winnow::prelude::*;
 use winnow::token::{one_of, take_while};
-use winnow::Parser;
 
 fn contraction(input: &mut &str) -> ModalResult<()> {
     ('\'', alt(("s", "d", "m", "t", "ll", "ve", "re")))
@@ -136,8 +136,8 @@ mod tests {
 
     #[test]
     fn combinator_compare() {
-        let input =
-            std::fs::read_to_string("/Users/marcel/data/TinyStoriesV2-GPT4-valid.txt").unwrap();
+        let data_dir = std::env::home_dir().unwrap().join("data");
+        let input = std::fs::read_to_string(data_dir.join("TinyStoriesV2-GPT4-valid.txt")).unwrap();
         let input_bytes = input.as_bytes();
         let standard_iterator = crate::pretokenize::pretokenize_as_iter(input_bytes);
         let mut combinator_iterator = pretokens_iterator(&input);

@@ -25,8 +25,6 @@ fn winnow_pretokenize(input: &[u8]) -> Vec<&[u8]> {
     v
 }
 
-
-
 pub fn criterion_benchmark(c: &mut Criterion) {
     // c.bench_function("fib 20", |b| b.iter(|| fibonacci(black_box(20))));
     let mut group = c.benchmark_group("unicode_classify");
@@ -35,8 +33,8 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     //     .sample_iter::<char, _>(rand::distr::StandardUniform)
     //     .take(4096)
     //     .collect();
-    let ts_input =
-        std::fs::read_to_string("/Users/marcel/data/TinyStoriesV2-GPT4-valid.txt").unwrap();
+    let data_dir = std::env::home_dir().unwrap().join("data");
+    let ts_input = std::fs::read_to_string(data_dir.join("TinyStoriesV2-GPT4-valid.txt")).unwrap();
     let bytes_input = ts_input.as_bytes();
 
     group.bench_with_input("winnow", bytes_input, |b, bytes: &[u8]| {

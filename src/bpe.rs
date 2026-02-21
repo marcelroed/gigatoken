@@ -348,7 +348,9 @@ mod tests {
     fn test_merges_from_vocab() {
         use base64::prelude::*;
         let mut buf = String::new();
-        std::fs::File::open("/Users/marcel/data/tokenizers/r50k_base.tiktoken")
+        let data_dir = std::env::home_dir().unwrap().join("data");
+        let tiktoken_path = data_dir.join("tokenizers/r50k_base.tiktoken");
+        std::fs::File::open(tiktoken_path)
             .expect("Didn't find file")
             .read_to_string(&mut buf)
             .unwrap();
@@ -396,8 +398,9 @@ mod tests {
     #[test]
     fn basic_tokenization() {
         let text = "This is a test string. Please tokenize it!";
-        let mut tokenizer = load_tiktoken("/Users/marcel/data/tokenizers/r50k_base.tiktoken")
-            .expect("Failed to load tokenizer");
+        let data_dir = std::env::home_dir().unwrap().join("data");
+        let tiktoken_path = data_dir.join("tokenizers/r50k_base.tiktoken");
+        let mut tokenizer = load_tiktoken(tiktoken_path).expect("Failed to load tokenizer");
         let pretokenize_iter = crate::pretokenize::pretokenize_as_iter(text.as_bytes());
         let mut output = vec![];
         tokenizer

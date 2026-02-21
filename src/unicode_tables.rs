@@ -154,7 +154,8 @@ mod tests {
     fn test_make_tree() {
         use memmap2::Mmap;
         // let file = File::open("/Users/marcel/data/TinyStoriesV2-GPT4-train.txt").unwrap();
-        let file = File::open("/Users/marcel/data/owt_train.txt").unwrap();
+        let data_dir = std::env::home_dir().unwrap().join("data");
+        let file = File::open(data_dir.join("owt_train.txt")).unwrap();
         let mmap = unsafe { Mmap::map(&file).expect("mmap failed") };
         let text = unsafe { str::from_utf8_unchecked(&mmap) };
         let table = table_from_text(text);
@@ -173,7 +174,8 @@ mod tests {
     fn bench_file_unicode_list(b: &mut Bencher) {
         // Read the file and build a set of all the codepoints that appear
         // Use memmap to read the file
-        let file = File::open("/Users/marcel/data/owt_train.txt").unwrap();
+        let data_dir = std::env::home_dir().unwrap().join("data");
+        let file = File::open(data_dir.join("owt_train.txt")).unwrap();
 
         use memmap2::Mmap;
         use std::io::Read;
