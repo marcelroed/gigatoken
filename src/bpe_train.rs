@@ -152,10 +152,52 @@ pub enum PretokenizeableSpec<'a> {
     Parquet(PathBuf),
 }
 
+/// How to break ties when multiple pairs have the same frequency count.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum TieBreaking {
+    /// Compare by token IDs remapped to match HuggingFace tokenizers' BpeTrainer
+    /// initial vocabulary ordering (ByteLevel unicode codepoint order for bytes 0-255).
+    #[default]
+    HuggingFace,
+    /// Compare by raw (u32, u32) token IDs (byte value = token ID).
+    RawTokenIds,
+    /// Assemble each token's bytes into a string and compare lexicographically.
+    AssembledBytes,
+}
+
+/// Build a mapping from byte value (0-255) to the rank it would receive in
+/// HuggingFace's BpeTrainer initial vocabulary. HF sorts the ByteLevel alphabet
+/// by unicode codepoint: printable ASCII/Latin-1 bytes keep their codepoint,
+/// while the remaining 68 bytes are remapped to U+0100..U+0143.
+fn build_byte_to_hf_rank() -> [u32; 256] {
+    let mut byte_to_cp = [0u32; 256];
+    let mut n = 0u32;
+    for b in 0..=255u8 {
+        let is_allowed = matches!(b, 33..=126 | 161..=172 | 174..=255);
+        if is_allowed {
+            byte_to_cp[b as usize] = b as u32;
+        } else {
+            byte_to_cp[b as usize] = 256 + n;
+            n += 1;
+        }
+    }
+
+    // Sort bytes by their unicode codepoint, then record position as rank
+    let mut bytes_sorted: Vec<u8> = (0..=255).collect();
+    bytes_sorted.sort_by_key(|&b| byte_to_cp[b as usize]);
+
+    let mut rank = [0u32; 256];
+    for (i, &b) in bytes_sorted.iter().enumerate() {
+        rank[b as usize] = i as u32;
+    }
+    rank
+}
+
 pub fn train_bpe(
     pretokenizeable: PretokenizeableSpec,
     vocab_size: usize,
     special_tokens: Vec<String>,
+    tie_breaking: TieBreaking,
 ) -> BPEResult {
     let counts = pretokenize_par(pretokenizeable);
 
@@ -201,6 +243,9 @@ pub fn train_bpe(
             .map(|x| x.bytes().collect::<Vec<u8>>()),
     );
 
+    // Build HF rank table for tie-breaking (only used in HuggingFace mode)
+    let hf_rank = build_byte_to_hf_rank();
+
     let mut pq = PriorityQueue::new();
     symbol_counts.into_iter().for_each(|(pair, count)| {
         pq.push(pair, count);
@@ -226,14 +271,44 @@ pub fn train_bpe(
                 }
                 tied_pairs.push(pq.pop().unwrap().0);
             }
-            // Find the smallest pair lexicographically
+            // Find the smallest pair according to the chosen tie-breaking rule
             let mut smallest_pair = first_pair;
-            let assemble_pair =
-                |(p0, p1)| (assemble_token(p0, &symbols), assemble_token(p1, &symbols));
-
-            for pair in tied_pairs.iter().copied() {
-                if assemble_pair(pair) < assemble_pair(smallest_pair) {
-                    smallest_pair = pair;
+            match tie_breaking {
+                TieBreaking::HuggingFace => {
+                    // Remap initial byte token IDs to HF's ByteLevel unicode
+                    // codepoint ordering before comparison.
+                    let remap = |id: u32| -> u32 {
+                        if id < 256 {
+                            hf_rank[id as usize]
+                        } else {
+                            id
+                        }
+                    };
+                    for &pair in &tied_pairs {
+                        let remapped = (remap(pair.0), remap(pair.1));
+                        let remapped_smallest =
+                            (remap(smallest_pair.0), remap(smallest_pair.1));
+                        if remapped < remapped_smallest {
+                            smallest_pair = pair;
+                        }
+                    }
+                }
+                TieBreaking::RawTokenIds => {
+                    for &pair in &tied_pairs {
+                        if pair < smallest_pair {
+                            smallest_pair = pair;
+                        }
+                    }
+                }
+                TieBreaking::AssembledBytes => {
+                    let assemble_pair = |(p0, p1)| {
+                        (assemble_token(p0, &symbols), assemble_token(p1, &symbols))
+                    };
+                    for pair in tied_pairs.iter().copied() {
+                        if assemble_pair(pair) < assemble_pair(smallest_pair) {
+                            smallest_pair = pair;
+                        }
+                    }
                 }
             }
 

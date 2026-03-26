@@ -17,14 +17,15 @@ use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyDict};
 use std::path::{Path, PathBuf};
 
-/// Formats the sum of two numbers as string.
 #[pyfunction]
 #[allow(clippy::type_complexity)]
+#[pyo3(signature = (in_data, vocab_size, special_tokens, tie_breaking = "huggingface"))]
 fn train_bpe<'py>(
     py: Python<'py>,
     in_data: Bound<'py, PyAny>,
     vocab_size: usize,
     special_tokens: Vec<String>,
+    tie_breaking: &str,
 ) -> PyResult<(
     Bound<'py, PyDict>,
     Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>,
@@ -34,6 +35,18 @@ fn train_bpe<'py>(
         vocab_size <= 2_usize.pow(32),
         "vocab_size must be less than 2^32"
     );
+
+    let tie_breaking = match tie_breaking {
+        "huggingface" => bpe_train::TieBreaking::HuggingFace,
+        "raw_token_ids" => bpe_train::TieBreaking::RawTokenIds,
+        "assembled_bytes" => bpe_train::TieBreaking::AssembledBytes,
+        other => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "tie_breaking must be 'huggingface', 'raw_token_ids', or 'assembled_bytes', got {other:?}"
+            )));
+        }
+    };
+
     // Check which input we got for
     let mut bytes_memmapped = None;
     let pretokenizeable = if in_data.is_instance_of::<PyBytes>() {
@@ -74,7 +87,7 @@ fn train_bpe<'py>(
 
     // Train BPE
     let bpe_train::BPEResult { vocab, merges } =
-        bpe_train::train_bpe(pretokenizeable, vocab_size, special_tokens);
+        bpe_train::train_bpe(pretokenizeable, vocab_size, special_tokens, tie_breaking);
 
     // Convert vocab to Python
     let vocab_py = vocab
