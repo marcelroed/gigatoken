@@ -2,7 +2,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use icu::properties::{CodePointMapDataBorrowed, props::EnumeratedProperty};
 use std::hint::black_box;
 
-use rand::{self, Rng};
+use rand::{self, Rng, RngExt};
 
 // pub fn fibonacci(n: u64) -> u64 {
 //     let mut a = 0;

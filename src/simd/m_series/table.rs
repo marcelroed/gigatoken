@@ -103,7 +103,7 @@ impl ScalarGatherTable for &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{Rng, RngCore};
+    use rand::{Rng, RngExt};
     extern crate test;
     use test::{Bencher, black_box};
 

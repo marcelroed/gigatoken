@@ -109,8 +109,9 @@ pub struct PretokenIterator<'a> {
 }
 
 pub fn pretokens_iterator<'a>(
-    input: &'a str,
+    input: &'a mut &'a str,
 ) -> winnow::combinator::ParserIterator<
+    'a,
     impl FnMut(
         &mut &'a str,
     )
@@ -140,7 +141,8 @@ mod tests {
         let input = std::fs::read_to_string(data_dir.join("TinyStoriesV2-GPT4-valid.txt")).unwrap();
         let input_bytes = input.as_bytes();
         let standard_iterator = crate::pretokenize::pretokenize_as_iter(input_bytes);
-        let mut combinator_iterator = pretokens_iterator(&input);
+        let mut input_slice = input.as_str();
+        let mut combinator_iterator = pretokens_iterator(&mut input_slice);
         for eorb in standard_iterator.zip_longest(&mut combinator_iterator) {
             match eorb {
                 itertools::EitherOrBoth::Both(a, b) => {

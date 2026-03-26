@@ -142,7 +142,7 @@ fn table_from_text(text: &str) -> CodePointTrie<'static, UnicodeClass> {
 mod tests {
     use super::*;
     use icu::properties::CodePointMapDataBorrowed;
-    use rand::{Rng, RngCore};
+    use rand::{Rng, RngExt};
     extern crate test;
     use std::{
         collections::{BTreeSet, HashSet},
