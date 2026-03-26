@@ -12,7 +12,9 @@ pub fn load_tiktoken(file_path: impl AsRef<Path>) -> Result<Tokenizer> {
         .with_context(|| format!("Failed to read {}", file_path.as_ref().display()))?
         .read_to_string(&mut buf)?;
 
-    let vocab: Vec<Vec<u8>> = buf
+    // Tiktoken vocabs contain a list of the vocab in order, meaning one needs to reconstruct the merges from this list.
+
+    let rank_vocab: Vec<Vec<u8>> = buf
         .lines()
         .enumerate()
         .map(|(i, line)| {
@@ -24,7 +26,5 @@ pub fn load_tiktoken(file_path: impl AsRef<Path>) -> Result<Tokenizer> {
         })
         .collect();
 
-    // Reorder based on
-
-    Tokenizer::from_ranks(vocab)
+    Tokenizer::from_ranks(rank_vocab)
 }
