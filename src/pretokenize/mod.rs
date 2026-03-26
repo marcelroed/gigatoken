@@ -11,12 +11,15 @@ use rayon::prelude::*;
 use std::cmp::min;
 use std::collections::HashMap;
 
+mod options;
 mod pretoken;
 mod pretoken_chunks;
 pub mod pretoken_combinator;
 mod pretokenize_traits;
 mod simd;
 mod unicode;
+
+pub use options::PretokenizerType;
 
 #[derive(Clone, Debug)]
 pub enum PretokenizerState {
@@ -608,96 +611,91 @@ impl Pretokenizer {
 
 #[cfg(test)]
 mod test {
-    use indicatif::ProgressIterator;
     use itertools::Itertools;
     use std::fs;
 
     use super::*;
 
-    // #[test]
-    // fn test_pretokenizer_ts_timing() {
-    //     let file_bytes = fs::read(
-    //         "/home/marcel/projects/spring2024-assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
-    //     )
-    //     .unwrap();
+    const GPT2_REGEX: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 
-    //     let pretokenized_counts = pretokenize_par(&file_bytes);
-    //     eprintln!("Pretokenized {} tokens", pretokenized_counts.len());
-    //     // eprintln!("Pretokenized counts: {:?}", pretokenized_counts);
-    //     // Print counts sorted by frequency
-    // }
+    /// Load the first `max_bytes` of ~/data/owt_train.txt, truncated to a UTF-8 boundary.
+    fn load_owt(max_bytes: usize) -> Vec<u8> {
+        let data_dir = std::env::home_dir().unwrap().join("data");
+        let all_bytes =
+            fs::read(data_dir.join("owt_train.txt")).expect("Could not read ~/data/owt_train.txt");
+        let mut end = max_bytes.min(all_bytes.len());
+        while end > 0 && std::str::from_utf8(&all_bytes[..end]).is_err() {
+            end -= 1;
+        }
+        all_bytes[..end].to_vec()
+    }
 
-    // #[test]
-    // fn test_pretokenizer_matches_regex() {
-    //     // let re = Regex::new(
-    //     //     r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
-    //     //     // onig::RegexOptions::REGEX_OPTION_NONE,
-    //     //     // onig::Syntax::oniguruma(),
-    //     // )
-    //     // .unwrap();
-    //     // // let re = Regex::new(r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
-    //     // //     .unwrap();
-    //     // let input = fs::read(
-    //     //     "/home/marcel/projects/spring2024-assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
-    //     // )
-    //     // .unwrap();
+    /// Compare the state-machine pretokenizer against the GPT-2 reference regex
+    /// on ~5 MB of OWT data, token by token.
+    #[test]
+    fn test_pretokenizer_matches_regex_owt() {
+        const SIZE: usize = 5_000_000;
+        let input = load_owt(SIZE);
+        eprintln!(
+            "Testing pretokenizer vs regex on {:.1} MB of OWT",
+            input.len() as f64 / 1e6
+        );
 
-    //     // let input = input[..10_000_000].to_vec();
+        let re = fancy_regex::Regex::new(GPT2_REGEX).unwrap();
+        let text = std::str::from_utf8(&input).unwrap();
 
-    //     // let pretokens = pretokenize_as_list(&input);
-    //     // let mut last_match: Option<(usize, usize)> = None;
-    //     for _ in (0..100).progress() {
-    //         let mut previous_tokens: Vec<(String, String)> = vec![];
+        let mut sm_iter = pretokenize_as_iter(&input);
+        let mut re_iter = re.find_iter(text);
+        let mut token_idx: usize = 0;
+        let mut recent: Vec<(String, String)> = Vec::new();
 
-    //         const WINDOW_SIZE: usize = 1_000_000;
-    //         let start = rand::rng().random_range(0..input.len() - WINDOW_SIZE);
-    //         let input = input[start..start + WINDOW_SIZE].to_vec();
-    //         let pretokens_iterator = pretokenize_as_iter(&input);
-    //         let re_iterator = re.find_iter(str::from_utf8(&input).unwrap());
-    //         for (token_idx, eorb) in pretokens_iterator.zip_longest(re_iterator).enumerate() {
-    //             let (token, (start, end)) = match eorb {
-    //                 itertools::EitherOrBoth::Both(first, second) => (first, second),
-    //                 itertools::EitherOrBoth::Left(first) => panic!(
-    //                     "No match found for token {token_idx} at bytes {first:?}, {:?}, {:?}",
-    //                     str::from_utf8(&input[input.len().saturating_sub(10)..]).unwrap(),
-    //                     &previous_tokens[previous_tokens.len().saturating_sub(10)..]
-    //                 ),
-    //                 itertools::EitherOrBoth::Right(second) => {
-    //                     panic!("No token found for match {token_idx} at byte {second:?}")
-    //                 }
-    //             };
-    //             // last_match = Some((start, end));
-    //             // let (&token, (start, end)) = eorb.both().unwrap();
-    //             let token_str = String::from_utf8_lossy(token).into_owned();
-    //             let match_str = String::from_utf8_lossy(&input[start..end]).into_owned();
-    //             previous_tokens.push((token_str.clone(), match_str.clone()));
-    //             // if pretokens.len() > 1000 {
-    //             //     pretokens.truncate(1000);
-    //             // }
-    //             assert_eq!(
-    //                 token_str,
-    //                 match_str,
-    //                 "Token {token_idx} (byte {start}) does not match regex, see last few {:?}\n Byte representation: {:02X?}{:02X?}\nExtended{:02X?}",
-    //                 &previous_tokens[previous_tokens.len().saturating_sub(10)..],
-    //                 token,
-    //                 &input[start..end],
-    //                 &input[start.saturating_sub(5)..end + 5]
-    //             );
-    //         }
-    //     }
-    // }
+        loop {
+            match (sm_iter.next(), re_iter.next()) {
+                (Some(sm_tok), Some(re_match)) => {
+                    let re_match = re_match.expect("regex match error");
+                    let sm_str = String::from_utf8_lossy(sm_tok.0);
+                    let re_str = &text[re_match.start()..re_match.end()];
+                    recent.push((sm_str.to_string(), re_str.to_string()));
+                    if recent.len() > 10 {
+                        recent.remove(0);
+                    }
+                    assert_eq!(
+                        sm_str, re_str,
+                        "Mismatch at token {token_idx} (byte ~{}).\n  state machine: {:?}\n  regex:         {:?}\n  recent tokens: {:?}",
+                        re_match.start(), sm_str, re_str, recent
+                    );
+                }
+                (None, None) => break,
+                (Some(sm_tok), None) => {
+                    panic!(
+                        "State machine produced extra token at index {token_idx}: {:?}\n  recent: {:?}",
+                        String::from_utf8_lossy(sm_tok.0),
+                        recent
+                    );
+                }
+                (None, Some(re_match)) => {
+                    let re_match = re_match.expect("regex match error");
+                    panic!(
+                        "Regex produced extra token at index {token_idx}: {:?}\n  recent: {:?}",
+                        &text[re_match.start()..re_match.end()],
+                        recent
+                    );
+                }
+            }
+            token_idx += 1;
+        }
+        eprintln!("All {token_idx} tokens match.");
+    }
 
     #[test]
     fn test_pretokenizer_ts() {
-        let file_bytes = fs::read("../../data/TinyStoriesV2-GPT4-train.txt").unwrap();
+        let data_dir = std::env::home_dir().unwrap().join("data");
+        let file_bytes = fs::read(data_dir.join("TinyStoriesV2-GPT4-train.txt")).unwrap();
 
-        // let pretokenized_counts = pretokenize_par(&file_bytes);
-        let pretokenized_counts = pretokenize_as_iter(&file_bytes)
-            .progress_count(644752805)
-            .counts();
-        eprintln!("Pretokenized {} tokens", pretokenized_counts.len());
-        // eprintln!("Pretokenized counts: {:?}", pretokenized_counts);
-        // Print counts sorted by frequency
+        let pretokenized_counts = pretokenize_as_iter(&file_bytes).counts();
+        eprintln!("Pretokenized {} unique tokens", pretokenized_counts.len());
+
         let mut sorted_counts: Vec<_> = pretokenized_counts.iter().collect();
         sorted_counts.sort_by_key(|&(_, &v)| v);
         sorted_counts.reverse();
@@ -707,62 +705,11 @@ mod test {
     }
 
     #[test]
-    fn test_pretokenizer_no_count_ts() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let file_bytes = fs::read(data_dir.join("TinyStoriesV2-GPT4-train.txt")).unwrap();
-
-        // let pretokenized_counts = pretokenize_par(&file_bytes);
-        let pretokens = pretokenize_as_iter(&file_bytes)
-            .progress_count(644752805)
-            .count();
-        eprintln!("Pretokenized {} tokens", pretokens);
-    }
-
-    /// Make sure the total number of pretokens matches Python regex
-    #[test]
-    fn test_pretokenizer_ts_length() {
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let file_bytes = fs::read(data_dir.join("TinyStoriesV2-GPT4-train.txt")).unwrap();
-
-        let pretokens_count = pretokenize_as_iter(&file_bytes).count();
-        eprintln!("Pretokenized {pretokens_count} tokens");
-        // Check that the total length of all tokens is equal to the input length
-        // assert_eq!(
-        //     pretokens_count, 544752805,
-        //     "Total number of pretokens does not match expected count"
-        // );
-    }
-
-    #[test]
     fn test_pretokenizer_owt_length() {
         let data_dir = std::env::home_dir().unwrap().join("data");
         let file_bytes = fs::read(data_dir.join("owt_train.txt")).unwrap();
 
         let pretokens_count = pretokenize_as_iter(&file_bytes).count();
         eprintln!("Pretokenized {pretokens_count} tokens");
-        // Check that the total length of all tokens is equal to the input length
-        // assert_eq!(pretokens_count, 544752805, "Total number of pretokens does not match expected count");
-        // assert_eq!(
-        //     pretokens_count, 123456789,
-        //     "Total number of pretokens does not match expected count"
-        // );
     }
-
-    // #[test]
-    // fn minimal_tokenization() {
-    //     let input = vec![0x74, 0x75, 0x72, 0x65, 0x73, 0x2E, 0xC2, 0xA0, 0x0A, 0x4F];
-    //     let pretokens: Vec<_> = pretokenize_as_iter(&input).collect();
-    //     let re =
-    //         Regex::new(r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
-    //             .unwrap();
-
-    //     for (&token, (start, end)) in pretokens
-    //         .iter()
-    //         .zip(re.find_iter(str::from_utf8(&input).unwrap()))
-    //     {
-    //         let token_str = String::from_utf8_lossy(token).into_owned();
-    //         let match_str = String::from_utf8_lossy(&input[start..end]).into_owned();
-    //         assert_eq!(token_str, match_str, "Token does not match regex");
-    //     }
-    // }
 }
