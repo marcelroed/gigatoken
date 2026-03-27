@@ -69,6 +69,18 @@ VOCAB_SIZE = 400
 
 
 # ---------------------------------------------------------------------------
+# Reference result: train once from JSONL, compare all others against it
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def reference_result(jsonl_file):
+    """Train from plain JSONL — the reference all other formats must match."""
+    source = FileSource([str(jsonl_file)], field="text")
+    return train_bpe(source, VOCAB_SIZE, [])
+
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
@@ -80,63 +92,65 @@ def test_file_source_txt(txt_file):
     assert len(merges) == VOCAB_SIZE - 256
 
 
-def test_file_source_jsonl(jsonl_file):
-    source = FileSource([str(jsonl_file)], field="text")
-    vocab, merges = train_bpe(source, VOCAB_SIZE, [])
+def test_file_source_jsonl(reference_result):
+    vocab, merges = reference_result
     assert len(vocab) == VOCAB_SIZE
+    assert len(merges) == VOCAB_SIZE - 256
 
 
-def test_file_source_jsonl_gz(jsonl_gz_file):
+def test_file_source_jsonl_gz_matches_jsonl(jsonl_gz_file, reference_result):
+    """Gzip-compressed JSONL must produce identical merges to plain JSONL."""
     source = FileSource([str(jsonl_gz_file)], field="text")
     vocab, merges = train_bpe(source, VOCAB_SIZE, [])
-    assert len(vocab) == VOCAB_SIZE
+    _, ref_merges = reference_result
+    assert merges == ref_merges
 
 
-def test_file_source_jsonl_zst(jsonl_zst_file):
+def test_file_source_jsonl_zst_matches_jsonl(jsonl_zst_file, reference_result):
+    """Zstd-compressed JSONL must produce identical merges to plain JSONL."""
     source = FileSource([str(jsonl_zst_file)], field="text")
     vocab, merges = train_bpe(source, VOCAB_SIZE, [])
-    assert len(vocab) == VOCAB_SIZE
+    _, ref_merges = reference_result
+    assert merges == ref_merges
 
 
-def test_file_source_multi_file(txt_file, jsonl_file, jsonl_gz_file, jsonl_zst_file):
-    """Mix of formats in a single FileSource."""
-    source = FileSource(
-        [str(txt_file), str(jsonl_file), str(jsonl_gz_file), str(jsonl_zst_file)],
-        field="text",
-    )
-    vocab, merges = train_bpe(source, VOCAB_SIZE, [])
-    assert len(vocab) == VOCAB_SIZE
-
-
-def test_file_source_jsonl_matches_bytes(jsonl_file):
-    """FileSource(jsonl) should produce the same vocab as training on equivalent bytes."""
-    source = FileSource([str(jsonl_file)], field="text")
-    vocab_fs, merges_fs = train_bpe(source, VOCAB_SIZE, [])
+def test_file_source_jsonl_matches_bytes(jsonl_file, reference_result):
+    """FileSource(jsonl) must produce identical merges to training on equivalent bytes."""
+    _, ref_merges = reference_result
 
     # Build equivalent bytes input (all documents joined by separator)
     corpus_bytes = "<|endoftext|>".join(CORPUS_LINES).encode("utf-8")
-    vocab_bytes, merges_bytes = train_bpe(corpus_bytes, VOCAB_SIZE, [])
+    _, bytes_merges = train_bpe(corpus_bytes, VOCAB_SIZE, [])
 
-    # Vocab sizes must match
-    assert len(vocab_fs) == len(vocab_bytes) == VOCAB_SIZE
-
-    # The merge sets should heavily overlap since both train on the same text
-    fs_merges = {(a, b) for a, b in merges_fs}
-    bytes_merges = {(a, b) for a, b in merges_bytes}
-    overlap = len(fs_merges & bytes_merges) / max(len(fs_merges), 1)
-    assert overlap >= 0.8, f"Only {overlap:.0%} merge overlap between FileSource and bytes"
+    assert ref_merges == bytes_merges
 
 
-def test_file_source_custom_field(tmp_dir):
-    """JSONL with a non-default field name."""
+def test_file_source_multi_file_matches_single(
+    jsonl_file, jsonl_gz_file, jsonl_zst_file, reference_result
+):
+    """Multiple copies of the same data (different formats) must produce
+    identical merges to a single copy — the word counts scale uniformly
+    so merge order is preserved."""
+    source = FileSource(
+        [str(jsonl_file), str(jsonl_gz_file), str(jsonl_zst_file)],
+        field="text",
+    )
+    vocab, merges = train_bpe(source, VOCAB_SIZE, [])
+    _, ref_merges = reference_result
+    assert merges == ref_merges
+
+
+def test_file_source_custom_field(tmp_dir, reference_result):
+    """JSONL with a non-default field name must produce identical merges."""
     path = tmp_dir / "custom_field.jsonl"
     with open(path, "w") as f:
         for line in CORPUS_LINES:
             f.write(json.dumps({"content": line}) + "\n")
 
     source = FileSource([str(path)], field="content")
-    vocab, merges = train_bpe(source, VOCAB_SIZE, [])
-    assert len(vocab) == VOCAB_SIZE
+    _, merges = train_bpe(source, VOCAB_SIZE, [])
+    _, ref_merges = reference_result
+    assert merges == ref_merges
 
 
 def test_file_source_repr():
