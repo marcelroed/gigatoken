@@ -64,8 +64,8 @@ impl ByteRemapping {
 /// Apply BPE merges to an already-initialized symbol sequence.
 /// Priority is determined by the merged token's ID (lower = first).
 /// This is correct for tiktoken-style tokenizers where vocab ID equals merge rank.
-pub fn bpe_merge_symbols(
-    merges: &HashMap<(TokenId, TokenId), TokenId>,
+pub fn bpe_merge_symbols<S: std::hash::BuildHasher>(
+    merges: &HashMap<(TokenId, TokenId), TokenId, S>,
     symbols: &mut Vec<TokenId>,
 ) {
     loop {
@@ -89,34 +89,108 @@ pub fn bpe_merge_symbols(
 
 /// Apply BPE merges using explicit merge ranks for priority (lower rank = first).
 /// The merge table maps `(token_a, token_b) → (merged_token, rank)`.
-/// This is needed for HF/SentencePiece tokenizers where merge order differs
-/// from vocab ID order.
-pub fn bpe_merge_symbols_ranked(
-    merges: &HashMap<(TokenId, TokenId), (TokenId, u32)>,
+///
+/// Uses a min-heap + doubly-linked list for O(n log n) performance instead of
+/// the naive O(n × merges) scan.
+/// This is only needed by SentencePiece-style tokenizers.
+pub fn bpe_merge_symbols_ranked<S: std::hash::BuildHasher>(
+    merges: &HashMap<(TokenId, TokenId), (TokenId, u32), S>,
     symbols: &mut Vec<TokenId>,
 ) {
-    loop {
-        let best_merge = symbols
-            .iter()
-            .copied()
-            .tuple_windows()
-            .enumerate()
-            .filter_map(|(i, (a, b))| merges.get(&(a, b)).map(|&(tok, rank)| (i, tok, rank)))
-            .min_by_key(|&(_, _, rank)| rank);
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
 
-        if let Some((merge_index, merge_token, _)) = best_merge {
-            symbols[merge_index] = merge_token;
-            symbols.remove(merge_index + 1);
-        } else {
+    let n = symbols.len();
+    if n < 2 {
+        return;
+    }
+
+    // Doubly-linked list via index arrays. NONE = no neighbor.
+    const NONE: usize = usize::MAX;
+    let mut next = vec![NONE; n];
+    let mut prev = vec![NONE; n];
+    let mut token = symbols.clone();
+
+    for i in 0..n - 1 {
+        next[i] = i + 1;
+    }
+    for i in 1..n {
+        prev[i] = i - 1;
+    }
+
+    // Min-heap of (rank, position). Position refers to the left symbol of the pair.
+    let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+
+    // Seed with all initial pairs
+    let mut i = 0;
+    while i < n {
+        let j = next[i];
+        if j == NONE {
             break;
         }
+        if let Some(&(_, rank)) = merges.get(&(token[i], token[j])) {
+            heap.push(Reverse((rank, i)));
+        }
+        i = j;
+    }
+
+    while let Some(Reverse((rank, pos))) = heap.pop() {
+        // Validate: pos must still be active and its right neighbor must exist
+        let right = next[pos];
+        if right == NONE {
+            continue;
+        }
+        // Check the pair still matches (it may have been invalidated by an earlier merge)
+        let pair = (token[pos], token[right]);
+        match merges.get(&pair) {
+            Some(&(merged_token, r)) if r == rank => {
+                // Apply the merge: replace token[pos], remove right
+                token[pos] = merged_token;
+                let right_right = next[right];
+                next[pos] = right_right;
+                if right_right != NONE {
+                    prev[right_right] = pos;
+                }
+                // Mark right as deleted
+                next[right] = NONE;
+                prev[right] = NONE;
+
+                // Re-check pair with left neighbor
+                let left = prev[pos];
+                if left != NONE {
+                    if let Some(&(_, rank)) = merges.get(&(token[left], token[pos])) {
+                        heap.push(Reverse((rank, left)));
+                    }
+                }
+                // Re-check pair with new right neighbor
+                if next[pos] != NONE {
+                    if let Some(&(_, rank)) = merges.get(&(token[pos], token[next[pos]])) {
+                        heap.push(Reverse((rank, pos)));
+                    }
+                }
+            }
+            _ => continue, // Stale entry, skip
+        }
+    }
+
+    // Collect surviving symbols via linked list traversal
+    symbols.clear();
+    let mut i = 0;
+    // Find the head (first element with prev == NONE that's still in the list)
+    // Since we never remove index 0's prev link, index 0 is always the head
+    loop {
+        symbols.push(token[i]);
+        if next[i] == NONE {
+            break;
+        }
+        i = next[i];
     }
 }
 
 /// Tokenize a single pretoken by mapping each byte to TokenId(byte_value)
 /// then applying BPE merges (priority by merged token ID).
-pub fn simple_bpe_merge(
-    merges: &HashMap<(TokenId, TokenId), TokenId>,
+pub fn simple_bpe_merge<S: std::hash::BuildHasher>(
+    merges: &HashMap<(TokenId, TokenId), TokenId, S>,
     pre_token: &[u8],
 ) -> Vec<TokenId> {
     let mut symbols: Vec<TokenId> = pre_token.iter().map(|&b| TokenId::from(b as u32)).collect();
