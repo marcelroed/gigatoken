@@ -51,3 +51,6 @@ dev = [
 
 [tool.ruff]
 line-length = 180
+
+[tool.ty.src]
+exclude = ["notebooks"]
