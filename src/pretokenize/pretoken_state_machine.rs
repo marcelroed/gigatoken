@@ -89,7 +89,7 @@ impl<'a> UTF8Iterator<'a> {
                 StartResult::Letter
             } else if unicode::is_gc_number(gc) {
                 StartResult::Number
-            } else if unicode::is_gc_separator(gc) {
+            } else if unicode::is_whitespace(next_codepoint) {
                 StartResult::Whitespace(len as u8)
             } else {
                 StartResult::Nonchar
@@ -118,7 +118,7 @@ impl<'a> UTF8Iterator<'a> {
         } else {
             let (next_codepoint, len) =
                 self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
-            Ok(if unicode::is_separator(next_codepoint) {
+            Ok(if unicode::is_whitespace(next_codepoint) {
                 WhitespaceResult::Whitespace(len as u8)
             } else {
                 self.pos -= len;
@@ -204,7 +204,7 @@ impl<'a> UTF8Iterator<'a> {
                 let gc = unicode::get_general_category(next_codepoint);
                 if unicode::is_gc_letter(gc)
                     || unicode::is_gc_number(gc)
-                    || unicode::is_gc_separator(gc)
+                    || unicode::is_whitespace(next_codepoint)
                 {
                     self.pos -= len;
                     return Ok(()); // We matched a letter or number, so we stop here
@@ -226,7 +226,8 @@ impl<'a> UTF8Iterator<'a> {
             }
             b'l' | b'v' | b'r' => {
                 if self.pos + 1 >= self.bytes.len() {
-                    return Err(OutOfBytesError {});
+                    // Not enough bytes for a two-letter contraction ('ll, 've, 're)
+                    return Ok(ApostropheResult::NotMatched);
                 }
                 let next_byte = self.bytes[self.pos + 1];
                 match (byte, next_byte) {

@@ -1,34 +1,46 @@
-// Different ways to construct (parallel) document iterators from file or Python input
-use memmap2::Mmap;
-use rayon::prelude::*;
-use std::ops::Deref;
-use std::{borrow::Cow, error::Error, path::Path};
+//! Layered input abstraction: Resource → Document → (Pretoken via pretokenize module).
+//!
+//! - **Resource**: a handle to a contiguous byte buffer (file, bytes, string).
+//! - **DocumentIter**: splits a byte buffer on a configurable separator, yielding documents.
+//! - Parallel chunking: `Resource::par_document_chunks` returns N document iterators
+//!   with chunk boundaries aligned to separator positions.
 
-mod bytes;
-mod jsonl;
-mod py;
+use memchr::memmem;
+use memmap2::Mmap;
+use std::path::Path;
+
+pub(crate) mod decompress;
+pub(crate) mod file_source;
+pub(crate) mod jsonl;
+
+// ---------------------------------------------------------------------------
+// Document — owned/borrowed byte buffer used by jsonl iterator
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub(crate) struct Document<'a>(Cow<'a, [u8]>);
+pub(crate) struct Document<'a>(std::borrow::Cow<'a, [u8]>);
 
 impl<'a> From<&'a [u8]> for Document<'a> {
     fn from(value: &'a [u8]) -> Self {
-        Document(Cow::Borrowed(value))
+        Document(std::borrow::Cow::Borrowed(value))
     }
 }
-impl<'a> From<Vec<u8>> for Document<'a> {
+
+impl From<Vec<u8>> for Document<'_> {
     fn from(value: Vec<u8>) -> Self {
         Document(value.into())
     }
 }
 
-impl<'a> Deref for Document<'a> {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0.as_ref()
+impl AsRef<[u8]> for Document<'_> {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
+
+// ---------------------------------------------------------------------------
+// DocRef — lightweight reference used internally by the pretokenizer
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DocRef<'a>(pub &'a [u8]);
@@ -39,64 +51,285 @@ impl<'a> From<&'a [u8]> for DocRef<'a> {
     }
 }
 
-impl<'a> From<&'a Document<'a>> for DocRef<'a> {
-    fn from(value: &'a Document<'a>) -> Self {
-        DocRef(value.as_ref())
-    }
-}
-
-impl<'a> Deref for DocRef<'a> {
+impl<'a> std::ops::Deref for DocRef<'a> {
     type Target = &'a [u8];
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-pub(crate) enum DocReader {
-    FromFiles,
-    PythonBytes,
+// ---------------------------------------------------------------------------
+// Resource trait
+// ---------------------------------------------------------------------------
+
+/// A contiguous byte buffer that can be split into documents and parallel chunks.
+pub trait Resource: Sync {
+    fn as_bytes(&self) -> &[u8];
+
+    /// Iterate documents by splitting on `separator`.
+    /// If separator is empty, the entire buffer is one document.
+    fn documents<'a>(&'a self, separator: &'a [u8]) -> DocumentIter<'a> {
+        DocumentIter::new(self.as_bytes(), separator)
+    }
+
+    /// Split into `n` chunk iterators, each yielding documents.
+    /// Chunk boundaries are aligned to separator positions so no document
+    /// is split across chunks.
+    fn par_document_chunks<'a>(
+        &'a self,
+        separator: &'a [u8],
+        n: usize,
+    ) -> Vec<DocumentIter<'a>> {
+        par_document_chunks(self.as_bytes(), separator, n)
+    }
 }
 
-pub(crate) enum InputData {
-    MmapFile(Mmap),
-    PythonBytes,
+// Blanket implementations
+
+impl Resource for [u8] {
+    fn as_bytes(&self) -> &[u8] {
+        self
+    }
 }
 
-pub(crate) fn read_file(path: impl AsRef<Path>) -> Result<Mmap, String> {
-    let path = path.as_ref();
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("jsonl") => todo!(),
-        Some("parquet") => todo!(),
-        Some("txt") | None => {
-            // TODO: Make this a one-time warning
-            eprintln!("Path {path:?} is being treated as a UTF-8 blob.")
-        }
-        Some(x) => {
-            eprintln!(
-                "Path {path:?} has extension {x} which was not recognized. Falling back to reading it as a blob of UTF-8."
-            )
+impl Resource for Vec<u8> {
+    fn as_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl Resource for str {
+    fn as_bytes(&self) -> &[u8] {
+        str::as_bytes(self)
+    }
+}
+
+impl Resource for String {
+    fn as_bytes(&self) -> &[u8] {
+        str::as_bytes(self)
+    }
+}
+
+impl Resource for Mmap {
+    fn as_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MmappedFile
+// ---------------------------------------------------------------------------
+
+/// Owns a memory-mapped file and implements `Resource`.
+pub struct MmappedFile {
+    mmap: Mmap,
+}
+
+impl MmappedFile {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self { mmap })
+    }
+}
+
+impl Resource for MmappedFile {
+    fn as_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DocumentIter
+// ---------------------------------------------------------------------------
+
+/// Zero-copy iterator that splits a byte slice on a separator, yielding documents.
+/// Empty documents (consecutive separators) are skipped.
+pub struct DocumentIter<'a> {
+    bytes: &'a [u8],
+    separator: &'a [u8],
+    position: usize,
+    end: usize,
+    finished: bool,
+}
+
+impl<'a> DocumentIter<'a> {
+    pub fn new(bytes: &'a [u8], separator: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            separator,
+            position: 0,
+            end: bytes.len(),
+            finished: false,
         }
     }
-    let file = std::fs::File::open(path).map_err(|e| format!("{e}"))?;
-    unsafe { Mmap::map(&file) }.map_err(|e| format!("{e}"))
+
+    fn new_range(bytes: &'a [u8], separator: &'a [u8], start: usize, end: usize) -> Self {
+        Self {
+            bytes,
+            separator,
+            position: start,
+            end,
+            finished: false,
+        }
+    }
 }
 
-/// Memmap each file
-pub fn iterate_files(
-    path_iterator: impl ParallelIterator<Item = impl AsRef<Path>>,
-) -> impl ParallelIterator<Item = Result<impl AsRef<[u8]>, String>> {
-    path_iterator
-        .map(|path| {
-            let file = std::fs::File::open(path.as_ref())?;
-            unsafe { Mmap::map(&file) }
-        })
-        .map(|r| r.map_err(|e| format!("Failed to open file: {e}")))
+impl<'a> Iterator for DocumentIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.finished || self.position >= self.end {
+                return None;
+            }
+
+            let search_range = &self.bytes[self.position..self.end];
+
+            // Empty separator means "no splitting" — yield entire remainder as one document
+            if self.separator.is_empty() {
+                self.finished = true;
+                return if search_range.is_empty() {
+                    None
+                } else {
+                    Some(search_range)
+                };
+            }
+
+            let finder = memmem::Finder::new(self.separator);
+            match finder.find(search_range) {
+                Some(offset) => {
+                    let doc = &self.bytes[self.position..self.position + offset];
+                    self.position += offset + self.separator.len();
+                    // Skip empty documents
+                    if !doc.is_empty() {
+                        return Some(doc);
+                    }
+                }
+                None => {
+                    // No more separators; yield the remainder
+                    self.finished = true;
+                    return if search_range.is_empty() {
+                        None
+                    } else {
+                        Some(search_range)
+                    };
+                }
+            }
+        }
+    }
 }
 
-// /// Create a parallel iterator over num_chunks number of inputs using a closure to find boundaries
-// pub(crate) trait DocumentParallelCoarse<'a> {
-//     fn par_iter_coarse(
-//         &self,
-//         first_boundary_fn: impl FnOnce(&[u8], usize) -> usize,
-//     ) -> impl ParallelIterator<Item = impl Iterator<Item = Document<'a>>>;
-// }
+// ---------------------------------------------------------------------------
+// Parallel document chunking
+// ---------------------------------------------------------------------------
+
+/// Split `bytes` into `n` document iterators with chunk boundaries aligned
+/// to separator positions. Each iterator covers a disjoint range.
+fn par_document_chunks<'a>(
+    bytes: &'a [u8],
+    separator: &'a [u8],
+    n: usize,
+) -> Vec<DocumentIter<'a>> {
+    if n <= 1 || bytes.is_empty() || separator.is_empty() {
+        return vec![DocumentIter::new(bytes, separator)];
+    }
+
+    let chunk_size = bytes.len() / n;
+    let finder = memmem::Finder::new(separator);
+
+    let mut boundaries = Vec::with_capacity(n + 1);
+    boundaries.push(0usize);
+
+    for i in 1..n {
+        let target = i * chunk_size;
+        // Scan forward from target to find the next separator
+        match finder.find(&bytes[target..]) {
+            Some(offset) => {
+                let boundary = target + offset + separator.len();
+                boundaries.push(boundary);
+            }
+            None => {
+                // No separator found; remaining data goes in the last chunk
+                break;
+            }
+        }
+    }
+    boundaries.push(bytes.len());
+    boundaries.dedup();
+
+    boundaries
+        .windows(2)
+        .map(|w| DocumentIter::new_range(bytes, separator, w[0], w[1]))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_document_iter_basic() {
+        let data = b"hello<|endoftext|>world<|endoftext|>foo";
+        let sep = b"<|endoftext|>";
+        let docs: Vec<&[u8]> = data.as_slice().documents(sep).collect();
+        assert_eq!(docs, vec![b"hello".as_slice(), b"world", b"foo"]);
+    }
+
+    #[test]
+    fn test_document_iter_no_separator() {
+        let data = b"hello world";
+        let docs: Vec<&[u8]> = data.as_slice().documents(b"<|endoftext|>").collect();
+        assert_eq!(docs, vec![b"hello world".as_slice()]);
+    }
+
+    #[test]
+    fn test_document_iter_empty_separator() {
+        let data = b"hello world";
+        let docs: Vec<&[u8]> = data.as_slice().documents(b"").collect();
+        assert_eq!(docs, vec![b"hello world".as_slice()]);
+    }
+
+    #[test]
+    fn test_document_iter_consecutive_separators() {
+        let data = b"a<SEP><SEP>b";
+        let docs: Vec<&[u8]> = data.as_slice().documents(b"<SEP>").collect();
+        assert_eq!(docs, vec![b"a".as_slice(), b"b"]);
+    }
+
+    #[test]
+    fn test_document_iter_separator_at_edges() {
+        let data = b"<SEP>hello<SEP>";
+        let docs: Vec<&[u8]> = data.as_slice().documents(b"<SEP>").collect();
+        assert_eq!(docs, vec![b"hello".as_slice()]);
+    }
+
+    #[test]
+    fn test_par_document_chunks_basic() {
+        let sep = b"<|endoftext|>";
+        let parts: Vec<&str> = (0..100)
+            .map(|i| if i % 10 == 9 { "doc" } else { "word " })
+            .collect();
+        let data = parts.join(std::str::from_utf8(sep).unwrap());
+        let bytes = data.as_bytes();
+
+        let chunks = bytes.par_document_chunks(sep, 4);
+        // All documents should be found across all chunks
+        let all_docs: Vec<&[u8]> = chunks.into_iter().flat_map(|c| c).collect();
+        let single_docs: Vec<&[u8]> = bytes.documents(sep).collect();
+        assert_eq!(all_docs, single_docs);
+    }
+
+    #[test]
+    fn test_par_chunks_single_thread() {
+        let data = b"a<SEP>b<SEP>c";
+        let chunks = data.as_slice().par_document_chunks(b"<SEP>", 1);
+        assert_eq!(chunks.len(), 1);
+        let docs: Vec<&[u8]> = chunks.into_iter().flat_map(|c| c).collect();
+        assert_eq!(docs, vec![b"a".as_slice(), b"b", b"c"]);
+    }
+}

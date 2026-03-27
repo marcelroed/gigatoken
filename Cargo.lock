@@ -2014,6 +2014,7 @@ dependencies = [
  "dashmap",
  "eyre",
  "fancy-regex",
+ "flate2",
  "icu",
  "icu_codepointtrie_builder",
  "indicatif",
@@ -2033,6 +2034,7 @@ dependencies = [
  "voracious_radix_sort",
  "winnow",
  "zerovec",
+ "zstd",
 ]
 
 [[package]]

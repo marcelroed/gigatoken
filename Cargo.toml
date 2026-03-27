@@ -46,6 +46,8 @@ voracious_radix_sort = { version = "1.2.0", features = [
 sonic-rs = "0.5.8"
 memchr = "2.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
+flate2 = "1.1"
+zstd = "0.13"
 
 [profile.release]
 lto = "fat"

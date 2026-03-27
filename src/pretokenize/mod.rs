@@ -1,13 +1,15 @@
-//! The pretokenizer is responsible for taking a single document and producing an iterator of
-//! pretokens.
-use crate::bpe_train::PretokenizeableSpec;
+//! Pretokenization: split documents into pretokens using a GPT-2 regex state machine.
+//!
+//! The main entry points are:
+//! - `Pretokenize` trait: `doc.pretokens()` on any `&[u8]`
+//! - `pretokenize_par_bytes`: parallel pretokenization with document splitting and counting
+
 pub(crate) use crate::pretokenize::pretoken::Pretoken;
 use crate::pretokenize::pretokenize_traits::{
-    ParallelMergeCounts, ParallelPretokenCountable, PretokenCountable,
+    ParallelMergeCounts, PretokenCountable,
 };
-use itertools::Itertools;
+use crate::input::Resource;
 use rayon::prelude::*;
-use std::cmp::min;
 use std::collections::HashMap;
 
 mod options;
@@ -15,45 +17,52 @@ mod pretoken;
 mod pretoken_chunks;
 pub mod pretoken_combinator;
 pub mod pretoken_state_machine;
-mod pretokenize_traits;
+pub(crate) mod pretokenize_traits;
 mod unicode;
 
 pub use options::PretokenizerType;
 pub use pretoken_state_machine::{PretokenizerIter, pretokenize_as_iter};
 
-pub fn find_boundaries(bytes: &[u8]) -> Vec<usize> {
-    fn advance_to_boundary(input: &[u8]) -> usize {
-        for (i, (first, second)) in input.iter().tuple_windows().enumerate() {
-            if matches!((first, second), (b'.', b' ')) {
-                return i + 1;
-            }
-        }
-        panic!("No boundary found in input");
-    }
+/// Default document separator used in common training corpora.
+pub const DEFAULT_SEPARATOR: &[u8] = b"<|endoftext|>";
 
-    let n_threads = rayon::current_num_threads();
-    eprintln!("Using {n_threads} threads for pretokenization");
-    let chunk_size = bytes.len().div_ceil(n_threads);
-    let mut boundaries: Vec<usize> = (0..=n_threads)
-        .map(|i| min(i * chunk_size, bytes.len()))
-        .collect();
-    for b in boundaries[1..n_threads].iter_mut() {
-        *b += advance_to_boundary(&bytes[*b..]);
-    }
-    boundaries
+// ---------------------------------------------------------------------------
+// Pretokenize trait — Layer 3
+// ---------------------------------------------------------------------------
+
+/// Anything that can be split into a stream of pretokens.
+pub trait Pretokenize {
+    fn pretokens(&self) -> PretokenizerIter<'_>;
 }
 
-pub fn pretokenize_par_bytes(
-    bytes: &[u8],
-) -> HashMap<Pretoken<'_>, usize, rustc_hash::FxBuildHasher> {
+impl Pretokenize for [u8] {
+    fn pretokens(&self) -> PretokenizerIter<'_> {
+        pretokenize_as_iter(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel pretokenization with document splitting
+// ---------------------------------------------------------------------------
+
+/// Pretokenize `bytes` in parallel, splitting documents on `separator`.
+/// Returns a map of pretoken → count.
+pub fn pretokenize_par_bytes<'a>(
+    bytes: &'a [u8],
+    separator: &'a [u8],
+) -> HashMap<Pretoken<'a>, usize, rustc_hash::FxBuildHasher> {
     let start_time = std::time::Instant::now();
-    let boundaries = find_boundaries(bytes);
-    let merged_counts = boundaries
-        .par_windows(2)
-        .map(|window| {
-            let start = window[0];
-            let end = window[1];
-            pretokenize_count(&bytes[start..end])
+    let n_threads = rayon::current_num_threads();
+    eprintln!("Using {n_threads} threads for pretokenization");
+
+    let chunks = bytes.par_document_chunks(separator, n_threads);
+
+    let merged_counts = chunks
+        .into_par_iter()
+        .map(|doc_iter| {
+            doc_iter
+                .flat_map(|doc| doc.pretokens())
+                .pretoken_count()
         })
         .par_merge_counts();
 
@@ -61,29 +70,17 @@ pub fn pretokenize_par_bytes(
     eprintln!("Pretokenization took {time_elapsed:?}");
 
     merged_counts
-    // merged_counts
-    //     .into_iter()
-    //     .map(|(k, v)| (k.to_owned(), v))
-    //     .collect()
-}
-
-pub fn pretokenize_par(
-    pretokenizeable: PretokenizeableSpec,
-) -> HashMap<Pretoken, usize, rustc_hash::FxBuildHasher> {
-    match pretokenizeable {
-        PretokenizeableSpec::Bytes(s) => pretokenize_par_bytes(s),
-        #[cfg(feature = "parquet")]
-        PretokenizeableSpec::Parquet(path) => pretokenize_par_parquet(&path),
-    }
 }
 
 // Only when the "parquet" feature is enabled
 #[cfg(feature = "parquet")]
 pub fn pretokenize_par_parquet(
-    parquet_path: &Path,
+    parquet_path: &std::path::Path,
 ) -> HashMap<Vec<u8>, usize, rustc_hash::FxBuildHasher> {
     use indicatif::{ProgressBar, ProgressIterator};
     use polars::prelude::*;
+    use std::cmp::min;
+    use std::sync::Arc;
     let parquet_path = PlPath::Local(Arc::from(parquet_path.to_owned()));
 
     let df = LazyFrame::scan_parquet(parquet_path.clone(), ScanArgsParquet::default()).unwrap();
@@ -134,7 +131,6 @@ pub fn pretokenize_par_parquet(
                 let freqs = loaded.column("frequency").unwrap();
                 let freqs = freqs.i64().expect("Didn't find frequencies");
 
-
                 strings.iter().zip(freqs.iter()).flat_map(|(s, f)| match (s, f) {
                     (Some(s), Some(f)) => Some((s.as_bytes(), f as usize)),
                     (Some(s), None) => Some((s.as_bytes(), 1)),
@@ -165,71 +161,6 @@ pub fn pretokenize_par_parquet(
         );
 
     total_counts
-}
-
-/// Return counts of all pretokens.
-pub fn pretokenize_count(bytes: &[u8]) -> HashMap<Pretoken<'_>, usize, rustc_hash::FxBuildHasher> {
-    let string = unsafe { std::str::from_utf8_unchecked(bytes) };
-    string
-        .split("<|endoftext|>")
-        .flat_map(|s| pretokenize_as_iter(s.as_bytes().into()))
-        .pretoken_count()
-}
-
-// pub fn count_pretokens<'a>(
-//     pretoken_iter: impl Iterator<Item = &'a [u8]>,
-// ) -> HashMap<&'a [u8], usize, rustc_hash::FxBuildHasher> {
-//     let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
-//     pretoken_iter.for_each(|token| {
-//         hashmap.entry(token).and_modify(|e| *e += 1).or_insert(1);
-//     });
-//     hashmap
-// }
-
-pub fn count_pretokens_weighted<'a>(
-    pretoken_weight_iter: impl Iterator<Item = (&'a [u8], usize)>,
-) -> HashMap<&'a [u8], usize, rustc_hash::FxBuildHasher> {
-    let mut hashmap = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
-    pretoken_weight_iter.for_each(|(token, weight)| {
-        hashmap
-            .entry(token)
-            .and_modify(|e| *e += weight)
-            .or_insert(weight);
-    });
-    hashmap
-}
-
-pub fn pretokenize_doc_iterable<'a>(
-    docs: impl Iterator<Item = &'a [u8]>,
-) -> impl Iterator<Item = Pretoken<'a>> {
-    docs.flat_map(|doc| pretokenize_as_iter(doc.into()))
-}
-
-pub fn pretokenize_with_endoftext(
-    bytes: &[u8],
-) -> HashMap<Pretoken<'_>, usize, rustc_hash::FxBuildHasher> {
-    let string = unsafe { std::str::from_utf8_unchecked(bytes) };
-
-    let mut hashmap = HashMap::default();
-
-    string
-        .split("<|endoftext|>")
-        .flat_map(|part| pretokenize_as_iter(part.as_bytes().into()))
-        .for_each(|token| {
-            hashmap.entry(token).and_modify(|e| *e += 1).or_insert(1);
-        });
-
-    hashmap
-}
-
-struct Pretokenizer {
-    special_tokens: Vec<(Vec<u8>, u32)>, // Split on these tokens, keep them in the stream
-}
-
-impl Pretokenizer {
-    pub fn new(special_tokens: Vec<(Vec<u8>, u32)>) -> Self {
-        Pretokenizer { special_tokens }
-    }
 }
 
 #[cfg(test)]

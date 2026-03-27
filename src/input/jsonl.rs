@@ -1,10 +1,20 @@
 use crate::input::Document;
 use sonic_rs::JsonValueTrait;
 
-struct JsonLinesIter<'a> {
+pub(crate) struct JsonLinesIter<'a> {
     slice: &'a [u8],
     position: usize,
-    text_fieldname: &'a str, // The fieldname in each JSON object that contains the text to be tokenized.
+    text_fieldname: &'a str,
+}
+
+impl<'a> JsonLinesIter<'a> {
+    pub(crate) fn new(slice: &'a [u8], text_fieldname: &'a str) -> Self {
+        Self {
+            slice,
+            position: 0,
+            text_fieldname,
+        }
+    }
 }
 
 /// Iterate documents in a .jsonl file
@@ -31,10 +41,3 @@ impl<'a> Iterator for JsonLinesIter<'a> {
         Some(Document::from(text.as_bytes().to_vec()))
     }
 }
-
-struct JsonLinesSource<R> {
-    reader: R,
-    position: usize,
-}
-
-impl<R> JsonLinesSource<R> where R: std::io::BufRead {}

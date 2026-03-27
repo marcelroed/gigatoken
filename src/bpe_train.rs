@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::collections::{BTreeSet, HashMap};
 
-use crate::pretokenize::pretokenize_par;
+use std::hash::Hash;
 
 #[derive(Clone)]
 pub struct Word {
@@ -146,12 +146,6 @@ pub struct BPEResult {
     pub merges: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-pub enum PretokenizeableSpec<'a> {
-    Bytes(&'a [u8]),
-    #[cfg(feature = "parquet")]
-    Parquet(PathBuf),
-}
-
 /// How to break ties when multiple pairs have the same frequency count.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum TieBreaking {
@@ -193,14 +187,12 @@ fn build_byte_to_hf_rank() -> [u32; 256] {
     rank
 }
 
-pub fn train_bpe(
-    pretokenizeable: PretokenizeableSpec,
+pub fn train_bpe<K: AsRef<[u8]> + Eq + Hash>(
+    counts: HashMap<K, usize, FxBuildHasher>,
     vocab_size: usize,
     special_tokens: Vec<String>,
     tie_breaking: TieBreaking,
 ) -> BPEResult {
-    let counts = pretokenize_par(pretokenizeable);
-
     // Indicates which word indices contain a given symbol
     let mut contained_in_words: HashMap<(u32, u32), BTreeSet<u32>> = HashMap::new();
     let mut contained_in_words_arr = vec![vec![vec![]; 256]; 256];
