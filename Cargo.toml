@@ -51,7 +51,13 @@ zstd = "0.13"
 
 [profile.release]
 lto = "fat"
-# debug = "line-tables-only"
+
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false
+lto = false
+codegen-units = 1
 
 [dev-dependencies]
 criterion = "0.8"
