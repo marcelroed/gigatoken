@@ -121,8 +121,11 @@ fn pretokenize_file(
     }
 
     // Everything else: stream from reader (never fully in memory)
-    let reader = decompress::open_reader(path, compression)?;
-    Ok(pretokenize_streaming(reader, content, field, separator))
+    Ok(match compression {
+        Compression::None => pretokenize_streaming(decompress::open_plain(path)?, content, field, separator),
+        Compression::Gzip => pretokenize_streaming(decompress::open_gzip(path)?, content, field, separator),
+        Compression::Zstd => pretokenize_streaming(decompress::open_zstd(path)?, content, field, separator),
+    })
 }
 
 // ---------------------------------------------------------------------------
