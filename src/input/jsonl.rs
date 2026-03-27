@@ -1,43 +1,46 @@
+use std::io::BufRead;
+
 use crate::input::Document;
 use sonic_rs::JsonValueTrait;
 
-pub(crate) struct JsonLinesIter<'a> {
-    slice: &'a [u8],
-    position: usize,
-    text_fieldname: &'a str,
+/// Streaming JSONL iterator over a `BufRead` source.
+/// Reads one line at a time — never buffers the entire file.
+pub(crate) struct JsonLinesReader<R> {
+    reader: R,
+    field: String,
+    line_buf: Vec<u8>,
 }
 
-impl<'a> JsonLinesIter<'a> {
-    pub(crate) fn new(slice: &'a [u8], text_fieldname: &'a str) -> Self {
+impl<R: BufRead> JsonLinesReader<R> {
+    pub(crate) fn new(reader: R, field: &str) -> Self {
         Self {
-            slice,
-            position: 0,
-            text_fieldname,
+            reader,
+            field: field.to_string(),
+            line_buf: Vec::with_capacity(4096),
         }
     }
 }
 
-/// Iterate documents in a .jsonl file
-impl<'a> Iterator for JsonLinesIter<'a> {
-    type Item = Document<'static>; // Will always be owned because the Json needs to be parsed
+impl<R: BufRead> Iterator for JsonLinesReader<R> {
+    type Item = Document<'static>;
+
     fn next(&mut self) -> Option<Self::Item> {
-        // Skip any trailing newlines between records
-        while self.position < self.slice.len() && self.slice[self.position] == b'\n' {
-            self.position += 1;
-        }
-        if self.position >= self.slice.len() {
-            return None;
-        }
+        loop {
+            self.line_buf.clear();
+            let bytes_read = self.reader.read_until(b'\n', &mut self.line_buf).ok()?;
+            if bytes_read == 0 {
+                return None; // EOF
+            }
 
-        // Find the end of this line
-        let line_end = memchr::memchr(b'\n', &self.slice[self.position..])
-            .map(|i| self.position + i)
-            .unwrap_or(self.slice.len());
-        let line = &self.slice[self.position..line_end];
-        self.position = line_end + 1;
+            let line = self.line_buf.as_slice();
+            // Skip empty lines
+            if line.iter().all(|&b| b == b'\n' || b == b'\r') {
+                continue;
+            }
 
-        let value = sonic_rs::get_from_slice(line, &[self.text_fieldname]).ok()?;
-        let text = value.as_str()?;
-        Some(Document::from(text.as_bytes().to_vec()))
+            let value = sonic_rs::get_from_slice(line, &[self.field.as_str()]).ok()?;
+            let text = value.as_str()?;
+            return Some(Document::from(text.as_bytes().to_vec()));
+        }
     }
 }

@@ -1,19 +1,20 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
-pub(crate) fn decompress_gzip(path: &Path) -> std::io::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let mut decoder = flate2::read::GzDecoder::new(file);
-    let mut buf = Vec::new();
-    decoder.read_to_end(&mut buf)?;
-    Ok(buf)
-}
+use super::file_source::Compression;
 
-pub(crate) fn decompress_zstd(path: &Path) -> std::io::Result<Vec<u8>> {
+/// Open a file with optional decompression, returning a buffered reader.
+pub(crate) fn open_reader(
+    path: &Path,
+    compression: Compression,
+) -> io::Result<Box<dyn BufRead + Send>> {
     let file = File::open(path)?;
-    let mut decoder = zstd::Decoder::new(file)?;
-    let mut buf = Vec::new();
-    decoder.read_to_end(&mut buf)?;
-    Ok(buf)
+    match compression {
+        Compression::None => Ok(Box::new(BufReader::new(file))),
+        Compression::Gzip => Ok(Box::new(BufReader::new(
+            flate2::read::GzDecoder::new(file),
+        ))),
+        Compression::Zstd => Ok(Box::new(BufReader::new(zstd::Decoder::new(file)?))),
+    }
 }
