@@ -72,5 +72,10 @@ fancy-regex = "0.17.0"
 name = "pretokenize"
 harness = false
 
+[[bench]]
+name = "encode"
+harness = false
+test = false
+
 [lints.rust]
 unused = "allow"

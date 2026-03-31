@@ -3,6 +3,7 @@
 
 pub(crate) mod bpe;
 pub(crate) mod bpe_train;
+pub(crate) mod encode;
 pub(crate) mod input;
 pub mod pretokenize;
 pub(crate) mod simd;
@@ -12,7 +13,7 @@ pub mod utils;
 use crate::bpe::Tokenizer;
 use crate::input::{MmappedFile, Resource};
 use crate::pretokenize::pretokenize_as_iter;
-pub(crate) mod load_tokenizer;
+pub mod load_tokenizer;
 use itertools::Itertools;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyDict};
@@ -74,9 +75,7 @@ impl FileSource {
         Self {
             paths,
             field: field.to_string(),
-            separator: separator
-                .unwrap_or(pretokenize::DEFAULT_SEPARATOR)
-                .to_vec(),
+            separator: separator.unwrap_or(pretokenize::DEFAULT_SEPARATOR).to_vec(),
         }
     }
 
@@ -121,14 +120,12 @@ fn train_bpe<'py>(
             field: file_source.field,
             separator: file_source.separator,
         };
-        let counts = spec
-            .pretokenize()
-            .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
-                    "FileSource processing failed: {}",
-                    e
-                ))
-            })?;
+        let counts = spec.pretokenize().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                "FileSource processing failed: {}",
+                e
+            ))
+        })?;
         let result = bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
         return bpe_result_to_python(py, result);
     }
@@ -148,8 +145,7 @@ fn train_bpe<'py>(
             #[cfg(feature = "parquet")]
             {
                 let counts = pretokenize::pretokenize_par_parquet(&path);
-                let result =
-                    bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
+                let result = bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
                 return bpe_result_to_python(py, result);
             }
         }
@@ -224,9 +220,9 @@ impl BPETokenizer {
             field: file_source.field,
             separator: file_source.separator,
         };
-        let files = spec.mmap_files().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e))
-        })?;
+        let files = spec
+            .mmap_files()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
 
         let mut all_results: Vec<Vec<u32>> = Vec::new();
         for (mmap, boundaries, _content) in &files {
@@ -296,9 +292,9 @@ impl SentencePieceTokenizer {
             field: file_source.field,
             separator: file_source.separator,
         };
-        let files = spec.mmap_files().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e))
-        })?;
+        let files = spec
+            .mmap_files()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
 
         let mut all_results: Vec<Vec<u32>> = Vec::new();
         for (mmap, boundaries, _content) in &files {
@@ -311,7 +307,11 @@ impl SentencePieceTokenizer {
                     JsonLinesSlice::new(chunk, spec.field())
                         .map(|doc| {
                             let text = unsafe { std::str::from_utf8_unchecked(doc.as_ref()) };
-                            encoder.encode_raw(text).into_iter().map(|t| t.into()).collect()
+                            encoder
+                                .encode_raw(text)
+                                .into_iter()
+                                .map(|t| t.into())
+                                .collect()
                         })
                         .collect()
                 })
