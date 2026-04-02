@@ -1,6 +1,8 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use jeton_rs::pretokenize::{PretokenizerIter, pretoken_combinator::pretokens_iterator};
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
+use jeton_rs::pretokenize::pretoken_avx512::Avx512PretokenizerIter;
 
 const TARGET_BENCH_SIZE: usize = 100_000_000; // ~100 MB
 
@@ -37,6 +39,14 @@ fn pretokenize_benches(c: &mut Criterion) {
         b.iter(|| {
             let mut input_str = unsafe { std::str::from_utf8_unchecked(&input) };
             let count = pretokens_iterator(&mut input_str).count();
+            black_box(count);
+        });
+    });
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
+    group.bench_function("avx512", |b| {
+        b.iter(|| {
+            let count = Avx512PretokenizerIter::new(&input).count();
             black_box(count);
         });
     });

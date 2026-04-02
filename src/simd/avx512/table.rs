@@ -55,16 +55,17 @@ impl VPGatherTable for &[u8] {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{Rng, RngCore};
+    use rand::{Rng, Fill, RngExt};
     extern crate test;
     use test::{Bencher, black_box};
 
     #[test]
     fn test_vpgather_lookup() {
         let mut table = vec![0_u8; 8192];
-        rand::rng().fill_bytes(&mut table);
+        rand::rng().fill(table.as_mut_slice());
 
         let indices = (0..(1024 * 1024))
             .map(|_| rand::rng().random_range(0..8192))
@@ -88,7 +89,7 @@ mod tests {
     #[bench]
     fn bench_vpgather_lookup(b: &mut Bencher) {
         let mut table = vec![0_u8; 131_072];
-        rand::rng().fill_bytes(&mut table);
+        rand::rng().fill(table.as_mut_slice());
 
         let indices = (0..(1024 * 1024))
             .map(|_| rand::rng().random_range(0..131_072))

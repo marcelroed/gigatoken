@@ -15,6 +15,8 @@ use std::collections::HashMap;
 mod options;
 mod pretoken;
 mod pretoken_chunks;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
+pub mod pretoken_avx512;
 pub mod pretoken_combinator;
 pub mod pretoken_state_machine;
 pub(crate) mod pretokenize_traits;

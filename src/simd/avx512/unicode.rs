@@ -11,6 +11,7 @@ unsafe fn vpermi2b_table_lookup(table1: s::u8x64, table2: s::u8x64, indices: s::
     unsafe { vpermi2b(table1.into(), indices.into(), table2.into()) }.into()
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     extern crate test;
@@ -21,7 +22,7 @@ mod tests {
         // Figure out how many elements we can look up per second in a table of 8192 elements.
         let mut table = [0; 8192];
 
-        use rand::Rng;
+        use rand::{Rng, RngExt};
         rand::rng().fill(&mut table);
 
         /// Create a large set of random offsets
@@ -45,7 +46,7 @@ mod tests {
         // Figure out how many elements we can look up per second in a table of 8192 elements.
         let mut table1 = [0; 64];
         let mut table2 = [0; 64];
-        use rand::Rng;
+        use rand::{Rng, RngExt};
         rand::rng().fill(&mut table1);
         rand::rng().fill(&mut table2);
 

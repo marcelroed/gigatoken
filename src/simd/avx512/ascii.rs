@@ -75,7 +75,7 @@ mod tests {
     use std::hint::black_box;
 
     use super::*;
-    use rand::{Rng, RngCore};
+    use rand::{Rng, Fill, RngExt};
     use test::Bencher;
 
     #[test]
@@ -121,7 +121,7 @@ mod tests {
     fn bench_ascii_classify(b: &mut Bencher) {
         // Initialize a random vector of 1GB of during setup
         let mut bytes = vec![0_u8; 1_000_000_000];
-        rand::rng().fill_bytes(&mut bytes);
+        rand::rng().fill(bytes.as_mut_slice());
         for byte in &mut bytes {
             // Set the first bit to 0 in order to make the bytes ASCII
             *byte &= 0b0111_1111;
