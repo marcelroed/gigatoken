@@ -12,30 +12,20 @@ crate-type = ["cdylib", "lib"]
 parquet = ["dep:polars"]
 
 [dependencies]
-dashmap = { version = "6.1", features = ["rayon"] }
+dashmap = "6.1"
 indicatif = "0.18"
 itertools = "0.14"
 priority-queue = "2.0"
-pyo3 = { version = "0.28", features = ["anyhow", "eyre"] }
+pyo3 = { version = "0.28", features = ["eyre"] }
 rayon = "1.11"
 regex = "1.12"
-rand = "0.10"
 # xxhash-rust = { version = "0.8.15", features = ["xxh3", "std", "const_xxh3"] }
 rustc-hash = "2.1"
 polars = { version = "0.53", features = ["lazy", "parquet"], optional = true }
 memmap2 = { version = "0.9", features = ["stable_deref_trait"] }
 base64 = "0.22"
 icu = { version = "2.1", features = ["compiled_data", "datagen"] }
-clap = { version = "4.5.48", features = [
-    # "debug",
-    "unicode",
-    "derive",
-    "string",
-    "env",
-] }
-thiserror = "2.0.17"
 eyre = "0.6.12"
-color-eyre = "0.6.5"
 winnow = { version = "1", features = ["simd"] }
 bumpalo = { version = "3.19.1", features = ["collections", "std"] }
 icu_codepointtrie_builder = { version = "0.5.1" }
@@ -68,6 +58,7 @@ strip = "none"
 [dev-dependencies]
 criterion = "0.8"
 fancy-regex = "0.17.0"
+rand = "0.10"
 
 
 # [[bench]]
