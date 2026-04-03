@@ -1,4 +1,4 @@
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512bw",
@@ -6,7 +6,10 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 ))]
 use jeton_rs::pretokenize::pretoken_avx512::Avx512PretokenizerIter;
 use jeton_rs::pretokenize::{
-    PretokenizerIter, pretoken_combinator::pretokens_iterator, pretoken_simd::SimdPretokIter,
+    pretoken_combinator::pretokens_iterator, pretoken_fast::FastPretokenizer, PretokenizerIter,
+};
+use jeton_rs::pretokenize::{
+    pretoken_combinator::pretokens_iterator, pretoken_simd::SimdPretokIter, PretokenizerIter,
 };
 use std::hint::black_box;
 
@@ -63,6 +66,24 @@ fn pretokenize_benches(c: &mut Criterion) {
     group.bench_function("simd", |b| {
         b.iter(|| {
             let count = SimdPretokIter::new(&input).count();
+            black_box(count);
+        });
+    });
+
+    group.bench_function("fast_scalar", |b| {
+        b.iter(|| {
+            let mut iter = FastPretokenizer::new(&input);
+            let mut count = 0;
+            while iter.next().is_some() {
+                count += 1;
+            }
+            black_box(count);
+        });
+    });
+
+    group.bench_function("fast_dual_cursor", |b| {
+        b.iter(|| {
+            let count = FastPretokenizer::new(&input).count();
             black_box(count);
         });
     });

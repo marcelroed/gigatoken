@@ -75,6 +75,11 @@ harness = false
 test = false
 
 [[bench]]
+name = "encode_st"
+harness = false
+test = false
+
+[[bench]]
 name = "simdutf_transcode"
 harness = false
 

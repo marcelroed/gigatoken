@@ -1,6 +1,5 @@
 use jeton_rs::load_tokenizer::hf::load_hf_bpe;
 use jeton_rs::pretokenize::pretoken_fast::FastPretokenizer;
-use rayon::prelude::*;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -8,7 +7,7 @@ fn main() {
     let tokenizer_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json");
     eprintln!("Loading GPT-2 tokenizer from {tokenizer_path:?}...");
-    let tokenizer = load_hf_bpe(&tokenizer_path).expect("Could not load GPT-2 tokenizer");
+    let mut tokenizer = load_hf_bpe(&tokenizer_path).expect("Could not load GPT-2 tokenizer");
 
     let owt_path = std::env::home_dir().unwrap().join("data/owt_train.txt");
     eprintln!("Reading {owt_path:?}...");
@@ -21,21 +20,14 @@ fn main() {
     let lines: Vec<&[u8]> = text.lines().map(|l| l.as_bytes()).collect();
     eprintln!("{} lines\n", lines.len());
 
-    eprintln!("Encoding (parallel)...");
+    eprintln!("Encoding (single-threaded)...");
     let start = Instant::now();
-    let total_tokens: usize = lines
-        .par_iter()
-        .map_init(
-            || tokenizer.fork(),
-            |tok, &line| {
-                let mut n = 0usize;
-                for arc in tok.memoized_encode(FastPretokenizer::new(line)) {
-                    n += arc.len();
-                }
-                n
-            },
-        )
-        .sum();
+    let mut total_tokens: usize = 0;
+    for &line in &lines {
+        for arc in tokenizer.memoized_encode(FastPretokenizer::new(line)) {
+            total_tokens += arc.len();
+        }
+    }
     let elapsed = start.elapsed().as_secs_f64();
     let throughput_gb = size_gb / elapsed;
 
