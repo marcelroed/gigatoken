@@ -6,9 +6,9 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 ))]
 use jeton_rs::pretokenize::pretoken_avx512::Avx512PretokenizerIter;
 use jeton_rs::pretokenize::{
-    pretoken_combinator::pretokens_iterator, pretoken_fast::FastPretokenizer,
-    pretoken_simd::SimdPretokIter, PretokenizerIter,
+    pretoken_combinator::pretokens_iterator, pretoken_fast::FastPretokenizer, PretokenizerIter,
 };
+use jeton_rs::pretokenize::pretoken_simd::SimdPretokIter;
 use std::hint::black_box;
 
 const TARGET_BENCH_SIZE: usize = 100_000_000; // ~100 MB
