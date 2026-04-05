@@ -1,13 +1,13 @@
 #![feature(test)]
 #![feature(portable_simd)]
 
-pub(crate) mod bpe;
+pub mod bpe;
 pub(crate) mod bpe_train;
-pub(crate) mod encode;
+pub mod encode;
 pub(crate) mod input;
 pub mod pretokenize;
 pub(crate) mod simd;
-pub(crate) mod token;
+pub mod token;
 pub(crate) mod unicode_tables;
 pub mod utils;
 use crate::bpe::Tokenizer;

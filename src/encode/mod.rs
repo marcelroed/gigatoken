@@ -1,1 +1,1 @@
-mod tiktoken_radix;
+pub mod tiktoken_radix;

@@ -30,9 +30,6 @@ winnow = { version = "1", features = ["simd"] }
 bumpalo = { version = "3.19.1", features = ["collections", "std"] }
 icu_codepointtrie_builder = { version = "0.5.1" }
 zerovec = { version = "0.11.5", features = ["derive", "std"] }
-voracious_radix_sort = { version = "1.2.0", features = [
-    "voracious_multithread",
-] }
 sonic-rs = "0.5.8"
 memchr = "2.8.0"
 simdutf = "0.7.0"

@@ -1898,7 +1898,6 @@ dependencies = [
  "serde",
  "simdutf",
  "sonic-rs",
- "voracious_radix_sort",
  "winnow",
  "zerovec",
  "zstd",
@@ -4171,15 +4170,6 @@ name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
-
-[[package]]
-name = "voracious_radix_sort"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446e7ffcb6c27a71d05af7e51ef2ee5b71c48424b122a832f2439651e1914899"
-dependencies = [
- "rayon",
-]
 
 [[package]]
 name = "walkdir"

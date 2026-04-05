@@ -11,8 +11,8 @@ use std::collections::HashMap;
 // ---------------------------------------------------------------------------
 
 pub struct ByteRemapping {
-    mapping: Vec<u8>, // Maps string byte to symbol byte
-    unmap: Vec<u8>,   // Maps symbol byte to string byte
+    pub mapping: Vec<u8>, // Maps string byte to symbol byte
+    pub unmap: Vec<u8>,   // Maps symbol byte to string byte
 }
 
 impl ByteRemapping {
