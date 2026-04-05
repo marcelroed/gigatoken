@@ -112,6 +112,72 @@ fn swar_scan_letters(bytes: &[u8], mut pos: usize) -> usize {
     pos
 }
 
+/// SWAR digit scan: advances `pos` past ASCII digits.
+#[inline(always)]
+fn swar_scan_digits(bytes: &[u8], mut pos: usize) -> usize {
+    let len = bytes.len();
+    while pos + 8 <= len {
+        let word = unsafe { (bytes.as_ptr().add(pos) as *const u64).read_unaligned() };
+        if word & HI != 0 {
+            break;
+        }
+        let ge_0 = (word | HI).wrapping_sub(0x3030_3030_3030_3030) & HI;
+        let le_9 = (0x3939_3939_3939_3939 | HI).wrapping_sub(word) & HI;
+        let mask = ge_0 & le_9 & HI;
+        if mask != HI {
+            return pos + (!mask & HI).to_le().trailing_zeros() as usize / 8;
+        }
+        pos += 8;
+    }
+    while pos < len && is_digit(unsafe { *bytes.get_unchecked(pos) }) {
+        pos += 1;
+    }
+    pos
+}
+
+/// SWAR "other" scan: advances `pos` past bytes that are NOT letter, digit,
+/// whitespace, or high (>=0x80). Returns position of first non-"other" byte.
+#[inline(always)]
+fn swar_scan_other(bytes: &[u8], mut pos: usize) -> usize {
+    let len = bytes.len();
+    while pos + 8 <= len {
+        let word = unsafe { (bytes.as_ptr().add(pos) as *const u64).read_unaligned() };
+        // Any high byte means non-ASCII — stop immediately
+        if word & HI != 0 {
+            break;
+        }
+        // Detect bytes that are NOT "other": letter OR digit OR whitespace
+        let lowered = word | 0x2020_2020_2020_2020;
+        let ge_a = (lowered | HI).wrapping_sub(0x6161_6161_6161_6161) & HI;
+        let le_z = (0x7A7A_7A7A_7A7A_7A7A | HI).wrapping_sub(lowered) & HI;
+        let is_letter = ge_a & le_z & HI;
+
+        let ge_0 = (word | HI).wrapping_sub(0x3030_3030_3030_3030) & HI;
+        let le_9 = (0x3939_3939_3939_3939 | HI).wrapping_sub(word) & HI;
+        let is_digit = ge_0 & le_9 & HI;
+
+        let ge_9 = (word | HI).wrapping_sub(0x0909_0909_0909_0909) & HI;
+        let le_13 = (0x0D0D_0D0D_0D0D_0D0D | HI).wrapping_sub(word) & HI;
+        let is_ws_ctrl = ge_9 & le_13 & HI;
+        let xor_space = word ^ 0x2020_2020_2020_2020;
+        let is_space = (xor_space.wrapping_sub(0x0101_0101_0101_0101)) & !xor_space & HI;
+
+        let not_other = is_letter | is_digit | is_ws_ctrl | is_space;
+        if not_other != 0 {
+            return pos + not_other.to_le().trailing_zeros() as usize / 8;
+        }
+        pos += 8;
+    }
+    while pos < len {
+        let b = unsafe { *bytes.get_unchecked(pos) };
+        if b >= 0x80 || is_letter(b) || is_digit(b) || is_ascii_ws(b) {
+            break;
+        }
+        pos += 1;
+    }
+    pos
+}
+
 // -----------------------------------------------------------------------
 // FastPretokenizer
 // -----------------------------------------------------------------------
@@ -224,6 +290,8 @@ impl<'a> FastPretokenizer<'a> {
     }
 
     /// Advance past one token. self.pos must be < self.bytes.len().
+    /// Uses direct comparison chains instead of LUT + jump table to avoid
+    /// GOT indirection and improve branch prediction on common patterns.
     #[inline(always)]
     fn advance(&mut self) {
         let bytes = self.bytes;
@@ -231,49 +299,75 @@ impl<'a> FastPretokenizer<'a> {
         let start = self.pos;
         let b0 = unsafe { *bytes.get_unchecked(start) };
 
-        match CLASS[b0 as usize] {
-            LETTER => {
-                self.pos = start + 1;
-                self.scan_letters();
-            }
-            SPACE => {
-                if start + 1 < len {
-                    let b1 = unsafe { *bytes.get_unchecked(start + 1) };
-                    if is_letter(b1) {
-                        self.pos = start + 2;
+        // Hot path 1: ASCII letter (~40% of tokens)
+        if is_letter(b0) {
+            self.pos = start + 1;
+            self.scan_letters();
+            return;
+        }
+
+        // Hot path 2: space before content (~25% of tokens)
+        if b0 == b' ' {
+            if start + 1 < len {
+                let b1 = unsafe { *bytes.get_unchecked(start + 1) };
+                if is_letter(b1) {
+                    self.pos = start + 2;
+                    self.scan_letters();
+                } else if is_digit(b1) {
+                    self.pos = start + 2;
+                    self.scan_digits();
+                } else if b1 >= 0x80 {
+                    self.pos = start + 1;
+                    let c = unsafe { decode_non_ascii(&bytes[self.pos..]) };
+                    self.pos += c.len_utf8();
+                    if unicode::is_letter(c) {
                         self.scan_letters();
-                    } else if is_digit(b1) {
-                        self.pos = start + 2;
+                    } else if unicode::is_number(c) {
                         self.scan_digits();
-                    } else if b1 >= 0x80 {
-                        self.pos = start + 1;
-                        let c = unsafe { decode_non_ascii(&bytes[self.pos..]) };
-                        self.pos += c.len_utf8();
-                        if unicode::is_letter(c) {
-                            self.scan_letters();
-                        } else if unicode::is_number(c) {
-                            self.scan_digits();
-                        } else if unicode::is_whitespace(c) {
-                            self.advance_whitespace(start);
-                        } else {
-                            self.scan_other();
-                        }
-                    } else if is_ascii_ws(b1) {
-                        self.pos = start + 1;
+                    } else if unicode::is_whitespace(c) {
                         self.advance_whitespace(start);
                     } else {
-                        self.pos = start + 2;
                         self.scan_other();
                     }
-                } else {
+                } else if is_ascii_ws(b1) {
                     self.pos = start + 1;
+                    self.advance_whitespace(start);
+                } else {
+                    self.pos = start + 2;
+                    self.scan_other();
                 }
-            }
-            DIGIT => {
+            } else {
                 self.pos = start + 1;
-                self.scan_digits();
             }
-            APOSTROPHE => match bytes.get(start + 1) {
+            return;
+        }
+
+        // Non-ASCII
+        if b0 >= 0x80 {
+            let c = unsafe { decode_non_ascii(&bytes[start..]) };
+            self.pos = start + c.len_utf8();
+            if unicode::is_letter(c) {
+                self.scan_letters();
+            } else if unicode::is_number(c) {
+                self.scan_digits();
+            } else if unicode::is_whitespace(c) {
+                self.advance_whitespace(start);
+            } else {
+                self.scan_other();
+            }
+            return;
+        }
+
+        // Digit
+        if is_digit(b0) {
+            self.pos = start + 1;
+            self.scan_digits();
+            return;
+        }
+
+        // Apostrophe / contraction
+        if b0 == b'\'' {
+            match bytes.get(start + 1) {
                 Some(b's' | b'd' | b'm' | b't') => {
                     self.pos = start + 2;
                 }
@@ -290,30 +384,20 @@ impl<'a> FastPretokenizer<'a> {
                     self.pos = start + 1;
                     self.scan_other();
                 }
-            },
-            WHITESPACE => {
-                self.pos = start + 1;
-                self.advance_whitespace(start);
             }
-            OTHER => {
-                self.pos = start + 1;
-                self.scan_other();
-            }
-            NON_ASCII => {
-                let c = unsafe { decode_non_ascii(&bytes[start..]) };
-                self.pos = start + c.len_utf8();
-                if unicode::is_letter(c) {
-                    self.scan_letters();
-                } else if unicode::is_number(c) {
-                    self.scan_digits();
-                } else if unicode::is_whitespace(c) {
-                    self.advance_whitespace(start);
-                } else {
-                    self.scan_other();
-                }
-            }
-            _ => unsafe { std::hint::unreachable_unchecked() },
+            return;
         }
+
+        // Whitespace (tab, newline, etc.)
+        if b0.wrapping_sub(9) < 5 {
+            self.pos = start + 1;
+            self.advance_whitespace(start);
+            return;
+        }
+
+        // Other (punctuation, symbols)
+        self.pos = start + 1;
+        self.scan_other();
     }
 }
 

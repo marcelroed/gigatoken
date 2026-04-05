@@ -273,7 +273,7 @@ unsafe fn whitespace_boundary(bytes: &[u8], start: usize) -> usize {
 }
 
 // ==========================================================================
-// SIMD scan primitives — 32-byte chunks (single μop on Zen 4)
+// SIMD scan primitives — 32-byte chunks
 // ==========================================================================
 
 #[inline]

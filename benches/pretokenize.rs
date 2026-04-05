@@ -6,10 +6,8 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 ))]
 use jeton_rs::pretokenize::pretoken_avx512::Avx512PretokenizerIter;
 use jeton_rs::pretokenize::{
-    pretoken_combinator::pretokens_iterator, pretoken_fast::FastPretokenizer, PretokenizerIter,
-};
-use jeton_rs::pretokenize::{
-    pretoken_combinator::pretokens_iterator, pretoken_simd::SimdPretokIter, PretokenizerIter,
+    pretoken_combinator::pretokens_iterator, pretoken_fast::FastPretokenizer,
+    pretoken_simd::SimdPretokIter, PretokenizerIter,
 };
 use std::hint::black_box;
 
@@ -59,7 +57,11 @@ fn pretokenize_benches(c: &mut Criterion) {
     ))]
     group.bench_function("avx512", |b| {
         b.iter(|| {
-            let count = Avx512PretokenizerIter::new(&input).count();
+            let mut iter = Avx512PretokenizerIter::new(&input);
+            let mut count = 0;
+            while iter.next().is_some() {
+                count += 1;
+            }
             black_box(count);
         });
     });
