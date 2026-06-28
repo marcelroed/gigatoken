@@ -29,9 +29,9 @@ fn main() {
             || tokenizer.fork(),
             |tok, &line| {
                 let mut n = 0usize;
-                for arc in tok.memoized_encode(FastPretokenizer::new(line)) {
-                    n += arc.len();
-                }
+                tok.memoized_encode(FastPretokenizer::new(line), |tokens| {
+                    n += tokens.len();
+                });
                 n
             },
         )

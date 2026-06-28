@@ -321,9 +321,9 @@ mod tests {
         let text = b"Hello, world! This is a test.";
         let pretokens = crate::pretokenize::pretokenize_as_iter(text);
         let mut token_ids: Vec<TokenId> = Vec::new();
-        for arc in tokenizer.memoized_encode(pretokens) {
-            token_ids.extend_from_slice(&arc);
-        }
+        tokenizer.memoized_encode(pretokens, |tokens| {
+            token_ids.extend_from_slice(tokens);
+        });
         eprintln!("Encoded {} bytes -> {:?}", text.len(), token_ids);
         let decoded: Vec<u8> = tokenizer.decode(&token_ids).collect();
         assert_eq!(decoded, text);

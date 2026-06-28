@@ -199,13 +199,13 @@ impl BPETokenizer {
         })
     }
     fn encode(&mut self, input: &[u8]) -> PyResult<Vec<u32>> {
-        let iter = self.tokenizer.memoized_encode(pretokenize_as_iter(input));
         let mut v = vec![];
-        for arc in iter {
-            for &e in arc.into_iter() {
-                v.push(e.into())
-            }
-        }
+        self.tokenizer
+            .memoized_encode(pretokenize_as_iter(input), |tokens| {
+                for &e in tokens {
+                    v.push(e.into())
+                }
+            });
         Ok(v)
     }
 
@@ -234,13 +234,15 @@ impl BPETokenizer {
                     let mut tokenizer = self.tokenizer.fork();
                     JsonLinesSlice::new(chunk, spec.field())
                         .map(|doc| {
-                            let iter = tokenizer.memoized_encode(pretokenize_as_iter(doc.as_ref()));
                             let mut v = vec![];
-                            for arc in iter {
-                                for &e in arc.into_iter() {
-                                    v.push(e.into())
-                                }
-                            }
+                            tokenizer.memoized_encode(
+                                pretokenize_as_iter(doc.as_ref()),
+                                |tokens| {
+                                    for &e in tokens {
+                                        v.push(e.into())
+                                    }
+                                },
+                            );
                             v
                         })
                         .collect()

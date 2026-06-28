@@ -55,9 +55,9 @@ fn main() {
     let start = Instant::now();
     let mut total_tokens: usize = 0;
     for &line in &lines {
-        for arc in tokenizer.memoized_encode(FastPretokenizer::new(line)) {
-            total_tokens += arc.len();
-        }
+        tokenizer.memoized_encode(FastPretokenizer::new(line), |tokens| {
+            total_tokens += tokens.len();
+        });
     }
     let elapsed = start.elapsed().as_secs_f64();
     let throughput_gb = size_gb / elapsed;

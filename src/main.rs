@@ -85,10 +85,9 @@ pub fn main() {
     let start = std::time::Instant::now();
     let mut total_tokens: usize = 0;
     for doc in &docs {
-        let iter = r50k.memoized_encode(pretokenize::pretokenize_as_iter(doc.as_bytes()));
-        for arc in iter {
-            total_tokens += arc.len();
-        }
+        r50k.memoized_encode(pretokenize::pretokenize_as_iter(doc.as_bytes()), |tokens| {
+            total_tokens += tokens.len();
+        });
     }
     let elapsed = start.elapsed();
     eprintln!(

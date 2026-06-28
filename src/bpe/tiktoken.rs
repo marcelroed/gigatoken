@@ -21,7 +21,54 @@ pub struct Tokenizer {
     pub(crate) vocab: Vec<Arc<[u8]>>,
     pub(crate) vocab_inv: HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
     pub(crate) byte_remapping: Option<ByteRemapping>,
-    pretoken_cache: HashMap<Arc<[u8]>, Arc<[TokenId]>, rustc_hash::FxBuildHasher>,
+    /// Append-only arena of encoded token IDs. Cache entries store
+    /// `(offset, len)` slices into this vector, avoiding per-entry
+    /// `Arc` allocations and atomic refcount bumps on every cache hit.
+    token_arena: Vec<TokenId>,
+    /// Pretoken cache for the common case (≤ 15 bytes, ~99.9% of pretokens).
+    /// The key packs the bytes into the low 15 bytes and the length into the
+    /// top byte of a `u128`, so lookups are a single inlined 128-bit compare
+    /// instead of a `memcmp` call, and hashing is two multiply-mixes instead of
+    /// a byte loop. Keys are `Copy`, so cache misses no longer allocate.
+    pretoken_cache: HashMap<u128, (u32, u32), rustc_hash::FxBuildHasher>,
+    /// Fallback cache for pretokens longer than 15 bytes.
+    pretoken_cache_long: HashMap<Box<[u8]>, (u32, u32), rustc_hash::FxBuildHasher>,
+}
+
+/// Pack a pretoken of ≤ 15 bytes into a `u128`: bytes in the low 15 lanes,
+/// length in the top byte. Returns `None` for longer pretokens, which use the
+/// `Box<[u8]>` fallback map. Encoding the length means two pretokens of
+/// different length can never collide.
+///
+/// The common path is a single unaligned 16-byte load followed by a mask, which
+/// avoids both the variable-length `copy_from_slice` (a `memcpy` libc call) and
+/// any per-byte branching. The load is only taken when it cannot cross a page
+/// boundary, so it can never touch an unmapped page; the rare near-boundary case
+/// falls back to a plain copy. Both paths produce the identical key.
+#[inline(always)]
+fn pack_pretoken_key(bytes: &[u8]) -> Option<u128> {
+    let n = bytes.len();
+    if n > 15 {
+        return None;
+    }
+    let p = bytes.as_ptr();
+    // Keep the low `n` bytes, zero the rest. `n <= 15`, so the shift is < 128
+    // and lane 15 stays zero, ready for the length tag.
+    let mask = (1u128 << (n * 8)) - 1;
+    let low = if (p as usize) & 4095 <= 4096 - 16 {
+        // SAFETY: the offset within the (≥ 4096-byte) page is ≤ 4096 - 16, so a
+        // 16-byte read stays inside the page holding `p`, which is mapped
+        // because `p` points to at least one valid byte.
+        let v = unsafe { (p as *const u128).read_unaligned() };
+        v & mask
+    } else {
+        // Rare: `p` is within 16 bytes of a page boundary. Gather with a plain
+        // copy (≤ 15 bytes) — correctness over speed on this cold path.
+        let mut lanes = [0u8; 16];
+        lanes[..n].copy_from_slice(bytes);
+        u128::from_le_bytes(lanes) & mask
+    };
+    Some(low | ((n as u128) << 120))
 }
 
 /// Tokenize a single pretoken by repeatedly applying BPE merges in order.
@@ -72,7 +119,9 @@ impl Tokenizer {
             vocab_inv,
             vocab,
             byte_remapping,
+            token_arena: Vec::new(),
             pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
         }
     }
 
@@ -111,7 +160,9 @@ impl Tokenizer {
             byte_remapping: ByteRemapping::from_byte_vocab(&vocab)?,
             vocab,
             vocab_inv,
+            token_arena: Vec::new(),
             pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
         })
     }
 
@@ -126,7 +177,9 @@ impl Tokenizer {
                 mapping: br.mapping.clone(),
                 unmap: br.unmap.clone(),
             }),
+            token_arena: Vec::new(),
             pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
         }
     }
 
@@ -148,21 +201,46 @@ impl Tokenizer {
 
     /// For each pretoken in the input iterator, looks up the string in the
     /// cache, and if not found, encodes it and inserts it into the cache.
-    pub fn memoized_encode<'a, 'i>(
-        &'a mut self,
+    /// Calls `f` with the encoded token slice for each pretoken.
+    pub fn memoized_encode<'i>(
+        &mut self,
         pretoken_iter: impl Iterator<Item = Pretoken<'i>>,
-    ) -> impl Iterator<Item = Arc<[TokenId]>> {
-        let pretoken_cache = &mut self.pretoken_cache;
-        pretoken_iter.map(|pretoken: Pretoken| {
-            let found_value = pretoken_cache.get(pretoken.as_ref());
-            if let Some(v) = found_value {
-                return v.clone();
+        mut f: impl FnMut(&[TokenId]),
+    ) {
+        for pretoken in pretoken_iter {
+            let bytes = pretoken.as_ref();
+            // Look up the cached encoding. Short pretokens (the overwhelming
+            // majority) use the packed `u128` map; the rare long ones fall back
+            // to the slice-keyed map. The key is computed once and reused on the
+            // miss path's insert.
+            let key = pack_pretoken_key(bytes);
+            let cached = match key {
+                Some(key) => self.pretoken_cache.get(&key).copied(),
+                None => self.pretoken_cache_long.get(bytes).copied(),
+            };
+            if let Some((offset, len)) = cached {
+                let start = offset as usize;
+                f(&self.token_arena[start..start + len as usize]);
+            } else {
+                let tokens = Self::encode_pretoken(
+                    self.byte_remapping.as_ref(),
+                    &self.merges,
+                    pretoken,
+                );
+                let offset = self.token_arena.len() as u32;
+                let len = tokens.len() as u32;
+                self.token_arena.extend_from_slice(&tokens);
+                match key {
+                    Some(key) => {
+                        self.pretoken_cache.insert(key, (offset, len));
+                    }
+                    None => {
+                        self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+                    }
+                }
+                f(&self.token_arena[offset as usize..offset as usize + len as usize]);
             }
-            let inserted_value: Arc<[TokenId]> =
-                Self::encode_pretoken(self.byte_remapping.as_ref(), &self.merges, pretoken).into();
-            pretoken_cache.insert(pretoken.as_ref().into(), inserted_value.clone());
-            inserted_value
-        })
+        }
     }
 
     pub fn decode(&self, v: &[TokenId]) -> impl Iterator<Item = u8> {
@@ -173,7 +251,7 @@ impl Tokenizer {
 
     /// Get the number of pretokens currently in the cache.
     pub fn pretoken_cache_size(&self) -> usize {
-        self.pretoken_cache.len()
+        self.pretoken_cache.len() + self.pretoken_cache_long.len()
     }
 }
 
@@ -249,9 +327,9 @@ mod tests {
         let mut tokenizer = load_tiktoken(tiktoken_path).expect("Failed to load tokenizer");
         let pretokenize_iter = crate::pretokenize::pretokenize_as_iter(text.as_bytes());
         let mut output = vec![];
-        tokenizer
-            .memoized_encode(pretokenize_iter)
-            .for_each(|pretoken| output.extend_from_slice(&pretoken));
+        tokenizer.memoized_encode(pretokenize_iter, |tokens| {
+            output.extend_from_slice(tokens);
+        });
         assert!(tokenizer.byte_remapping.is_some());
         println!("Encoded: {:?}", output);
         let decoded = tokenizer.decode(&output).collect::<Vec<u8>>();
