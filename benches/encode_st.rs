@@ -46,21 +46,21 @@ fn main() {
 
     let input = load_input();
     let size_gb = input.len() as f64 / 1e9;
-
-    let text = unsafe { std::str::from_utf8_unchecked(&input) };
-    let lines: Vec<&[u8]> = text.lines().map(|l| l.as_bytes()).collect();
-    eprintln!("{} lines\n", lines.len());
+    // Encode the whole buffer in one pass (matches real usage; the pretokenizer
+    // handles newlines itself, so pre-splitting into lines is unnecessary).
+    let buf: &[u8] = &input;
 
     eprintln!("Encoding (single-threaded)...");
     let start = Instant::now();
     let mut total_tokens: usize = 0;
-    for &line in &lines {
-        tokenizer.memoized_encode(FastPretokenizer::new(line), |tokens| {
-            total_tokens += tokens.len();
-        });
-    }
+    tokenizer.memoized_encode(FastPretokenizer::new(buf), |tokens| {
+        total_tokens += tokens.len();
+    });
     let elapsed = start.elapsed().as_secs_f64();
     let throughput_gb = size_gb / elapsed;
 
-    eprintln!("{total_tokens} tokens in {elapsed:.2}s — {throughput_gb:.2} GB/s ({:.0} MB/s)", throughput_gb * 1000.0);
+    eprintln!(
+        "{total_tokens} tokens in {elapsed:.2}s — {throughput_gb:.2} GB/s ({:.0} MB/s)",
+        throughput_gb * 1000.0
+    );
 }

@@ -80,6 +80,11 @@ harness = false
 test = false
 
 [[bench]]
+name = "pretokenize_profile"
+harness = false
+test = false
+
+[[bench]]
 name = "simdutf_transcode"
 harness = false
 
