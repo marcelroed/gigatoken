@@ -1,0 +1,5 @@
+# Allow per-profile `rustflags` (nightly-only). This lets the `profiling`
+# profile in Cargo.toml set `force-frame-pointers` without affecting normal
+# release/dev builds.
+[unstable]
+profile-rustflags = true
