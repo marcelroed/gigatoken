@@ -34,7 +34,7 @@ def jeton_tok(tinyllama_tokenizer_path):
 def _assert_ids_match(hf_tok, jeton_tok, text: str):
     """Encode text with both tokenizers and compare token IDs directly."""
     hf_ids = hf_tok.encode(text).ids[1:]  # strip BOS
-    jeton_ids = jeton_tok.encode(text)
+    jeton_ids = jeton_tok.encode(text).tolist()
     assert jeton_ids == hf_ids, (
         f"Mismatch for {text!r}:\n"
         f"  HF:    {hf_ids}\n"
@@ -123,7 +123,7 @@ def test_owt_10mb(hf_tok, jeton_tok):
 
     mismatches = 0
     for i, line in enumerate(non_empty):
-        jeton_ids = jeton_tok.encode(line)
+        jeton_ids = jeton_tok.encode(line).tolist()
         hf_ids = hf_id_lists[i]
         if jeton_ids != hf_ids:
             if mismatches < 5:

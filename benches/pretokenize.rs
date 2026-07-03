@@ -6,8 +6,8 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 ))]
 use jeton_rs::pretokenize::pretoken_avx512::Avx512PretokenizerIter;
 use jeton_rs::pretokenize::{
-    pretoken_combinator::pretokens_iterator, FastCl100kPretokenizer, FastR50kPretokenizer,
-    PretokenizerIter,
+    pretoken_combinator::pretokens_iterator, FastCl100kPretokenizer, FastQwen2Pretokenizer,
+    FastR50kPretokenizer, PretokenizerIter,
 };
 use jeton_rs::pretokenize::pretoken_simd::SimdPretokIter;
 use std::hint::black_box;
@@ -87,6 +87,17 @@ fn pretokenize_benches(c: &mut Criterion) {
     group.bench_function("cl100k_fast_scalar", |b| {
         b.iter(|| {
             let mut iter = FastCl100kPretokenizer::new(&input);
+            let mut count = 0;
+            while iter.next().is_some() {
+                count += 1;
+            }
+            black_box(count);
+        });
+    });
+
+    group.bench_function("qwen2_fast_scalar", |b| {
+        b.iter(|| {
+            let mut iter = FastQwen2Pretokenizer::new(&input);
             let mut count = 0;
             while iter.next().is_some() {
                 count += 1;

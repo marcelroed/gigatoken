@@ -32,7 +32,7 @@ pub(crate) mod pretokenize_traits;
 mod unicode;
 pub mod pretoken_simd;
 
-pub use fast::{FastCl100kPretokenizer, FastR50kPretokenizer};
+pub use fast::{FastCl100kPretokenizer, FastQwen2Pretokenizer, FastR50kPretokenizer};
 pub use options::{FastPretokenizerDispatch, PretokenizerType};
 pub use pretoken_state_machine::PretokenizerIter;
 

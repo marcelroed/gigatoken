@@ -7,9 +7,11 @@
 //! classes line up.
 
 pub mod cl100k;
+pub mod qwen2;
 pub mod r50k;
 
 pub use cl100k::FastCl100kPretokenizer;
+pub use qwen2::FastQwen2Pretokenizer;
 pub use r50k::FastR50kPretokenizer;
 
 use crate::pretokenize::unicode;

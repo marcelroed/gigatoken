@@ -1,5 +1,5 @@
 use crate::pretokenize::Pretoken;
-use crate::pretokenize::fast::{FastCl100kPretokenizer, FastR50kPretokenizer};
+use crate::pretokenize::fast::{FastCl100kPretokenizer, FastQwen2Pretokenizer, FastR50kPretokenizer};
 
 /// Which pretokenization scheme (regex) a tokenizer uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,10 @@ impl PretokenizerType {
             PretokenizerType::GPT4 => {
                 FastPretokenizerDispatch::Cl100k(FastCl100kPretokenizer::new(bytes))
             }
-            PretokenizerType::Qwen2 | PretokenizerType::DeepSeekV3 => {
+            PretokenizerType::Qwen2 => {
+                FastPretokenizerDispatch::Qwen2(FastQwen2Pretokenizer::new(bytes))
+            }
+            PretokenizerType::DeepSeekV3 => {
                 unimplemented!("no fast pretokenizer for {self:?} yet")
             }
         }
@@ -36,6 +39,7 @@ impl PretokenizerType {
 pub enum FastPretokenizerDispatch<'a> {
     R50k(FastR50kPretokenizer<'a>),
     Cl100k(FastCl100kPretokenizer<'a>),
+    Qwen2(FastQwen2Pretokenizer<'a>),
 }
 
 impl<'a> Iterator for FastPretokenizerDispatch<'a> {
@@ -46,6 +50,7 @@ impl<'a> Iterator for FastPretokenizerDispatch<'a> {
         match self {
             FastPretokenizerDispatch::R50k(it) => it.next(),
             FastPretokenizerDispatch::Cl100k(it) => it.next(),
+            FastPretokenizerDispatch::Qwen2(it) => it.next(),
         }
     }
 }

@@ -17,6 +17,7 @@ indicatif = "0.18"
 itertools = "0.14"
 priority-queue = "2.0"
 pyo3 = { version = "0.28", features = ["eyre"] }
+numpy = "0.28"
 rayon = "1.11"
 regex = "1.12"
 # xxhash-rust = { version = "0.8.15", features = ["xxh3", "std", "const_xxh3"] }

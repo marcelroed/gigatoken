@@ -15,6 +15,7 @@ use crate::input::{MmappedFile, Resource};
 use crate::pretokenize::pretokenize_as_iter;
 pub mod load_tokenizer;
 use itertools::Itertools;
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyDict};
 use std::path::PathBuf;
@@ -198,7 +199,11 @@ impl BPETokenizer {
             tokenizer: load_tokenizer::hf::load_hf_bpe(&path)?,
         })
     }
-    fn encode(&mut self, input: &[u8]) -> PyResult<Vec<u32>> {
+    fn encode<'py>(
+        &mut self,
+        py: Python<'py>,
+        input: &[u8],
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
         let mut v = vec![];
         self.tokenizer
             .memoized_encode(pretokenize_as_iter(input), |tokens| {
@@ -206,12 +211,16 @@ impl BPETokenizer {
                     v.push(e.into())
                 }
             });
-        Ok(v)
+        Ok(v.into_pyarray(py))
     }
 
     /// Encode all documents from a FileSource in parallel.
     /// Everything happens in Rust: mmap, JSONL parse, pretokenize, BPE merge.
-    fn encode_file(&self, file_source: FileSource) -> PyResult<Vec<Vec<u32>>> {
+    fn encode_file<'py>(
+        &self,
+        py: Python<'py>,
+        file_source: FileSource,
+    ) -> PyResult<Vec<Bound<'py, PyArray1<u32>>>> {
         use input::jsonl::JsonLinesSlice;
         use rayon::prelude::*;
 
@@ -224,7 +233,7 @@ impl BPETokenizer {
             .mmap_files()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
 
-        let mut all_results: Vec<Vec<u32>> = Vec::new();
+        let mut all_results: Vec<Bound<'py, PyArray1<u32>>> = Vec::new();
         for (mmap, boundaries, _content) in &files {
             let bytes = mmap.as_bytes();
             let chunk_results: Vec<Vec<Vec<u32>>> = boundaries
@@ -249,7 +258,7 @@ impl BPETokenizer {
                 })
                 .collect();
             for chunk in chunk_results {
-                all_results.extend(chunk);
+                all_results.extend(chunk.into_iter().map(|v| v.into_pyarray(py)));
             }
         }
         Ok(all_results)
@@ -274,18 +283,23 @@ impl SentencePieceTokenizer {
         })
     }
 
-    fn encode(&self, input: &str) -> PyResult<Vec<u32>> {
+    fn encode<'py>(&self, py: Python<'py>, input: &str) -> PyResult<Bound<'py, PyArray1<u32>>> {
         Ok(self
             .tokenizer
             .encoder()
             .encode_raw(input)
             .into_iter()
             .map(|t| t.into())
-            .collect())
+            .collect::<Vec<u32>>()
+            .into_pyarray(py))
     }
 
     /// Encode all documents from a FileSource in parallel.
-    fn encode_file(&self, file_source: FileSource) -> PyResult<Vec<Vec<u32>>> {
+    fn encode_file<'py>(
+        &self,
+        py: Python<'py>,
+        file_source: FileSource,
+    ) -> PyResult<Vec<Bound<'py, PyArray1<u32>>>> {
         use input::jsonl::JsonLinesSlice;
         use rayon::prelude::*;
 
@@ -298,7 +312,7 @@ impl SentencePieceTokenizer {
             .mmap_files()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
 
-        let mut all_results: Vec<Vec<u32>> = Vec::new();
+        let mut all_results: Vec<Bound<'py, PyArray1<u32>>> = Vec::new();
         for (mmap, boundaries, _content) in &files {
             let bytes = mmap.as_bytes();
             let chunk_results: Vec<Vec<Vec<u32>>> = boundaries
@@ -319,24 +333,39 @@ impl SentencePieceTokenizer {
                 })
                 .collect();
             for chunk in chunk_results {
-                all_results.extend(chunk);
+                all_results.extend(chunk.into_iter().map(|v| v.into_pyarray(py)));
             }
         }
         Ok(all_results)
     }
 
-    fn encode_no_normalize(&self, input: &str) -> PyResult<Vec<u32>> {
+    fn encode_no_normalize<'py>(
+        &self,
+        py: Python<'py>,
+        input: &str,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
         Ok(self
             .tokenizer
             .encoder()
             .encode_normalized(input)
             .into_iter()
             .map(|t| t.into())
-            .collect())
+            .collect::<Vec<u32>>()
+            .into_pyarray(py))
     }
 
-    fn decode(&self, tokens: Vec<u32>) -> PyResult<Vec<u8>> {
-        let token_ids: Vec<crate::token::TokenId> = tokens.into_iter().map(Into::into).collect();
+    fn decode(&self, tokens: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        let token_ids: Vec<crate::token::TokenId> =
+            if let Ok(arr) = tokens.cast::<PyArray1<u32>>() {
+                let arr = arr.readonly();
+                arr.as_slice()?.iter().map(|&t| t.into()).collect()
+            } else {
+                tokens
+                    .extract::<Vec<u32>>()?
+                    .into_iter()
+                    .map(Into::into)
+                    .collect()
+            };
         Ok(self.tokenizer.decode(&token_ids))
     }
 

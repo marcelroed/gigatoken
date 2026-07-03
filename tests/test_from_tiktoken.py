@@ -36,7 +36,7 @@ def r50k() -> tuple[tiktoken.Encoding, BPETokenizer]:
 
 def _assert_same(tt_enc, bpe_tok, text: str):
     expected = tt_enc.encode(text)
-    actual = bpe_tok.encode(text.encode("utf-8"))
+    actual = bpe_tok.encode(text.encode("utf-8")).tolist()
     assert actual == expected, f"Mismatch for {text!r}:\n  tiktoken: {expected}\n  jeton:    {actual}"
 
 

@@ -48,7 +48,7 @@ def test_encode_dclm_10k_docs(tinyllama_tokenizer_path):
 
     mismatches = 0
     for i, doc in enumerate(docs):
-        jeton_ids = list(jeton_tok.encode(doc))
+        jeton_ids = jeton_tok.encode(doc).tolist()
         hf_ids = hf_tok.encode(doc).ids[1:]  # strip BOS
         if jeton_ids != hf_ids:
             for j in range(min(len(jeton_ids), len(hf_ids))):

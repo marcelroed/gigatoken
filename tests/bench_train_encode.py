@@ -219,7 +219,7 @@ def bench_encoding(text_size_kb: int = 100, n_runs: int = 5):
     sample = lines[:10]
     mismatches = 0
     for text in sample:
-        jeton_ids = list(jeton_tok.encode(text))
+        jeton_ids = jeton_tok.encode(text).tolist()
         hf_ids = hf_tok.encode(text, add_special_tokens=False).ids
         if jeton_ids != hf_ids:
             mismatches += 1
