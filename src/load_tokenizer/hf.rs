@@ -24,6 +24,16 @@ struct TokenizerJson {
     added_tokens: Vec<AddedToken>,
     #[serde(default)]
     pre_tokenizer: Option<PreTokenizerJson>,
+    #[serde(default)]
+    normalizer: Option<NormalizerJson>,
+}
+
+#[derive(Deserialize)]
+struct NormalizerJson {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    normalizers: Vec<NormalizerJson>,
 }
 
 #[derive(Deserialize)]
@@ -193,42 +203,71 @@ pub fn load_hf_sentencepiece(path: impl AsRef<Path>) -> Result<SentencePieceBPE>
 }
 
 // ---------------------------------------------------------------------------
+// Normalizer detection
+// ---------------------------------------------------------------------------
+
+/// Determine whether the tokenizer's normalizer is NFC (the only kind we
+/// support for ByteLevel BPE). Returns `true` for NFC, `false` for no
+/// normalizer, and an error for anything else — silently skipping an unknown
+/// normalizer would produce token IDs that diverge from HF.
+fn detect_nfc_normalizer(normalizer: &Option<NormalizerJson>) -> Result<bool> {
+    fn is_nfc(n: &NormalizerJson) -> Result<bool> {
+        match n.kind.as_str() {
+            "NFC" => Ok(true),
+            "Sequence" => {
+                let each: Vec<bool> = n.normalizers.iter().map(is_nfc).collect::<Result<_>>()?;
+                Ok(each.into_iter().any(|b| b))
+            }
+            other => Err(eyre::eyre!("Unsupported normalizer type: {other}")),
+        }
+    }
+    normalizer.as_ref().map_or(Ok(false), is_nfc)
+}
+
+// ---------------------------------------------------------------------------
 // Pre-tokenizer detection
 // ---------------------------------------------------------------------------
 
 /// Determine the pretokenization scheme from a tokenizer.json `pre_tokenizer`.
 ///
 /// Handles a bare `ByteLevel` (GPT-2 style, `use_regex: true`) and
-/// `Sequence`s containing a `Split` with a known regex pattern.
+/// `Sequence`s whose `Split` regexes (in order) form a known scheme —
+/// either a single known regex or DeepSeek's digits/CJK/main triple.
 fn detect_pretokenizer_type(
     pre_tokenizer: &Option<PreTokenizerJson>,
 ) -> Result<crate::pretokenize::PretokenizerType> {
     use crate::pretokenize::PretokenizerType;
 
-    fn find_split_regex(pt: &PreTokenizerJson) -> Option<&str> {
+    fn collect_split_regexes<'a>(pt: &'a PreTokenizerJson, out: &mut Vec<&'a str>) {
         if pt.kind == "Split"
             && let Some(PatternJson { regex: Some(re) }) = &pt.pattern
         {
-            return Some(re);
+            out.push(re);
         }
-        pt.pretokenizers.iter().find_map(find_split_regex)
+        for child in &pt.pretokenizers {
+            collect_split_regexes(child, out);
+        }
     }
 
     let Some(pt) = pre_tokenizer else {
         // No pre_tokenizer at all; keep the historical default.
         return Ok(PretokenizerType::GPT2);
     };
-    match find_split_regex(pt) {
-        Some(regex) => PretokenizerType::from_split_regex(regex).ok_or_else(|| {
-            eyre::eyre!("Unknown pre_tokenizer Split regex, no fast pretokenizer for: {regex}")
-        }),
+    let mut regexes = Vec::new();
+    collect_split_regexes(pt, &mut regexes);
+    if regexes.is_empty() {
         // ByteLevel with use_regex (the default) splits with the GPT-2 regex.
-        None if pt.kind == "ByteLevel" => Ok(PretokenizerType::GPT2),
-        None => Err(eyre::eyre!(
+        if pt.kind == "ByteLevel" {
+            return Ok(PretokenizerType::GPT2);
+        }
+        return Err(eyre::eyre!(
             "Unsupported pre_tokenizer type: {} (no Split regex found)",
             pt.kind
-        )),
+        ));
     }
+    PretokenizerType::from_split_regexes(&regexes).ok_or_else(|| {
+        eyre::eyre!("Unknown pre_tokenizer Split regexes, no fast pretokenizer for: {regexes:?}")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -255,8 +294,16 @@ fn build_byte_unicode_tables() -> ([char; 256], HashMap<char, u8>) {
 }
 
 /// Decode a GPT-2 ByteLevel unicode string back to raw bytes.
+///
+/// Byte-level vocab strings consist solely of table chars; a string with any
+/// other char is stored raw (e.g. DeepSeek V4 keeps its special tokens
+/// unencoded in `model.vocab`) and taken as literal UTF-8 content.
 fn unicode_to_bytes(s: &str, u2b: &HashMap<char, u8>) -> Vec<u8> {
-    s.chars().map(|c| u2b[&c]).collect()
+    if s.chars().all(|c| u2b.contains_key(&c)) {
+        s.chars().map(|c| u2b[&c]).collect()
+    } else {
+        s.as_bytes().to_vec()
+    }
 }
 
 /// Load a HuggingFace `tokenizer.json` that uses ByteLevel BPE without
@@ -293,6 +340,18 @@ pub fn load_hf_bpe(path: impl AsRef<Path>) -> Result<bpe::tiktoken::Tokenizer> {
         vocab_inv.insert(bytes, TokenId::from(id));
     }
 
+    // Added tokens may live outside model.vocab (e.g. Qwen2's <|endoftext|>);
+    // extend the vocab so their IDs decode to the literal content.
+    for t in &tj.added_tokens {
+        let id = t.id as usize;
+        if id >= vocab.len() {
+            vocab.resize(id + 1, Arc::from(Vec::new().as_slice()));
+        }
+        if vocab[id].is_empty() {
+            vocab[id] = t.content.as_bytes().into();
+        }
+    }
+
     // Build merges from the merge list. Each merge "a b" means:
     // look up token IDs for "a" and "b", the merged token is vocab[concat(a,b)].
     let mut merges: HashMap<(TokenId, TokenId), TokenId, FxBuildHasher> =
@@ -325,6 +384,7 @@ pub fn load_hf_bpe(path: impl AsRef<Path>) -> Result<bpe::tiktoken::Tokenizer> {
         byte_remapping,
     );
     tokenizer.set_pretokenizer_type(detect_pretokenizer_type(&tj.pre_tokenizer)?);
+    tokenizer.set_normalize_nfc(detect_nfc_normalizer(&tj.normalizer)?);
     // All added tokens (special and non-special) are matched atomically in the
     // raw input by HF's AddedVocabulary; mirror that.
     tokenizer.set_added_tokens(
@@ -354,20 +414,22 @@ mod tests {
 
     #[test]
     fn test_load_tinyllama_sentencepiece() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/scripts/tinyllama_tokenizer.json"
-        );
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/tinyllama_tokenizer.json");
+        if !std::path::Path::new(path).exists() {
+            eprintln!("Skipping: {path} not found");
+            return;
+        }
         let tokenizer = load_hf_sentencepiece(path).unwrap();
         eprintln!("{:?}", tokenizer);
     }
 
     #[test]
     fn test_encode_hello_sentencepiece() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/scripts/tinyllama_tokenizer.json"
-        );
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/tinyllama_tokenizer.json");
+        if !std::path::Path::new(path).exists() {
+            eprintln!("Skipping: {path} not found");
+            return;
+        }
         let tokenizer = load_hf_sentencepiece(path).unwrap();
         let ids = tokenizer.encode_raw("Hello world");
         eprintln!("Encoded: {:?}", ids);
@@ -377,10 +439,7 @@ mod tests {
 
     #[test]
     fn test_load_gpt2_from_hf() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/scripts/gpt2_tokenizer.json"
-        );
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/gpt2_tokenizer.json");
         if !std::path::Path::new(path).exists() {
             eprintln!("Skipping: {path} not found");
             return;

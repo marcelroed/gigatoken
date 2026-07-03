@@ -84,6 +84,42 @@ def gpt2_tokenizer_path() -> Path:
     )
 
 
+@pytest.fixture(scope="session")
+def qwen2_tokenizer_path() -> Path:
+    """Path to Qwen2 tokenizer.json, downloaded from HF if absent."""
+    return _download_hf_tokenizer(
+        "Qwen/Qwen2-1.5B-Instruct",
+        "qwen2_tokenizer.json",
+    )
+
+
+@pytest.fixture(scope="session")
+def deepseek_v3_tokenizer_path() -> Path:
+    """Path to DeepSeek V3 tokenizer.json, downloaded from HF if absent."""
+    return _download_hf_tokenizer(
+        "deepseek-ai/DeepSeek-V3",
+        "deepseek_v3_tokenizer.json",
+    )
+
+
+@pytest.fixture(scope="session")
+def deepseek_v4_tokenizer_path() -> Path:
+    """Path to DeepSeek V4 tokenizer.json, downloaded from HF if absent."""
+    return _download_hf_tokenizer(
+        "deepseek-ai/DeepSeek-V4-Flash",
+        "deepseek_v4_tokenizer.json",
+    )
+
+
+@pytest.fixture(scope="session")
+def olmo3_tokenizer_path() -> Path:
+    """Path to Olmo3 (dolma2) tokenizer.json, downloaded from HF if absent."""
+    return _download_hf_tokenizer(
+        "allenai/Olmo-3-1025-7B",
+        "olmo3_tokenizer.json",
+    )
+
+
 # ---------------------------------------------------------------------------
 # GPT-2 byte <-> unicode helpers (reused by test_bpe_train_compare, etc.)
 # ---------------------------------------------------------------------------

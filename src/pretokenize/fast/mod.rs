@@ -7,11 +7,13 @@
 //! classes line up.
 
 pub mod cl100k;
+pub mod deepseek_v3;
 pub mod olmo3;
 pub mod qwen2;
 pub mod r50k;
 
 pub use cl100k::FastCl100kPretokenizer;
+pub use deepseek_v3::FastDeepSeekV3Pretokenizer;
 pub use olmo3::FastOlmo3Pretokenizer;
 pub use qwen2::FastQwen2Pretokenizer;
 pub use r50k::FastR50kPretokenizer;

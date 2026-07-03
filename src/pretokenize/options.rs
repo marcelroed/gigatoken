@@ -1,6 +1,7 @@
 use crate::pretokenize::Pretoken;
 use crate::pretokenize::fast::{
-    FastCl100kPretokenizer, FastOlmo3Pretokenizer, FastQwen2Pretokenizer, FastR50kPretokenizer,
+    FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
+    FastQwen2Pretokenizer, FastR50kPretokenizer,
 };
 
 /// Which pretokenization scheme (regex) a tokenizer uses.
@@ -10,8 +11,17 @@ pub enum PretokenizerType {
     GPT4, // cl100k
     Qwen2,      // Slightly adapted from GPT4, also used by Qwen3
     Olmo3,      // dolma2: Qwen2 scheme with cl100k's \p{N}{1,3}; used by Olmo 2/3
-    DeepSeekV3, // o200k, also used by GPT-4o
+    DeepSeekV3, // Sequence of three Splits (digits, CJK, main); used by DeepSeek V3/V3.1/V4
 }
+
+/// The three Split regexes of the DeepSeek V3/V4 pre_tokenizer Sequence, as
+/// they appear in tokenizer.json (the third contains literal CR/LF chars,
+/// not `\r`/`\n` escapes).
+const DEEPSEEK_V3_SPLIT_REGEXES: [&str; 3] = [
+    r"\p{N}{1,3}",
+    "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+",
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+];
 
 impl PretokenizerType {
     /// Fast pretokenizer for this scheme.
@@ -34,8 +44,19 @@ impl PretokenizerType {
                 FastPretokenizerDispatch::Olmo3(FastOlmo3Pretokenizer::new(bytes))
             }
             PretokenizerType::DeepSeekV3 => {
-                unimplemented!("no fast pretokenizer for {self:?} yet")
+                FastPretokenizerDispatch::DeepSeekV3(FastDeepSeekV3Pretokenizer::new(bytes))
             }
+        }
+    }
+
+    /// Identify the scheme from the ordered list of `Split` regexes found in
+    /// a HuggingFace `tokenizer.json` pre_tokenizer. Returns `None` for
+    /// unknown patterns.
+    pub fn from_split_regexes(patterns: &[&str]) -> Option<Self> {
+        match patterns {
+            [p] => Self::from_split_regex(p),
+            _ if patterns == DEEPSEEK_V3_SPLIT_REGEXES => Some(PretokenizerType::DeepSeekV3),
+            _ => None,
         }
     }
 
@@ -68,6 +89,7 @@ pub enum FastPretokenizerDispatch<'a> {
     Cl100k(FastCl100kPretokenizer<'a>),
     Qwen2(FastQwen2Pretokenizer<'a>),
     Olmo3(FastOlmo3Pretokenizer<'a>),
+    DeepSeekV3(FastDeepSeekV3Pretokenizer<'a>),
 }
 
 impl<'a> Iterator for FastPretokenizerDispatch<'a> {
@@ -80,6 +102,7 @@ impl<'a> Iterator for FastPretokenizerDispatch<'a> {
             FastPretokenizerDispatch::Cl100k(it) => it.next(),
             FastPretokenizerDispatch::Qwen2(it) => it.next(),
             FastPretokenizerDispatch::Olmo3(it) => it.next(),
+            FastPretokenizerDispatch::DeepSeekV3(it) => it.next(),
         }
     }
 }

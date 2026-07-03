@@ -11,49 +11,37 @@ use std::collections::HashMap;
 // ---------------------------------------------------------------------------
 
 pub struct ByteRemapping {
-    mapping: Vec<u8>, // Maps string byte to symbol byte
-    unmap: Vec<u8>,   // Maps symbol byte to string byte
+    /// Maps each byte value to the token ID of its single-byte vocab entry.
+    /// The IDs need not be < 256 (e.g. DeepSeek puts its byte tokens at
+    /// 3..=258, after the special tokens).
+    mapping: Vec<TokenId>,
 }
 
 impl ByteRemapping {
+    /// Build the byte → token-ID table by scanning `vocab` for single-byte
+    /// entries (lowest ID wins). Returns `None` when the mapping is the
+    /// identity (token ID == byte value), and an error if some byte value
+    /// has no single-byte token.
     pub fn from_byte_vocab(vocab: &[impl AsRef<[u8]>]) -> Result<Option<Self>> {
-        let byte_remapping = vocab[..256]
-            .iter()
-            .map(|b| {
-                let b = b.as_ref();
-                if b.len() != 1 {
-                    anyhow!(
-                        "Byte remapping failed because vocab entry for byte is not length 1: {:?}",
-                        b
-                    );
-                }
-                Ok(b[0])
-            })
-            .collect::<Result<Vec<u8>>>()?;
-
-        // Only use the byte remapping if it's not the identity mapping
-        let byte_remapping = byte_remapping
+        const UNSET: u32 = u32::MAX;
+        let mut mapping = vec![TokenId::from(UNSET); 256];
+        for (id, entry) in vocab.iter().enumerate() {
+            if let &[b] = entry.as_ref()
+                && mapping[b as usize].0 == UNSET
+            {
+                mapping[b as usize] = TokenId::from(id as u32);
+            }
+        }
+        if let Some(missing) = mapping.iter().position(|t| t.0 == UNSET) {
+            return Err(anyhow!(
+                "Byte remapping failed: no single-byte vocab entry for byte {missing:#04x}"
+            ));
+        }
+        Ok(mapping
             .iter()
             .enumerate()
-            .any(|(i, &b)| i != b as usize)
-            .then_some(byte_remapping)
-            .map(|mapping| {
-                let mut unmap = vec![0_u8; 256];
-                for (i, &b) in mapping.iter().enumerate() {
-                    unmap[b as usize] = i as u8;
-                }
-                ByteRemapping {
-                    unmap: mapping,
-                    mapping: unmap,
-                }
-            });
-        Ok(byte_remapping)
-    }
-    pub fn remap_bytes(&self, bytes: &[u8]) -> Vec<u8> {
-        bytes.iter().map(|&b| self.mapping[b as usize]).collect()
-    }
-    pub fn unmap_bytes(&self, bytes: &[u8]) -> Vec<u8> {
-        bytes.iter().map(|&b| self.unmap[b as usize]).collect()
+            .any(|(b, t)| t.0 != b as u32)
+            .then_some(ByteRemapping { mapping }))
     }
 }
 

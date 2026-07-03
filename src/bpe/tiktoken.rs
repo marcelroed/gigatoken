@@ -46,6 +46,31 @@ pub struct Tokenizer {
     added_tokens: Vec<(Arc<[u8]>, TokenId)>,
     /// Distinct first bytes of `added_tokens`, for the candidate scan.
     added_first_bytes: Vec<u8>,
+    /// Apply NFC normalization to non-added-token segments before
+    /// pretokenization, like HuggingFace's `NFC` normalizer (e.g. Qwen2).
+    normalize_nfc: bool,
+}
+
+/// NFC-normalize a segment if needed, using `buf` as scratch on the slow path.
+///
+/// ASCII and already-normalized segments are returned as-is. Invalid UTF-8 is
+/// passed through unchanged (HF only ever sees `str`, so there is no parity
+/// behavior to match).
+fn nfc_segment<'a>(seg: &'a [u8], buf: &'a mut String) -> &'a [u8] {
+    if seg.is_ascii() {
+        return seg;
+    }
+    let Ok(s) = std::str::from_utf8(seg) else {
+        return seg;
+    };
+    let nfc = icu::normalizer::ComposingNormalizer::new_nfc();
+    if nfc.is_normalized(s) {
+        return seg;
+    }
+    buf.clear();
+    nfc.normalize_to(s, buf)
+        .expect("writing to a String cannot fail");
+    buf.as_bytes()
 }
 
 /// Pack a pretoken of ≤ 15 bytes into a `u128`: bytes in the low 15 lanes,
@@ -140,6 +165,7 @@ impl Tokenizer {
             pretokenizer_type: PretokenizerType::GPT2,
             added_tokens: Vec::new(),
             added_first_bytes: Vec::new(),
+            normalize_nfc: false,
         }
     }
 
@@ -186,6 +212,7 @@ impl Tokenizer {
             pretokenizer_type: PretokenizerType::GPT2,
             added_tokens: Vec::new(),
             added_first_bytes: Vec::new(),
+            normalize_nfc: false,
         })
     }
 
@@ -198,7 +225,6 @@ impl Tokenizer {
             vocab_inv: self.vocab_inv.clone(),
             byte_remapping: self.byte_remapping.as_ref().map(|br| ByteRemapping {
                 mapping: br.mapping.clone(),
-                unmap: br.unmap.clone(),
             }),
             token_arena: Vec::new(),
             pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
@@ -208,6 +234,7 @@ impl Tokenizer {
             pretokenizer_type: self.pretokenizer_type,
             added_tokens: self.added_tokens.clone(),
             added_first_bytes: self.added_first_bytes.clone(),
+            normalize_nfc: self.normalize_nfc,
         }
     }
 
@@ -217,6 +244,12 @@ impl Tokenizer {
 
     pub fn pretokenizer_type(&self) -> PretokenizerType {
         self.pretokenizer_type
+    }
+
+    /// Enable NFC normalization of non-added-token segments before
+    /// pretokenization (HF `normalizer: {"type": "NFC"}`).
+    pub fn set_normalize_nfc(&mut self, normalize_nfc: bool) {
+        self.normalize_nfc = normalize_nfc;
     }
 
     /// Set the added tokens matched atomically by
@@ -271,18 +304,26 @@ impl Tokenizer {
     /// This mirrors the full HuggingFace `tokenizers` encode pipeline.
     pub fn encode_with_added_tokens(&mut self, bytes: &[u8], mut f: impl FnMut(&[TokenId])) {
         let pretokenizer_type = self.pretokenizer_type;
+        let normalize_nfc = self.normalize_nfc;
+        let mut nfc_buf = String::new();
         let mut pos = 0;
         while pos < bytes.len() {
-            match self.find_added_token(bytes, pos) {
-                Some((start, end, id)) => {
-                    self.memoized_encode(pretokenizer_type.pretokenize(&bytes[pos..start]), &mut f);
+            let (seg_end, added) = match self.find_added_token(bytes, pos) {
+                Some((start, end, id)) => (start, Some((end, id))),
+                None => (bytes.len(), None),
+            };
+            let segment = if normalize_nfc {
+                nfc_segment(&bytes[pos..seg_end], &mut nfc_buf)
+            } else {
+                &bytes[pos..seg_end]
+            };
+            self.memoized_encode(pretokenizer_type.pretokenize(segment), &mut f);
+            match added {
+                Some((end, id)) => {
                     f(&[id]);
                     pos = end;
                 }
-                None => {
-                    self.memoized_encode(pretokenizer_type.pretokenize(&bytes[pos..]), &mut f);
-                    break;
-                }
+                None => break,
             }
         }
     }
@@ -292,15 +333,15 @@ impl Tokenizer {
         merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
         pretoken: Pretoken,
     ) -> Vec<TokenId> {
-        let pretoken: Cow<[u8]> = if let Some(byte_remapping) = byte_remapping {
-            pretoken
+        let mut symbols: Vec<TokenId> = match byte_remapping {
+            Some(br) => pretoken.iter().map(|&b| br.mapping[b as usize]).collect(),
+            None => pretoken
                 .iter()
-                .map(|&b| byte_remapping.mapping[b as usize])
-                .collect::<Cow<[u8]>>()
-        } else {
-            Cow::Borrowed(pretoken.0)
+                .map(|&b| TokenId::from(b as u32))
+                .collect(),
         };
-        simple_bpe_merge(merges, &pretoken)
+        crate::bpe::bpe_merge_symbols(merges, &mut symbols);
+        symbols
     }
 
     /// For each pretoken in the input iterator, looks up the string in the
@@ -331,11 +372,7 @@ impl Tokenizer {
                 let symbols = &mut self.symbol_scratch;
                 symbols.clear();
                 match self.byte_remapping.as_ref() {
-                    Some(br) => symbols.extend(
-                        bytes
-                            .iter()
-                            .map(|&b| TokenId::from(br.mapping[b as usize] as u32)),
-                    ),
+                    Some(br) => symbols.extend(bytes.iter().map(|&b| br.mapping[b as usize])),
                     None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
                 }
                 bpe_merge_symbols_with_scratch(&self.merges, symbols, &mut self.merge_scratch);
