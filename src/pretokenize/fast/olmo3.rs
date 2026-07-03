@@ -1,28 +1,24 @@
-//! Fast scalar pretokenizer for the cl100k_base (GPT-3.5/GPT-4) regex:
-//! `'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s+`
+//! Fast scalar pretokenizer for the Olmo 2/3 (dolma2) regex:
+//! `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
 //!
-//! Differences from the r50k scheme:
-//! - contractions are case-insensitive (`'S`, `'Ll`, ...)
-//! - a letter run absorbs ONE preceding char of any kind except `\r`, `\n`,
-//!   letters, and numbers (not just a space: `!word`, `\tword`, `\u{A0}word`)
-//! - number runs are at most 3 chars and never absorb a leading space
-//! - a punctuation run absorbs trailing `\r`/`\n` chars (`"!!\n\n"`)
-//! - a whitespace run containing a newline splits right after its LAST
-//!   newline (`\s*[\r\n]`); trailing whitespace at EOS stays one token
+//! This is the Qwen2 scheme with cl100k's number rule: `\p{N}{1,3}` matches
+//! runs of up to THREE number chars (Qwen2 matches exactly one). Everything
+//! else — contractions, letter-run prefixes, the `\s*[\r\n]+` newline rule
+//! outranking end-of-input whitespace — is identical to Qwen2.
 
 use super::{
     decode_cp, is_ascii_ws, is_digit, is_letter, scan_letters_from, scan_numbers_max3,
     scan_other_from,
 };
-use crate::pretokenize::unicode::{self, CharClass};
 use crate::pretokenize::Pretoken;
+use crate::pretokenize::unicode::{self, CharClass};
 
-pub struct FastCl100kPretokenizer<'a> {
+pub struct FastOlmo3Pretokenizer<'a> {
     bytes: &'a [u8],
     pos: usize,
 }
 
-impl<'a> FastCl100kPretokenizer<'a> {
+impl<'a> FastOlmo3Pretokenizer<'a> {
     #[inline]
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
@@ -41,7 +37,7 @@ impl<'a> FastCl100kPretokenizer<'a> {
     }
 }
 
-impl<'a> Iterator for FastCl100kPretokenizer<'a> {
+impl<'a> Iterator for FastOlmo3Pretokenizer<'a> {
     type Item = Pretoken<'a>;
 
     #[inline]
@@ -71,7 +67,7 @@ fn letter_end_at(bytes: &[u8], pos: usize) -> Option<usize> {
     None
 }
 
-/// `[\r\n]*+`: trailing newlines after a punctuation run.
+/// `[\r\n]*`: trailing newlines after a punctuation run.
 #[inline(always)]
 fn scan_newlines(bytes: &[u8], mut pos: usize) -> usize {
     while pos < bytes.len() {
@@ -86,9 +82,9 @@ fn scan_newlines(bytes: &[u8], mut pos: usize) -> usize {
 }
 
 /// Whitespace-led token starting at `start`, i.e. the alternatives
-/// `\s++$` | `\s*[\r\n]` | `\s+(?!\S)` | `\s+`, in that priority.
-/// Precondition: the letter-prefix (`[^\r\n\p{L}\p{N}]?+\p{L}++`) and
-/// space+punct (` ?[^\s\p{L}\p{N}]++...`) alternatives were ruled out.
+/// `\s*[\r\n]+` | `\s+(?!\S)` | `\s+`, in that priority.
+/// Precondition: the letter-prefix (`[^\r\n\p{L}\p{N}]?\p{L}+`) and
+/// space+punct (` ?[^\s\p{L}\p{N}]+...`) alternatives were ruled out.
 #[inline(always)]
 fn ws_token_end(bytes: &[u8], start: usize) -> usize {
     let len = bytes.len();
@@ -116,11 +112,11 @@ fn ws_token_end(bytes: &[u8], start: usize) -> usize {
             break;
         }
     }
-    if p >= len {
-        return p; // `\s++$`: trailing whitespace is one token
-    }
     if last_nl_end != 0 {
-        return last_nl_end; // `\s*[\r\n]`: through the last newline
+        return last_nl_end; // `\s*[\r\n]+`: through the last newline, even at EOS
+    }
+    if p >= len {
+        return p; // `\s+(?!\S)`: lookahead succeeds at EOS
     }
     if last_char_start > start {
         return last_char_start; // `\s+(?!\S)`: all but the last ws char
@@ -134,7 +130,7 @@ fn ws_token_end(bytes: &[u8], start: usize) -> usize {
 fn advance_pos(bytes: &[u8], pos: usize) -> usize {
     let b0 = unsafe { *bytes.get_unchecked(pos) };
 
-    // Hot path 1: ASCII letter — `\p{L}++` with empty prefix
+    // Hot path 1: ASCII letter — `\p{L}+` with empty prefix
     if is_letter(b0) {
         return scan_letters_from(bytes, pos + 1);
     }
@@ -142,7 +138,7 @@ fn advance_pos(bytes: &[u8], pos: usize) -> usize {
     // Hot path 2: space prefix
     if b0 == b' ' {
         let Some(&b1) = bytes.get(pos + 1) else {
-            return pos + 1; // trailing lone space (`\s++$`)
+            return pos + 1; // trailing lone space (`\s+(?!\S)` at EOS)
         };
         if is_letter(b1) {
             return scan_letters_from(bytes, pos + 2); // " word"
@@ -154,7 +150,7 @@ fn advance_pos(bytes: &[u8], pos: usize) -> usize {
             if is_ascii_ws(b1) {
                 return ws_token_end(bytes, pos);
             }
-            // ` ?[^\s\p{L}\p{N}]++[\r\n]*+`
+            // ` ?[^\s\p{L}\p{N}]+[\r\n]*`
             let p = scan_other_from(bytes, pos + 2);
             return scan_newlines(bytes, p);
         }
@@ -193,7 +189,7 @@ fn advance_pos(bytes: &[u8], pos: usize) -> usize {
         return scan_newlines(bytes, p);
     }
 
-    // ASCII digit
+    // ASCII digit: `\p{N}{1,3}`
     if is_digit(b0) {
         return scan_numbers_max3(bytes, pos + 1, 1);
     }
@@ -251,20 +247,20 @@ mod tests {
     use super::*;
     use std::io::Read;
 
-    /// Backtracking-compatible equivalent of the possessive cl100k pattern.
-    /// Each possessive quantifier is safe to relax because nothing after it
-    /// can match a char its class rejected, and `$` only matches at EOS.
-    const CL100K_REF_REGEX: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s+$|\s*[\r\n]|\s+(?!\S)|\s+";
+    /// The Olmo3/dolma2 pattern verbatim — no possessive quantifiers, so it
+    /// runs directly under fancy-regex.
+    const OLMO3_REF_REGEX: &str =
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
     fn regex_tokens(s: &str) -> Vec<String> {
-        let re = fancy_regex::Regex::new(CL100K_REF_REGEX).unwrap();
+        let re = fancy_regex::Regex::new(OLMO3_REF_REGEX).unwrap();
         re.find_iter(s)
             .map(|m| m.unwrap().as_str().to_string())
             .collect()
     }
 
     fn fast_tokens(s: &str) -> Vec<String> {
-        FastCl100kPretokenizer::new(s.as_bytes())
+        FastOlmo3Pretokenizer::new(s.as_bytes())
             .map(|t| String::from_utf8_lossy(t.0).into_owned())
             .collect()
     }
@@ -283,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn cl100k_small_cases() {
+    fn olmo3_small_cases() {
         let cases = [
             "hello",
             " hello",
@@ -312,10 +308,13 @@ mod tests {
             "123",
             "1234",
             "1234567",
+            "12345678901",
             " 123",
+            " 1234",
             "  123",
             "3rd",
             "abc1234def",
+            "3.14159",
             "hello, world!",
             "hi!\n\ndef",
             "hi !!\n\ndef",
@@ -334,7 +333,11 @@ mod tests {
             "  \n  hello",
             "\r\nhello",
             "a\r\n",
+            "a\r\n ",
+            "a\n \n",
+            "a \n \t",
             "\n\n",
+            "\n\n\t",
             "   ",
             " ",
             "",
@@ -343,13 +346,16 @@ mod tests {
             "\u{a0}word",
             "voilà ¡hola!",
             "١٢٣٤٥",
+            " ١٢٣٤٥",
             "e\u{301}f",
             "日本語のテキスト",
             " 日本語",
             "1٢3x",
+            "1٢34",
             "tab\tsep\tvals",
             "\x0bword",
             "a\u{2028}b",
+            "a\u{2028}\n",
             "price: $5.99!",
             "'ſ",
             "it'ſ fine",
@@ -364,17 +370,17 @@ mod tests {
     }
 
     #[test]
-    fn cl100k_matches_regex_owt() {
+    fn olmo3_matches_regex_owt() {
         const SIZE: usize = 5_000_000;
         let input = load_owt_prefix(SIZE);
         let text = std::str::from_utf8(&input).unwrap();
         eprintln!(
-            "Testing cl100k fast pretokenizer vs regex on {:.1} MB of OWT",
+            "Testing olmo3 fast pretokenizer vs regex on {:.1} MB of OWT",
             input.len() as f64 / 1e6
         );
 
-        let re = fancy_regex::Regex::new(CL100K_REF_REGEX).unwrap();
-        let mut fast_iter = FastCl100kPretokenizer::new(&input);
+        let re = fancy_regex::Regex::new(OLMO3_REF_REGEX).unwrap();
+        let mut fast_iter = FastOlmo3Pretokenizer::new(&input);
         let mut re_iter = re.find_iter(text);
         let mut token_idx: usize = 0;
         let mut recent: Vec<(String, String)> = Vec::new();
@@ -413,5 +419,78 @@ mod tests {
             token_idx += 1;
         }
         eprintln!("All {token_idx} tokens match.");
+    }
+
+    /// Full-OWT (~12 GB) comparison against the reference regex, parallelized
+    /// with rayon over ~32 MB chunks cut at newline boundaries. Splitting is
+    /// safe because both sides tokenize the identical chunk. Run with:
+    /// `cargo test --release olmo3_matches_regex_owt_full -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reads the full ~12 GB OWT file; run explicitly in release mode"]
+    fn olmo3_matches_regex_owt_full() {
+        use rayon::prelude::*;
+
+        let path = std::env::home_dir().unwrap().join("data/owt_train.txt");
+        let file = std::fs::File::open(&path).expect("Could not open ~/data/owt_train.txt");
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let bytes: &[u8] = &mmap;
+
+        const CHUNK: usize = 32 * 1024 * 1024;
+        let mut boundaries = vec![0usize];
+        while *boundaries.last().unwrap() < bytes.len() {
+            let target = (*boundaries.last().unwrap() + CHUNK).min(bytes.len());
+            let end = if target == bytes.len() {
+                target
+            } else {
+                // Cut at the next newline (ASCII, so always a UTF-8 boundary).
+                match memchr::memchr(b'\n', &bytes[target..]) {
+                    Some(off) => target + off + 1,
+                    None => bytes.len(),
+                }
+            };
+            boundaries.push(end);
+        }
+        eprintln!(
+            "Comparing olmo3 fast pretokenizer vs regex on {:.2} GB in {} chunks",
+            bytes.len() as f64 / 1e9,
+            boundaries.len() - 1
+        );
+
+        let total_tokens: usize = boundaries
+            .par_windows(2)
+            .map(|w| {
+                let chunk = &bytes[w[0]..w[1]];
+                let text = std::str::from_utf8(chunk).expect("chunk is not valid UTF-8");
+                let re = fancy_regex::Regex::new(OLMO3_REF_REGEX).unwrap();
+                let mut fast_iter = FastOlmo3Pretokenizer::new(chunk);
+                let mut re_iter = re.find_iter(text);
+                let mut count = 0usize;
+                loop {
+                    match (fast_iter.next(), re_iter.next()) {
+                        (Some(fast_tok), Some(re_match)) => {
+                            let re_match = re_match.expect("regex match error");
+                            let fast_str = String::from_utf8_lossy(fast_tok.0);
+                            let re_str = &text[re_match.start()..re_match.end()];
+                            assert_eq!(
+                                fast_str, re_str,
+                                "Mismatch in chunk at byte {} (chunk offset {})",
+                                w[0] + re_match.start(),
+                                re_match.start()
+                            );
+                        }
+                        (None, None) => break,
+                        (fast, re) => panic!(
+                            "Token count mismatch in chunk starting at byte {}: fast={:?} regex={:?}",
+                            w[0],
+                            fast.map(|t| String::from_utf8_lossy(t.0).into_owned()),
+                            re.map(|m| m.unwrap().as_str().to_string()),
+                        ),
+                    }
+                    count += 1;
+                }
+                count
+            })
+            .sum();
+        eprintln!("All {total_tokens} tokens match across the full file.");
     }
 }

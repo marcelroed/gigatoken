@@ -32,7 +32,9 @@ pub(crate) mod pretokenize_traits;
 mod unicode;
 pub mod pretoken_simd;
 
-pub use fast::{FastCl100kPretokenizer, FastQwen2Pretokenizer, FastR50kPretokenizer};
+pub use fast::{
+    FastCl100kPretokenizer, FastOlmo3Pretokenizer, FastQwen2Pretokenizer, FastR50kPretokenizer,
+};
 pub use options::{FastPretokenizerDispatch, PretokenizerType};
 pub use pretoken_state_machine::PretokenizerIter;
 
@@ -99,8 +101,7 @@ pub fn pretokenize_par_parquet(
     use indicatif::{ProgressBar, ProgressIterator};
     use polars::prelude::*;
     use std::cmp::min;
-    use std::sync::Arc;
-    let parquet_path = PlPath::Local(Arc::from(parquet_path.to_owned()));
+    let parquet_path = PlRefPath::try_from_path(parquet_path).unwrap();
 
     let df = LazyFrame::scan_parquet(parquet_path.clone(), ScanArgsParquet::default()).unwrap();
 
@@ -157,7 +158,7 @@ pub fn pretokenize_par_parquet(
                 }).for_each(|(s, f)| {
                     pretokenize_as_iter(s).for_each(|pretoken| {
                         thread_counts
-                            .entry(pretoken.to_owned())
+                            .entry(pretoken.0.to_owned())
                             .and_modify(|e| *e += f)
                             .or_insert(f);
                     })

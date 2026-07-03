@@ -12,7 +12,6 @@ pub(crate) mod unicode_tables;
 pub mod utils;
 use crate::bpe::Tokenizer;
 use crate::input::{MmappedFile, Resource};
-use crate::pretokenize::pretokenize_as_iter;
 pub mod load_tokenizer;
 use itertools::Itertools;
 use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
@@ -205,13 +204,52 @@ impl BPETokenizer {
         input: &[u8],
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
         let mut v = vec![];
-        self.tokenizer
-            .memoized_encode(pretokenize_as_iter(input), |tokens| {
-                for &e in tokens {
-                    v.push(e.into())
-                }
-            });
+        self.tokenizer.encode_with_added_tokens(input, |tokens| {
+            for &e in tokens {
+                v.push(e.into())
+            }
+        });
         Ok(v.into_pyarray(py))
+    }
+
+    /// Encode a batch of documents in parallel with rayon, releasing the GIL.
+    /// Uses the tokenizer's own pretokenization scheme and added tokens.
+    /// Documents are processed in coarse chunks so each fork (a full clone of
+    /// the merge/vocab maps, plus a cold pretoken cache) is amortized over
+    /// many documents instead of one per work-stealing split.
+    fn encode_batch<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Vec<Vec<u8>>,
+    ) -> PyResult<Vec<Bound<'py, PyArray1<u32>>>> {
+        use rayon::prelude::*;
+        let n_chunks = 4 * rayon::current_num_threads();
+        let chunk_size = inputs.len().div_ceil(n_chunks).max(1);
+        let results: Vec<Vec<Vec<u32>>> = py.detach(|| {
+            inputs
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let mut tokenizer = self.tokenizer.fork();
+                    chunk
+                        .iter()
+                        .map(|doc| {
+                            let mut v = vec![];
+                            tokenizer.encode_with_added_tokens(doc, |tokens| {
+                                for &e in tokens {
+                                    v.push(e.into())
+                                }
+                            });
+                            v
+                        })
+                        .collect()
+                })
+                .collect()
+        });
+        Ok(results
+            .into_iter()
+            .flatten()
+            .map(|v| v.into_pyarray(py))
+            .collect())
     }
 
     /// Encode all documents from a FileSource in parallel.
@@ -244,14 +282,11 @@ impl BPETokenizer {
                     JsonLinesSlice::new(chunk, spec.field())
                         .map(|doc| {
                             let mut v = vec![];
-                            tokenizer.memoized_encode(
-                                pretokenize_as_iter(doc.as_ref()),
-                                |tokens| {
-                                    for &e in tokens {
-                                        v.push(e.into())
-                                    }
-                                },
-                            );
+                            tokenizer.encode_with_added_tokens(doc.as_ref(), |tokens| {
+                                for &e in tokens {
+                                    v.push(e.into())
+                                }
+                            });
                             v
                         })
                         .collect()
@@ -262,6 +297,21 @@ impl BPETokenizer {
             }
         }
         Ok(all_results)
+    }
+
+    fn decode(&self, tokens: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        let token_ids: Vec<crate::token::TokenId> =
+            if let Ok(arr) = tokens.cast::<PyArray1<u32>>() {
+                let arr = arr.readonly();
+                arr.as_slice()?.iter().map(|&t| t.into()).collect()
+            } else {
+                tokens
+                    .extract::<Vec<u32>>()?
+                    .into_iter()
+                    .map(Into::into)
+                    .collect()
+            };
+        Ok(self.tokenizer.decode(&token_ids).collect())
     }
 
     fn __repr__(&self) -> PyResult<String> {

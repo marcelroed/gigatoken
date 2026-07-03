@@ -3,7 +3,7 @@ use bumpalo::collections::Vec as BumpVec;
 use itertools::Itertools;
 
 use crate::bpe::{ByteRemapping, MergeScratch, bpe_merge_symbols_with_scratch, simple_bpe_merge};
-use crate::pretokenize::Pretoken;
+use crate::pretokenize::{Pretoken, PretokenizerType};
 use crate::token::TokenId;
 use eyre::Result;
 use std::borrow::Cow;
@@ -37,6 +37,15 @@ pub struct Tokenizer {
     /// performs no per-pretoken allocations.
     merge_scratch: MergeScratch,
     symbol_scratch: Vec<TokenId>,
+    /// Pretokenization scheme used by [`Self::encode_with_added_tokens`].
+    pub(crate) pretokenizer_type: PretokenizerType,
+    /// Added tokens (special and non-special), matched atomically in the raw
+    /// input before pretokenization, like HuggingFace's AddedVocabulary.
+    /// Sorted by content length descending so the first match at a position
+    /// is the longest (leftmost-longest semantics).
+    added_tokens: Vec<(Arc<[u8]>, TokenId)>,
+    /// Distinct first bytes of `added_tokens`, for the candidate scan.
+    added_first_bytes: Vec<u8>,
 }
 
 /// Pack a pretoken of ≤ 15 bytes into a `u128`: bytes in the low 15 lanes,
@@ -128,6 +137,9 @@ impl Tokenizer {
             pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
+            pretokenizer_type: PretokenizerType::GPT2,
+            added_tokens: Vec::new(),
+            added_first_bytes: Vec::new(),
         }
     }
 
@@ -171,6 +183,9 @@ impl Tokenizer {
             pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
+            pretokenizer_type: PretokenizerType::GPT2,
+            added_tokens: Vec::new(),
+            added_first_bytes: Vec::new(),
         })
     }
 
@@ -190,6 +205,85 @@ impl Tokenizer {
             pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
+            pretokenizer_type: self.pretokenizer_type,
+            added_tokens: self.added_tokens.clone(),
+            added_first_bytes: self.added_first_bytes.clone(),
+        }
+    }
+
+    pub fn set_pretokenizer_type(&mut self, pretokenizer_type: PretokenizerType) {
+        self.pretokenizer_type = pretokenizer_type;
+    }
+
+    pub fn pretokenizer_type(&self) -> PretokenizerType {
+        self.pretokenizer_type
+    }
+
+    /// Set the added tokens matched atomically by
+    /// [`Self::encode_with_added_tokens`]. Empty contents are ignored.
+    pub fn set_added_tokens(&mut self, added_tokens: Vec<(Vec<u8>, TokenId)>) {
+        let mut added_tokens: Vec<(Arc<[u8]>, TokenId)> = added_tokens
+            .into_iter()
+            .filter(|(content, _)| !content.is_empty())
+            .map(|(content, id)| (content.into(), id))
+            .collect();
+        added_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let mut first_bytes: Vec<u8> = added_tokens.iter().map(|(c, _)| c[0]).collect();
+        first_bytes.sort_unstable();
+        first_bytes.dedup();
+        self.added_tokens = added_tokens;
+        self.added_first_bytes = first_bytes;
+    }
+
+    /// Find the leftmost added-token occurrence at or after `from`, taking
+    /// the longest token when several match at the same position. Returns
+    /// `(start, end, id)`.
+    fn find_added_token(&self, bytes: &[u8], from: usize) -> Option<(usize, usize, TokenId)> {
+        if self.added_tokens.is_empty() {
+            return None;
+        }
+        let hay = &bytes[from..];
+        let candidates: Box<dyn Iterator<Item = usize> + '_> =
+            match self.added_first_bytes.as_slice() {
+                &[a] => Box::new(memchr::memchr_iter(a, hay)),
+                &[a, b] => Box::new(memchr::memchr2_iter(a, b, hay)),
+                &[a, b, c] => Box::new(memchr::memchr3_iter(a, b, c, hay)),
+                firsts => Box::new(
+                    hay.iter()
+                        .enumerate()
+                        .filter(move |(_, b)| firsts.contains(b))
+                        .map(|(i, _)| i),
+                ),
+            };
+        for cand in candidates {
+            for (content, id) in &self.added_tokens {
+                if hay[cand..].starts_with(content) {
+                    return Some((from + cand, from + cand + content.len(), *id));
+                }
+            }
+        }
+        None
+    }
+
+    /// Encode raw text: split out added-token occurrences (emitted as their
+    /// single token ID), pretokenize the segments between them with this
+    /// tokenizer's pretokenization scheme, and BPE-encode each pretoken.
+    /// This mirrors the full HuggingFace `tokenizers` encode pipeline.
+    pub fn encode_with_added_tokens(&mut self, bytes: &[u8], mut f: impl FnMut(&[TokenId])) {
+        let pretokenizer_type = self.pretokenizer_type;
+        let mut pos = 0;
+        while pos < bytes.len() {
+            match self.find_added_token(bytes, pos) {
+                Some((start, end, id)) => {
+                    self.memoized_encode(pretokenizer_type.pretokenize(&bytes[pos..start]), &mut f);
+                    f(&[id]);
+                    pos = end;
+                }
+                None => {
+                    self.memoized_encode(pretokenizer_type.pretokenize(&bytes[pos..]), &mut f);
+                    break;
+                }
+            }
         }
     }
 

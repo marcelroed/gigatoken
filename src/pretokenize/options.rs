@@ -1,5 +1,7 @@
 use crate::pretokenize::Pretoken;
-use crate::pretokenize::fast::{FastCl100kPretokenizer, FastQwen2Pretokenizer, FastR50kPretokenizer};
+use crate::pretokenize::fast::{
+    FastCl100kPretokenizer, FastOlmo3Pretokenizer, FastQwen2Pretokenizer, FastR50kPretokenizer,
+};
 
 /// Which pretokenization scheme (regex) a tokenizer uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7,6 +9,7 @@ pub enum PretokenizerType {
     GPT2, // Also used by llama, also known as r50k
     GPT4, // cl100k
     Qwen2,      // Slightly adapted from GPT4, also used by Qwen3
+    Olmo3,      // dolma2: Qwen2 scheme with cl100k's \p{N}{1,3}; used by Olmo 2/3
     DeepSeekV3, // o200k, also used by GPT-4o
 }
 
@@ -27,9 +30,33 @@ impl PretokenizerType {
             PretokenizerType::Qwen2 => {
                 FastPretokenizerDispatch::Qwen2(FastQwen2Pretokenizer::new(bytes))
             }
+            PretokenizerType::Olmo3 => {
+                FastPretokenizerDispatch::Olmo3(FastOlmo3Pretokenizer::new(bytes))
+            }
             PretokenizerType::DeepSeekV3 => {
                 unimplemented!("no fast pretokenizer for {self:?} yet")
             }
+        }
+    }
+
+    /// Identify the scheme from the `Split` regex found in a HuggingFace
+    /// `tokenizer.json` pre_tokenizer. Returns `None` for unknown patterns.
+    pub fn from_split_regex(pattern: &str) -> Option<Self> {
+        match pattern {
+            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+" => {
+                Some(PretokenizerType::GPT2)
+            }
+            r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s+"
+            | r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+" => {
+                Some(PretokenizerType::GPT4)
+            }
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+" => {
+                Some(PretokenizerType::Qwen2)
+            }
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+" => {
+                Some(PretokenizerType::Olmo3)
+            }
+            _ => None,
         }
     }
 }
@@ -40,6 +67,7 @@ pub enum FastPretokenizerDispatch<'a> {
     R50k(FastR50kPretokenizer<'a>),
     Cl100k(FastCl100kPretokenizer<'a>),
     Qwen2(FastQwen2Pretokenizer<'a>),
+    Olmo3(FastOlmo3Pretokenizer<'a>),
 }
 
 impl<'a> Iterator for FastPretokenizerDispatch<'a> {
@@ -51,6 +79,7 @@ impl<'a> Iterator for FastPretokenizerDispatch<'a> {
             FastPretokenizerDispatch::R50k(it) => it.next(),
             FastPretokenizerDispatch::Cl100k(it) => it.next(),
             FastPretokenizerDispatch::Qwen2(it) => it.next(),
+            FastPretokenizerDispatch::Olmo3(it) => it.next(),
         }
     }
 }

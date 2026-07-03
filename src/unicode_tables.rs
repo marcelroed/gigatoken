@@ -100,14 +100,13 @@ impl From<char> for Codepoint {
 fn build_unicode_tables(
     values_by_codepoint: &[UnicodeClass],
 ) -> CodePointTrie<'static, UnicodeClass> {
-    use icu_codepointtrie_builder::{CodePointTrieBuilder, CodePointTrieBuilderData};
-    CodePointTrieBuilder {
-        data: CodePointTrieBuilderData::ValuesByCodePoint(values_by_codepoint),
-        default_value: UnicodeClass::Other,
-        error_value: UnicodeClass::Other,
-        trie_type: TrieType::Small,
+    use icu_codepointtrie_builder::CodePointTrieBuilder;
+    let mut builder =
+        CodePointTrieBuilder::new(UnicodeClass::Other, UnicodeClass::Other, TrieType::Small);
+    for (cp, value) in values_by_codepoint.iter().enumerate() {
+        builder.set_value(cp as u32, *value);
     }
-    .build()
+    builder.build()
 }
 
 fn build_charset(text: &str) -> Vec<char> {

@@ -7,10 +7,12 @@
 //! classes line up.
 
 pub mod cl100k;
+pub mod olmo3;
 pub mod qwen2;
 pub mod r50k;
 
 pub use cl100k::FastCl100kPretokenizer;
+pub use olmo3::FastOlmo3Pretokenizer;
 pub use qwen2::FastQwen2Pretokenizer;
 pub use r50k::FastR50kPretokenizer;
 
@@ -231,8 +233,33 @@ pub(crate) fn swar_scan_other(bytes: &[u8], mut pos: usize) -> usize {
 }
 
 // -----------------------------------------------------------------------
-// Shared run scans (`\p{L}+`, `\p{N}+`, `[^\s\p{L}\p{N}]+`)
+// Shared run scans (`\p{L}+`, `\p{N}+`, `\p{N}{1,3}`, `[^\s\p{L}\p{N}]+`)
 // -----------------------------------------------------------------------
+
+/// `\p{N}{1,3}`: extend a number run that already matched `consumed` chars
+/// to at most 3 chars total. Shared by the cl100k and olmo3 schemes.
+#[inline(always)]
+pub(crate) fn scan_numbers_max3(bytes: &[u8], mut pos: usize, mut consumed: u32) -> usize {
+    let len = bytes.len();
+    while consumed < 3 && pos < len {
+        let b = unsafe { *bytes.get_unchecked(pos) };
+        if is_digit(b) {
+            pos += 1;
+            consumed += 1;
+            continue;
+        }
+        if b >= 0x80 {
+            let (cp, l) = unsafe { decode_cp(bytes, pos) };
+            if unicode::class_of(cp) == unicode::CharClass::Number {
+                pos += l;
+                consumed += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    pos
+}
 
 #[inline(always)]
 pub(crate) fn scan_letters_from(bytes: &[u8], pos: usize) -> usize {

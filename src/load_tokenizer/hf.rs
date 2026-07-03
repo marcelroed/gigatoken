@@ -22,6 +22,24 @@ struct TokenizerJson {
     model: Model,
     #[serde(default)]
     added_tokens: Vec<AddedToken>,
+    #[serde(default)]
+    pre_tokenizer: Option<PreTokenizerJson>,
+}
+
+#[derive(Deserialize)]
+struct PreTokenizerJson {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    pretokenizers: Vec<PreTokenizerJson>,
+    #[serde(default)]
+    pattern: Option<PatternJson>,
+}
+
+#[derive(Deserialize)]
+struct PatternJson {
+    #[serde(rename = "Regex", default)]
+    regex: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +193,45 @@ pub fn load_hf_sentencepiece(path: impl AsRef<Path>) -> Result<SentencePieceBPE>
 }
 
 // ---------------------------------------------------------------------------
+// Pre-tokenizer detection
+// ---------------------------------------------------------------------------
+
+/// Determine the pretokenization scheme from a tokenizer.json `pre_tokenizer`.
+///
+/// Handles a bare `ByteLevel` (GPT-2 style, `use_regex: true`) and
+/// `Sequence`s containing a `Split` with a known regex pattern.
+fn detect_pretokenizer_type(
+    pre_tokenizer: &Option<PreTokenizerJson>,
+) -> Result<crate::pretokenize::PretokenizerType> {
+    use crate::pretokenize::PretokenizerType;
+
+    fn find_split_regex(pt: &PreTokenizerJson) -> Option<&str> {
+        if pt.kind == "Split"
+            && let Some(PatternJson { regex: Some(re) }) = &pt.pattern
+        {
+            return Some(re);
+        }
+        pt.pretokenizers.iter().find_map(find_split_regex)
+    }
+
+    let Some(pt) = pre_tokenizer else {
+        // No pre_tokenizer at all; keep the historical default.
+        return Ok(PretokenizerType::GPT2);
+    };
+    match find_split_regex(pt) {
+        Some(regex) => PretokenizerType::from_split_regex(regex).ok_or_else(|| {
+            eyre::eyre!("Unknown pre_tokenizer Split regex, no fast pretokenizer for: {regex}")
+        }),
+        // ByteLevel with use_regex (the default) splits with the GPT-2 regex.
+        None if pt.kind == "ByteLevel" => Ok(PretokenizerType::GPT2),
+        None => Err(eyre::eyre!(
+            "Unsupported pre_tokenizer type: {} (no Split regex found)",
+            pt.kind
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GPT-2 / ByteLevel BPE loader
 // ---------------------------------------------------------------------------
 
@@ -262,7 +319,21 @@ pub fn load_hf_bpe(path: impl AsRef<Path>) -> Result<bpe::tiktoken::Tokenizer> {
 
     let byte_remapping = bpe::ByteRemapping::from_byte_vocab(&vocab)?;
 
-    Ok(bpe::tiktoken::Tokenizer::new(merges, vocab.into_iter().map(|a| a.to_vec()).collect(), byte_remapping))
+    let mut tokenizer = bpe::tiktoken::Tokenizer::new(
+        merges,
+        vocab.into_iter().map(|a| a.to_vec()).collect(),
+        byte_remapping,
+    );
+    tokenizer.set_pretokenizer_type(detect_pretokenizer_type(&tj.pre_tokenizer)?);
+    // All added tokens (special and non-special) are matched atomically in the
+    // raw input by HF's AddedVocabulary; mirror that.
+    tokenizer.set_added_tokens(
+        tj.added_tokens
+            .iter()
+            .map(|t| (t.content.as_bytes().to_vec(), TokenId::from(t.id)))
+            .collect(),
+    );
+    Ok(tokenizer)
 }
 
 #[cfg(test)]
