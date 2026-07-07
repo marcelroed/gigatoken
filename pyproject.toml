@@ -12,7 +12,13 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
-dependencies = ["awkward>=2.8.9", "numpy>=1.24.4"]
+dependencies = [
+    # Everything down to awkward 2.0.0 passes the test suite, but 2.6.3 is the
+    # first release compatible with NumPy 2.x, which the numpy floor permits.
+    "awkward>=2.6.3",
+    # rust-numpy supports numpy >= 1.16; 1.24.4 (verified) keeps headroom.
+    "numpy>=1.24.4",
+]
 
 [tool.maturin]
 

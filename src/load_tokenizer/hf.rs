@@ -54,13 +54,19 @@ struct PatternJson {
 
 #[derive(Deserialize)]
 struct Model {
-    #[serde(rename = "type")]
+    /// tokenizer.json files written before tokenizers 0.9 (e.g. the original
+    /// GPT-2 upload) omit `model.type`; those are always BPE.
+    #[serde(rename = "type", default = "legacy_bpe_type")]
     model_type: String,
     vocab: HashMap<String, u32>,
     #[serde(deserialize_with = "deserialize_merges")]
     merges: Vec<[String; 2]>,
     #[serde(default)]
     byte_fallback: bool,
+}
+
+fn legacy_bpe_type() -> String {
+    "BPE".to_string()
 }
 
 /// Merges appear as `["a", "b"]` arrays in current tokenizer.json files and
@@ -126,7 +132,10 @@ pub enum HfTokenizer {
 }
 
 fn parse_tokenizer_json(data: &[u8]) -> Result<TokenizerJson> {
-    sonic_rs::from_slice(data).context("Failed to parse tokenizer JSON")
+    // Inline the deserializer's own message (offending field, position,
+    // snippet): the first line is often all that surfaces in test summaries
+    // and short tracebacks.
+    sonic_rs::from_slice(data).map_err(|e| eyre::eyre!("Failed to parse tokenizer JSON: {e}"))
 }
 
 fn read_tokenizer_json(path: impl AsRef<Path>) -> Result<TokenizerJson> {
@@ -462,6 +471,27 @@ mod tests {
         assert_eq!(token_str_to_bytes("▁"), "▁".as_bytes().to_vec());
         assert_eq!(token_str_to_bytes("<unk>"), b"<unk>".to_vec());
         assert_eq!(token_str_to_bytes("<s>"), b"<s>".to_vec());
+    }
+
+    #[test]
+    fn test_parse_legacy_model_without_type() {
+        // Pre-tokenizers-0.9 files have no `model.type`; they must parse as BPE.
+        let json = br#"{"model": {"vocab": {"a": 0}, "merges": []}}"#;
+        let tj = parse_tokenizer_json(json).unwrap();
+        assert_eq!(tj.model.model_type, "BPE");
+    }
+
+    #[test]
+    fn test_parse_error_names_the_field() {
+        // The first line of the error must carry the deserializer's detail,
+        // not just a generic "failed to parse".
+        let json = br#"{"model": {"type": "BPE", "merges": []}}"#;
+        let err = match parse_tokenizer_json(json) {
+            Ok(_) => panic!("expected a parse error"),
+            Err(e) => e,
+        };
+        let first_line = err.to_string();
+        assert!(first_line.contains("vocab"), "unhelpful error: {first_line}");
     }
 
     #[test]
