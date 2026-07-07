@@ -1,67 +1,90 @@
-"""Verify SentencePieceTokenizer encoding matches HuggingFace on real DCLM data."""
+"""Verify gigatok encoding matches HuggingFace on curated DCLM data.
 
-import json
-from pathlib import Path
+The corpus (data/dclm_sample.jsonl.zst, ~20 MB) is DCLM-baseline documents
+selected for tokenizer-hostile content — CJK/RTL scripts, NFC-divergent text,
+emoji, control whitespace, code, unbroken 80+ char tokens, 128 KB+ documents —
+built by streaming the dataset from HuggingFace on first use (dclm_fixture.py).
+"""
 
+import re
+import unicodedata
+
+import awkward as ak
 import pytest
-import zstandard
-from tokenizers import Tokenizer
+from tokenizers import Tokenizer as HFTokenizer
 
-from gigatok.gigatok_rs import SentencePieceTokenizer
+import gigatok
+from gigatok import JsonlFileSource
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DCLM_PATH = DATA_DIR / "dclm-baseline" / "shard_00000000_processed.jsonl.zst"
-
-
-def load_dclm_docs(max_docs: int) -> list[str]:
-    dctx = zstandard.ZstdDecompressor()
-    docs = []
-    with open(DCLM_PATH, "rb") as fh:
-        reader = dctx.stream_reader(fh)
-        buf = b""
-        for chunk in iter(lambda: reader.read(1024 * 1024), b""):
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                if line.strip():
-                    obj = json.loads(line)
-                    t = obj.get("text")
-                    if t:
-                        docs.append(t)
-                if len(docs) >= max_docs:
-                    return docs
-    return docs
+TOKENIZER_FIXTURES = [
+    "tinyllama_tokenizer_path",  # SentencePiece backend
+    "olmo3_tokenizer_path",  # byte-level BPE backend
+    "deepseek_v3_tokenizer_path",  # byte-level BPE with NFC normalizer
+]
 
 
-skipif_no_dclm = pytest.mark.skipif(
-    not DCLM_PATH.exists(),
-    reason="DCLM data not available (place shard at data/dclm-baseline/)",
-)
+def test_dclm_sample_is_diverse(dclm_docs):
+    """The fixture holds ~20 MB and contains the edge cases it promises."""
+    total = sum(len(d.encode("utf-8")) for d in dclm_docs)
+    assert total >= 15_000_000
+    assert len(dclm_docs) > 1_000
+    assert any(not unicodedata.is_normalized("NFC", d) for d in dclm_docs)
+    assert any(re.search(r"[一-鿿]", d) for d in dclm_docs)  # CJK
+    assert any(re.search(r"[Ѐ-ӿ]", d) for d in dclm_docs)  # Cyrillic
+    assert any(re.search(r"[؀-ۿ]", d) for d in dclm_docs)  # Arabic
+    assert any(re.search(r"[\U0001f300-\U0001faff]", d) for d in dclm_docs)  # emoji
+    assert any("\t" in d or "\r" in d for d in dclm_docs)
+    assert any(re.search(r"\S{80,}", d) for d in dclm_docs)
+    assert any(len(d.encode("utf-8")) >= 131_072 for d in dclm_docs)
+    assert any(len(d.encode("utf-8")) < 200 for d in dclm_docs)
 
 
-@skipif_no_dclm
-def test_encode_dclm_10k_docs(tinyllama_tokenizer_path):
-    """Exact token ID comparison on 10K DCLM documents (diverse Unicode)."""
-    docs = load_dclm_docs(10_000)
-    hf_tok = Tokenizer.from_file(str(tinyllama_tokenizer_path))
-    gigatok_tok = SentencePieceTokenizer.from_hf(tinyllama_tokenizer_path)
+@pytest.mark.parametrize("tok_fixture", TOKENIZER_FIXTURES)
+def test_encode_dclm_matches_hf(tok_fixture, request, dclm_docs):
+    """Exact token-ID parity with HuggingFace over the full DCLM sample."""
+    path = request.getfixturevalue(tok_fixture)
+    hf_tok = HFTokenizer.from_file(str(path))
+    tok = gigatok.Tokenizer(path)
+
+    hf_ids = [e.ids for e in hf_tok.encode_batch(dclm_docs, add_special_tokens=False)]
+    got = ak.to_list(tok.encode_batch(dclm_docs))
 
     mismatches = 0
-    for i, doc in enumerate(docs):
-        gigatok_ids = gigatok_tok.encode(doc).tolist()
-        hf_ids = hf_tok.encode(doc).ids[1:]  # strip BOS
-        if gigatok_ids != hf_ids:
-            for j in range(min(len(gigatok_ids), len(hf_ids))):
-                if gigatok_ids[j] != hf_ids[j]:
-                    ctx = bytes(gigatok_tok.decode(gigatok_ids[max(0, j - 3) : j]))
-                    print(
-                        f"\n  Doc {i}: first diff at token {j}, "
-                        f"gigatok={gigatok_ids[j]}, hf={hf_ids[j]}, "
-                        f"context=...{ctx!r}"
-                    )
-                    break
-            else:
-                print(f"\n  Doc {i}: length differs gigatok={len(gigatok_ids)}, hf={len(hf_ids)}")
-            mismatches += 1
+    for i, (ours, theirs) in enumerate(zip(got, hf_ids)):
+        if ours == theirs:
+            continue
+        mismatches += 1
+        if mismatches > 5:
+            continue
+        for j in range(min(len(ours), len(theirs))):
+            if ours[j] != theirs[j]:
+                ctx = bytes(tok.decode(ours[max(0, j - 3) : j]))
+                print(f"\n  Doc {i}: first diff at token {j}, gigatok={ours[j]}, hf={theirs[j]}, context=...{ctx!r}")
+                break
+        else:
+            print(f"\n  Doc {i}: length differs gigatok={len(ours)}, hf={len(theirs)}")
 
-    assert mismatches == 0, f"{mismatches}/{len(docs)} documents differ"
+    assert mismatches == 0, f"{mismatches}/{len(dclm_docs)} documents differ"
+
+
+def test_encode_batch_matches_single_docs(olmo3_tokenizer_path, dclm_docs):
+    """Parallel batch encoding agrees with one-doc-at-a-time encoding."""
+    tok = gigatok.Tokenizer(olmo3_tokenizer_path)
+    batch = ak.to_list(tok.encode_batch(dclm_docs))
+    for doc, row in zip(dclm_docs, batch):
+        assert tok.encode(doc).tolist() == row
+
+
+def test_encode_files_dclm_fixture(olmo3_tokenizer_path, dclm_sample_path, dclm_docs):
+    """encode_files on the fixture .jsonl.zst matches encode_batch on its docs."""
+    tok = gigatok.Tokenizer(olmo3_tokenizer_path)
+    from_file = ak.to_list(tok.encode_files(JsonlFileSource([dclm_sample_path])))
+    assert len(from_file) == len(dclm_docs)
+    assert from_file == ak.to_list(tok.encode_batch(dclm_docs))
+
+
+def test_decode_roundtrip_dclm(olmo3_tokenizer_path, dclm_docs):
+    """Byte-level BPE without normalizer must roundtrip every document."""
+    tok = gigatok.Tokenizer(olmo3_tokenizer_path)
+    for doc in dclm_docs:
+        assert bytes(tok.decode(tok.encode(doc))) == doc.encode("utf-8")

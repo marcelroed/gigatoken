@@ -160,6 +160,23 @@ def gpt2_unicode_to_bytes(s: str) -> bytes:
 
 
 @pytest.fixture(scope="session")
+def dclm_sample_path() -> Path:
+    """Curated ~20 MB DCLM sample (data/dclm_sample.jsonl.zst), built by
+    streaming the dataset from HuggingFace on first use — see dclm_fixture.py."""
+    import dclm_fixture
+
+    return dclm_fixture.ensure_dclm_sample()
+
+
+@pytest.fixture(scope="session")
+def dclm_docs(dclm_sample_path) -> list[str]:
+    """The DCLM sample as a list of document texts."""
+    import dclm_fixture
+
+    return dclm_fixture.load_dclm_texts(dclm_sample_path)
+
+
+@pytest.fixture(scope="session")
 def r50k_tiktoken_path() -> Path:
     """Path to r50k_base.tiktoken, downloaded from OpenAI if absent."""
     return _download_url(
