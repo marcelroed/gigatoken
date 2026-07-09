@@ -6,6 +6,8 @@ profile-rustflags = true
 
 # Point PyO3 at the project venv so `cargo test`/`cargo build` link against the
 # venv's Python instead of whatever `python3` is on PATH (which may lack dev
-# libs, e.g. system Python without python3.x-dev).
+# libs, e.g. system Python without python3.x-dev). Only applies when
+# PYO3_PYTHON is not already set.
+
 [env]
-PYO3_PYTHON = { value = ".venv/bin/python", relative = true }
+PYO3_PYTHON = { value = ".venv/bin/python", relative = true}
