@@ -1,7 +1,7 @@
-//! Fast pretokenizer for the cl100k_base (GPT-3.5/GPT-4) regex — on
-//! aarch64 a mask scanner via the shared `family::family_batch_masks`
+//! Fast pretokenizer for the cl100k_base (GPT-3.5/GPT-4) regex — on aarch64
+//! (NEON) and x86_64 with AVX-512 (runtime-detected) a mask scanner via the shared `family::family_batch_masks`
 //! boundary algebra, with the scalar `advance_pos` below as reference,
-//! non-aarch64 fallback, and bad-zone/tail executor:
+//! no-SIMD fallback, and bad-zone/tail executor:
 //! `'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s+`
 //!
 //! Differences from the r50k scheme:
@@ -13,6 +13,7 @@
 //! - a whitespace run containing a newline splits right after its LAST
 //!   newline (`\s*[\r\n]`); trailing whitespace at EOS stays one token
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::family::family_batch_masks;
 use super::mask::{MaskScheme, MaskState};
 use super::{
@@ -30,14 +31,15 @@ impl MaskScheme for Cl100kScheme {
         advance_pos(bytes, pos)
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[inline(always)]
     fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
         family_batch_masks(bytes, scan, true, unicode::class_of)
     }
 }
 
-/// On aarch64, iteration runs the shared cl100k-family mask scanner (see
+/// With SIMD support (aarch64 NEON, or x86_64 AVX-512 detected at runtime),
+/// iteration runs the shared cl100k-family mask scanner (see
 /// `family::family_batch_masks`); elsewhere every token takes the scalar
 /// `advance_pos`.
 pub struct FastCl100kPretokenizer<'a> {

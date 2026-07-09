@@ -1,8 +1,9 @@
 //! Fast pretokenizer for the GPT-2 (r50k_base) regex:
 //! `'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`
 //!
-//! On aarch64 the iterator runs a simdjson-style mask scanner: 64-byte
-//! batches are classified with NEON into per-byte u64 class masks, the
+//! On aarch64 (NEON) and x86_64 with AVX-512 (runtime-detected) the
+//! iterator runs a simdjson-style mask scanner: 64-byte
+//! batches are classified with SIMD into per-byte u64 class masks, the
 //! token-boundary bits are derived with shifted-mask algebra in scalar
 //! registers (log step 17; the original vector-register algebra of step
 //! 15 measured the same and was retired for the simpler form), and the
@@ -19,7 +20,7 @@
 //! 15, 983 for the scalar scanner).
 //!
 //! The scalar path (`advance_pos`, SWAR letter runs + arithmetic
-//! predicates) remains the reference implementation, the non-aarch64
+//! predicates) remains the reference implementation, the no-SIMD
 //! fallback, and the executor for bad zones and buffer tails.
 //!
 //! `advance_pos` is a pure free function (`(bytes, pos) -> end`) rather than
@@ -113,66 +114,107 @@ fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
             return extended_masks(bytes, scan, lb, db, s64, wsa, hi64, ap64);
         }
 
-        let ob = !(lb | db | wsa); // hi == 0 on this path
+        ascii_batch_algebra(bytes, scan, lb, db, s64, wsa, ap64)
+    }
+}
 
-        // Bit-0 carries from the char before the batch. This batch is
-        // pure ASCII, so a multi-byte prev char always ends exactly at
-        // the boundary and the walk-back gives true carries — no bad
-        // zone.
-        let (pl, pd, ps, pws, po) = if scan == 0 {
-            (0, 0, 0, 0, 0)
-        } else {
-            carries_at(bytes, scan)
-        };
+/// AVX-512 counterpart of the NEON `batch_masks`: the classification is
+/// one 64-byte load and one k-register compare per class
+/// ([`mask::ascii_masks_avx512`]); the boundary algebra and the extended
+/// (non-ASCII) path are the same shared scalar code. Runtime-gated:
+/// [`MaskState`] routes here only after [`mask::simd_scanner_available`]
+/// reported AVX-512 support.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
+#[inline]
+fn batch_masks_avx512(bytes: &[u8], scan: usize) -> (u64, u64) {
+    let len = bytes.len();
+    if scan + 70 > len {
+        // Not enough lookahead for the batch-edge char classification
+        // (up to a 4-byte char starting at scan + 66); scalar batch.
+        return (0, u64::MAX);
+    }
+    let am = mask::ascii_masks_avx512(bytes, scan);
+    let wsa = am.s | am.wt | am.n;
+    if am.hi != 0 {
+        return extended_masks(bytes, scan, am.l, am.d, am.s, wsa, am.hi, am.ap);
+    }
+    ascii_batch_algebra(bytes, scan, am.l, am.d, am.s, wsa, am.ap)
+}
 
-        let cont_same =
-            (lb & ((lb << 1) | pl)) | (db & ((db << 1) | pd)) | (ob & ((ob << 1) | po));
-        let after_sp = (s64 << 1) | ps;
-        let nb = !wsa & !cont_same & !after_sp;
+/// Pure-ASCII boundary algebra shared by the NEON and AVX-512 batch
+/// classifiers (the batch has no non-ASCII byte; `wsa` = all ASCII
+/// whitespace). Everything here is platform-independent u64 bit math.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn ascii_batch_algebra(
+    bytes: &[u8],
+    scan: usize,
+    lb: u64,
+    db: u64,
+    s64: u64,
+    wsa: u64,
+    ap64: u64,
+) -> (u64, u64) {
+    let ob = !(lb | db | wsa); // hi == 0 on this path
 
-        // Ws-run split (`\s+(?!\S)`); bit 63 needs the real lookahead
-        // char. The ASCII case is branchless — "is byte 63 ws" is a
-        // ~20% coin flip on natural text, so testing it costs a
-        // mispredict every few batches. Only a non-ASCII lookahead
-        // byte (rare) branches, for the table-backed ws check.
-        let mut split_ok = wsa & (!wsa >> 1); // bit 63: shifted-in 0
-        let nb64 = bytes[scan + 64]; // in bounds: scan + 70 <= len
-        if nb64 < 0x80 {
-            split_ok |= (u64::from(!is_ascii_ws(nb64)) << 63) & wsa;
-        } else if wsa >> 63 != 0 && mask::nn_at_full(bytes, scan + 64) {
-            split_ok |= 1 << 63;
-        }
-        let pwsb = (wsa << 1) | pws;
-        let wsboundary = wsa & (!pwsb | split_ok);
-        let mut boundary = nb | wsboundary;
+    // Bit-0 carries from the char before the batch. This batch is
+    // pure ASCII, so a multi-byte prev char always ends exactly at
+    // the boundary and the walk-back gives true carries — no bad
+    // zone.
+    let (pl, pd, ps, pws, po) = if scan == 0 {
+        (0, 0, 0, 0, 0)
+    } else {
+        carries_at(bytes, scan)
+    };
 
-        let mut bad = 0u64;
+    let cont_same =
+        (lb & ((lb << 1) | pl)) | (db & ((db << 1) | pd)) | (ob & ((ob << 1) | po));
+    let after_sp = (s64 << 1) | ps;
+    let nb = !wsa & !cont_same & !after_sp;
 
-        // Contraction fixup (see extended_masks for the rules).
-        if ap64 != 0 {
-            let mut cand = ap64 & boundary;
-            while cand != 0 {
-                let i = cand.trailing_zeros() as usize;
-                cand &= cand - 1;
-                if i >= 61 {
-                    bad |= u64::MAX << i;
-                    break;
-                }
-                let k = match bytes[scan + i + 1] {
-                    b's' | b'd' | b'm' | b't' => 2,
-                    b'l' if bytes[scan + i + 2] == b'l' => 3,
-                    b'v' if bytes[scan + i + 2] == b'e' => 3,
-                    b'r' if bytes[scan + i + 2] == b'e' => 3,
-                    _ => 0,
-                };
-                if k != 0 {
-                    boundary &= !(1u64 << (i + 1));
-                    boundary |= 1u64 << (i + k);
-                }
+    // Ws-run split (`\s+(?!\S)`); bit 63 needs the real lookahead
+    // char. The ASCII case is branchless — "is byte 63 ws" is a
+    // ~20% coin flip on natural text, so testing it costs a
+    // mispredict every few batches. Only a non-ASCII lookahead
+    // byte (rare) branches, for the table-backed ws check.
+    let mut split_ok = wsa & (!wsa >> 1); // bit 63: shifted-in 0
+    let nb64 = bytes[scan + 64]; // in bounds: scan + 70 <= len
+    if nb64 < 0x80 {
+        split_ok |= (u64::from(!is_ascii_ws(nb64)) << 63) & wsa;
+    } else if wsa >> 63 != 0 && mask::nn_at_full(bytes, scan + 64) {
+        split_ok |= 1 << 63;
+    }
+    let pwsb = (wsa << 1) | pws;
+    let wsboundary = wsa & (!pwsb | split_ok);
+    let mut boundary = nb | wsboundary;
+
+    let mut bad = 0u64;
+
+    // Contraction fixup (see extended_masks for the rules).
+    if ap64 != 0 {
+        let mut cand = ap64 & boundary;
+        while cand != 0 {
+            let i = cand.trailing_zeros() as usize;
+            cand &= cand - 1;
+            if i >= 61 {
+                bad |= u64::MAX << i;
+                break;
+            }
+            let k = match bytes[scan + i + 1] {
+                b's' | b'd' | b'm' | b't' => 2,
+                b'l' if bytes[scan + i + 2] == b'l' => 3,
+                b'v' if bytes[scan + i + 2] == b'e' => 3,
+                b'r' if bytes[scan + i + 2] == b'e' => 3,
+                _ => 0,
+            };
+            if k != 0 {
+                boundary &= !(1u64 << (i + 1));
+                boundary |= 1u64 << (i + k);
             }
         }
-        (boundary & !bad, bad)
     }
+    (boundary & !bad, bad)
 }
 
 /// Slow(er) path for batches containing non-ASCII: every unicode char in
@@ -192,7 +234,7 @@ fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
 /// table hot in cache) plus edge-char resolution was worth ~13% end to
 /// end. `#[inline(never)]`: inlining this into the walker wrecks the
 /// clean path's register allocation (step 15).
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn extended_masks(
@@ -324,7 +366,7 @@ fn extended_masks(
 /// `ps` (the ` ?` absorb) is ASCII 0x20 only. The ASCII case (almost
 /// every call) is branchless — a class if-chain here is a per-batch
 /// mispredict on natural text.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
 fn carries_at(bytes: &[u8], scan: usize) -> (u64, u64, u64, u64, u64) {
     let b = bytes[scan - 1];
@@ -353,9 +395,19 @@ impl MaskScheme for R50kScheme {
     fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
         batch_masks(bytes, scan)
     }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
+        debug_assert!(mask::simd_scanner_available());
+        // SAFETY: MaskState enables the mask-scanner path only after
+        // runtime AVX-512 detection (mask::simd_scanner_available).
+        unsafe { batch_masks_avx512(bytes, scan) }
+    }
 }
 
-/// On aarch64, iteration runs on the mask scanner above via the shared
+/// With SIMD support (aarch64 NEON, or x86_64 AVX-512 detected at
+/// runtime), iteration runs on the mask scanner above via the shared
 /// [`MaskState`] batch walker; elsewhere every token takes `advance_pos`.
 pub struct FastR50kPretokenizer<'a> {
     bytes: &'a [u8],
@@ -598,20 +650,20 @@ mod tests {
     /// into test loops and measure ~1.4x slow, so the interleaved perf
     /// harness needs a locally instantiated iterator. Must produce exactly
     /// the shipped tokenization.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     struct MaskIter<'a> {
         bytes: &'a [u8],
         state: MaskState,
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     impl<'a> MaskIter<'a> {
         fn new(bytes: &'a [u8]) -> Self {
             Self { bytes, state: MaskState::new(0) }
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     impl<'a> Iterator for MaskIter<'a> {
         type Item = Pretoken<'a>;
         #[inline]
@@ -621,9 +673,39 @@ mod tests {
         }
     }
 
+    /// The batch classifier must actually engage on any machine with the
+    /// assumed feature sets (aarch64 NEON; x86_64 Zen-5-class AVX-512):
+    /// on plain ASCII text it must report real token starts and no bad
+    /// zones. Guards against a broken runtime detection or classifier
+    /// silently passing the differential tests via the scalar fallback.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn batch_classifier_engages_on_ascii() {
+        if !mask::simd_scanner_available() {
+            eprintln!("no SIMD scanner on this CPU; skipping");
+            return;
+        }
+        // Longer than scan + 70: the classifier needs byte-64+ lookahead.
+        let text = b"The quick brown fox jumps over the lazy dog while 42 geese watch on quietly";
+        let (usable, bad) = R50kScheme::batch_masks(text, 0);
+        assert_eq!(bad, 0, "plain ASCII must produce no bad zones");
+        let mut starts = vec![];
+        let mut p = 0;
+        while p < text.len() {
+            starts.push(p);
+            p = advance_pos(text, p);
+        }
+        for i in 0..64usize {
+            if usable >> i & 1 == 1 {
+                assert!(starts.contains(&i), "usable bit {i} is not a token start");
+            }
+        }
+        assert!(usable.count_ones() >= 10, "classifier found too few boundaries");
+    }
+
     /// Token-for-token differential check of `MaskIter` vs the shipped
     /// iterator on crafted edge cases.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn mask_iter_matches_shipped_edge_cases() {
         let cases: Vec<Vec<u8>> = vec![
@@ -669,7 +751,7 @@ mod tests {
 
     /// Differential fuzz: random mixes of letters, digits, ws, punctuation,
     /// apostrophes, and multi-byte UTF-8 at every length 0..~200.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn mask_iter_matches_shipped_fuzz() {
         let pieces: &[&str] = &[
@@ -704,7 +786,7 @@ mod tests {
     }
 
     /// Differential check on the FULL OWT file (~11.9 GB), token for token.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     #[ignore]
     fn mask_iter_matches_shipped_owt_full() {
@@ -733,7 +815,7 @@ mod tests {
     }
 
     /// Differential check on real OWT (100 MB), token for token.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     #[ignore]
     fn mask_iter_matches_shipped_owt() {
@@ -762,7 +844,7 @@ mod tests {
     /// iterator vs the mask scanner. Both variants are LOCAL copies: test
     /// builds skip fat LTO, so shipped symbols are not inlined here and
     /// measure ~1.4x slow (see project memory / step 14 of the log).
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     #[ignore]
     fn ab_r50k_mask_iter_interleaved() {
@@ -820,7 +902,7 @@ mod tests {
     /// Diagnostics for the mask scanner: fallback rate on real OWT, and
     /// mask-vs-scalar throughput on a sanitized buffer (apostrophes and
     /// non-ASCII replaced) that never triggers the fallback.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     #[ignore]
     fn mask_iter_diagnostics() {
@@ -831,7 +913,7 @@ mod tests {
         let (mut batches, mut dirty_batches, mut gap_bytes) = (0usize, 0usize, 0u64);
         let mut scan = 0usize;
         while scan + 64 <= input.len() {
-            let (usable, bad) = batch_masks(&input, scan);
+            let (usable, bad) = R50kScheme::batch_masks(&input, scan);
             batches += 1;
             if bad != 0 {
                 dirty_batches += 1;

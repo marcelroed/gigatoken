@@ -7,7 +7,7 @@
 //! pretokenizer_optimization_log.md step 15).
 //!
 //! A scheme plugs in two functions ([`MaskScheme`]):
-//! - `advance`: the scalar ground truth (also the non-aarch64 iterator),
+//! - `advance`: the scalar ground truth (also the no-SIMD iterator),
 //! - `batch_masks`: `(usable, bad)` bitmasks for a 64-byte batch. `usable`
 //!   bits are trustworthy token starts; `bad` marks zones (non-ASCII the
 //!   scheme doesn't classify in-mask, batch-edge ambiguities) that
@@ -15,8 +15,8 @@
 //!   across an unresolved zone.
 //!
 //! Layering, bottom to top:
-//! 1. Platform SIMD primitives (`movemask64`, `ascii_masks`) — the only
-//!    code to reimplement for AVX2/AVX-512.
+//! 1. Platform SIMD primitives (`movemask64`, `ascii_masks` on NEON;
+//!    `ascii_masks_avx512` on x86-64) — the only per-platform code.
 //! 2. Bit-domain helpers shared across schemes — platform-independent
 //!    u64 algebra and per-char table classification
 //!    (`classify_uni_chars`, `char_through`, `nn_at_full`,
@@ -30,9 +30,43 @@
 use crate::pretokenize::unicode::{self, CharClass};
 
 // -----------------------------------------------------------------------
-// Platform SIMD primitives (aarch64 NEON). An AVX2/AVX-512 port supplies
-// these same signatures behind cfg(target_arch = "x86_64").
+// Platform SIMD primitives: aarch64 NEON (compile-time, always present)
+// and x86_64 AVX-512 (runtime-detected; scalar fallback otherwise).
 // -----------------------------------------------------------------------
+
+/// Is the SIMD mask scanner usable on this machine? aarch64 always has
+/// NEON; x86_64 requires AVX-512 (Zen 4/5, Ice Lake+), detected at
+/// runtime — CPUs are assumed to have either the full Zen 5 feature set
+/// or none of it, so there is no AVX2-only tier. When this returns
+/// false, [`MaskState`] runs every token through the scheme's scalar
+/// `advance`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn simd_scanner_available() -> bool {
+    // std's feature cache makes this an atomic load + bit test after the
+    // first call.
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("bmi1")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("lzcnt")
+        && std::arch::is_x86_feature_detected!("popcnt")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn simd_scanner_available() -> bool {
+    cfg!(target_arch = "aarch64")
+}
+
+// The AVX-512 batch classifiers are all annotated
+// `#[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]`.
+// Besides the 512-bit byte ops (F/BW), the scalar-visible bit features
+// (BMI1/2, LZCNT, POPCNT) are enabled so the boundary algebra inlined
+// into those functions compiles to tzcnt/lzcnt/blsr instead of
+// baseline-x86 bsf sequences. The set must stay in sync with
+// [`simd_scanner_available`].
 
 /// simdjson-style movemask: 4 mask vectors (64 lanes of 0x00/0xFF) -> u64,
 /// bit i = lane i.
@@ -117,6 +151,45 @@ pub(crate) fn ascii_masks(bytes: &[u8], scan: usize) -> AsciiMasks {
             hi: movemask64(hi[0], hi[1], hi[2], hi[3]),
             ap: movemask64(ap[0], ap[1], ap[2], ap[3]),
         }
+    }
+}
+
+/// Classify `bytes[scan..scan+64]` with AVX-512 (requires
+/// `scan + 64 <= bytes.len()`). One 64-byte load and one k-register
+/// compare per predicate: a `__mmask64` IS the u64 the bit algebra wants,
+/// so there is no movemask ladder and no lazy any-tests — every field
+/// (including `hi` and `ap`) is computed unconditionally.
+///
+/// Runtime-gated: callers reach this only after
+/// [`simd_scanner_available`] reported AVX-512 support (enforced by
+/// [`MaskState`], which otherwise never leaves the scalar path).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
+#[inline]
+pub(crate) fn ascii_masks_avx512(bytes: &[u8], scan: usize) -> AsciiMasks {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm512_loadu_si512(bytes.as_ptr().add(scan) as *const _);
+        let lowered = _mm512_or_si512(v, _mm512_set1_epi8(0x20));
+        let l = _mm512_cmple_epu8_mask(
+            _mm512_sub_epi8(lowered, _mm512_set1_epi8(b'a' as i8)),
+            _mm512_set1_epi8(25),
+        );
+        let d = _mm512_cmple_epu8_mask(
+            _mm512_sub_epi8(v, _mm512_set1_epi8(b'0' as i8)),
+            _mm512_set1_epi8(9),
+        );
+        let s = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b' ' as i8));
+        let n = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\r' as i8))
+            | _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+        // \t (9), \x0b (11), \x0c (12): ascii ws minus \r\n and space.
+        let wt = _mm512_cmple_epu8_mask(
+            _mm512_sub_epi8(v, _mm512_set1_epi8(9)),
+            _mm512_set1_epi8(4),
+        ) & !n;
+        let hi = _mm512_movepi8_mask(v) as u64;
+        let ap = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\'' as i8));
+        AsciiMasks { l, d, s, wt, n, hi, ap }
     }
 }
 
@@ -316,15 +389,21 @@ pub(crate) trait MaskScheme {
     /// `(usable, bad)` for `bytes[scan..scan+64]` (`scan+64 <= len`):
     /// `usable` bit k = trustworthy token start at scan+k; `bad` bit k =
     /// byte scan+k needs the scalar path. `usable & bad` must be 0.
-    #[cfg(target_arch = "aarch64")]
+    ///
+    /// On x86_64 the implementations dispatch into AVX-512 code and must
+    /// only be called when [`simd_scanner_available`] is true —
+    /// [`MaskState`] guarantees this by never leaving the scalar path
+    /// otherwise.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64);
 }
 
 /// Scheme-agnostic mask-scanner state: pops trusted boundary bits, walks
 /// bad zones through the scheme's scalar `advance`, runs the buffer tail
 /// scalar, and precomputes one batch ahead so the SIMD chain retires under
-/// the previous batch's pops. On non-aarch64 targets `scalar_until` starts
-/// at `usize::MAX`, so every token takes the scalar path.
+/// the previous batch's pops. Without SIMD support (non-aarch64/x86_64
+/// targets, or an x86_64 CPU without AVX-512) `scalar_until` starts at
+/// `usize::MAX`, so every token takes the scalar path.
 pub(crate) struct MaskState {
     /// Start of the pending (not yet emitted) token.
     pub pos: usize,
@@ -350,7 +429,7 @@ pub(crate) struct MaskState {
 impl MaskState {
     #[inline]
     pub(crate) fn new(pos: usize) -> Self {
-        let scalar_until = if cfg!(target_arch = "aarch64") { pos } else { usize::MAX };
+        let scalar_until = if simd_scanner_available() { pos } else { usize::MAX };
         Self {
             pos,
             scan: pos,
@@ -368,7 +447,7 @@ impl MaskState {
     /// Load the segment of `batch_usable` bits in [from_bit, next bad run)
     /// into `rem` and aim `scalar_until` past that bad run at the next
     /// trusted boundary (or the batch end).
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[inline(always)]
     fn load_segment(&mut self, from_bit: u32) {
         let live = u64::MAX << from_bit;
@@ -415,7 +494,7 @@ impl MaskState {
                 self.pos = end;
                 return Some((start, end));
             }
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             {
                 // Continue with the current batch's next trusted segment
                 // after a scalar gap (each batch is computed exactly once).
@@ -479,7 +558,7 @@ impl MaskState {
                     self.load_segment(0);
                 }
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             {
                 // Unreachable: scalar_until is usize::MAX on this arch.
                 self.scalar_until = usize::MAX;

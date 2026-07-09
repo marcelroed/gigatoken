@@ -73,7 +73,7 @@ struct Carries {
 
 /// Pure-ASCII carries (hot, branchless). Requires `scan > 0` and
 /// `bytes[scan-1] < 0x80` (and `bytes[scan-2] < 0x80` when present).
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
 fn ascii_carries(bytes: &[u8], scan: usize) -> Carries {
     let b = bytes[scan - 1];
@@ -196,6 +196,56 @@ pub(crate) fn family_batch_masks(
     }
 }
 
+/// AVX-512 front-end for the family schemes: same contract as the NEON
+/// `family_batch_masks` above. The classification collapses to one
+/// 64-byte load and one k-register compare per class
+/// ([`mask::ascii_masks_avx512`]); the boundary algebra and the extended
+/// (non-ASCII) path are the shared scalar code.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn family_batch_masks(
+    bytes: &[u8],
+    scan: usize,
+    digits3: bool,
+    class: impl Fn(u32) -> CharClass + Copy,
+) -> (u64, u64) {
+    debug_assert!(mask::simd_scanner_available());
+    // SAFETY: MaskState enables the mask-scanner path only after runtime
+    // AVX-512 detection (mask::simd_scanner_available).
+    unsafe { family_batch_masks_avx512(bytes, scan, digits3, class) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
+#[inline]
+fn family_batch_masks_avx512(
+    bytes: &[u8],
+    scan: usize,
+    digits3: bool,
+    class: impl Fn(u32) -> CharClass + Copy,
+) -> (u64, u64) {
+    let len = bytes.len();
+    if scan + 70 > len {
+        // Not enough lookahead for the batch-edge char classification
+        // (up to a 4-byte char starting at scan + 66); scalar batch.
+        return (0, u64::MAX);
+    }
+    let am = mask::ascii_masks_avx512(bytes, scan);
+
+    // Any non-ASCII byte in the batch — or within the two carry bytes
+    // before it — routes to the extended classifier. (`am.hi` is exact
+    // and already computed, unlike NEON's lazily-movemasked variant.)
+    if am.hi != 0
+        || (scan >= 1 && bytes[scan - 1] >= 0x80)
+        || (scan >= 2 && bytes[scan - 2] >= 0x80)
+    {
+        return family_extended_masks(bytes, scan, digits3, class, am);
+    }
+
+    let cr = if scan == 0 { Carries::default() } else { ascii_carries(bytes, scan) };
+    family_algebra(bytes, scan, digits3, am, cr, mask::UniClasses::default())
+}
+
 /// Slow(er) path for batches with non-ASCII in or just before them: the
 /// carries walk back through multi-byte chars and classify with the
 /// packed table, so a batch following unicode text gets true carries
@@ -205,7 +255,7 @@ pub(crate) fn family_batch_masks(
 /// applies unchanged. Only number chars (their `\p{N}{1,3}` grouping is
 /// char-counted, inexpressible in byte masks), whitespace straddling the
 /// batch end, and stray continuation bytes stay bad zones.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(never)]
 fn family_extended_masks(
     bytes: &[u8],
@@ -291,7 +341,7 @@ fn family_extended_masks(
 /// masks. `uni` is all-zero on the pure-ASCII path (the constant folds
 /// away every unicode term); the extended path passes real class masks
 /// with straddle-in claims already merged in.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
 fn family_algebra(
     bytes: &[u8],
@@ -612,7 +662,7 @@ mod owt_tests {
     /// Diagnostic: per-batch mask-compute cost, r50k vs cl100k, same
     /// input, walker excluded. Local instantiations (inline fns), so
     /// relative timing is honest despite test builds skipping fat LTO.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     #[ignore]
     fn family_vs_r50k_mask_compute_cost() {
@@ -668,7 +718,7 @@ mod owt_tests {
     /// defers, 0.10% unicode resid, 0.61% other [mostly contraction
     /// spills and `pd` continuations]; was 18.62% before the byte-64
     /// edge resolution.)
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     #[ignore]
     fn family_deferral_census() {

@@ -1,4 +1,5 @@
-//! Fast pretokenizer for the Qwen3.5 regex — on aarch64 a mask scanner
+//! Fast pretokenizer for the Qwen3.5 regex — on aarch64 (NEON) and
+//! x86_64 with AVX-512 (runtime-detected) a mask scanner
 //! via the shared `family::family_batch_masks` boundary algebra with the
 //! mark-folding classifier (`unicode::class_of_marks_join`), so marks
 //! join letter runs in-mask exactly as in the scalar `advance_pos`:
@@ -14,6 +15,7 @@
 //! a valid prefix, but since marks are also in the run class the match span
 //! is the same either way.
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::family::family_batch_masks;
 use super::mask::{MaskScheme, MaskState};
 use super::{decode_cp, is_ascii_ws, is_digit, is_letter, swar_scan_letters};
@@ -28,14 +30,15 @@ impl MaskScheme for Qwen35Scheme {
         advance_pos(bytes, pos)
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[inline(always)]
     fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
         family_batch_masks(bytes, scan, false, unicode::class_of_marks_join)
     }
 }
 
-/// On aarch64, iteration runs the shared cl100k-family mask scanner (see
+/// With SIMD support (aarch64 NEON, or x86_64 AVX-512 detected at runtime),
+/// iteration runs the shared cl100k-family mask scanner (see
 /// `family::family_batch_masks`); elsewhere every token takes the scalar
 /// `advance_pos`.
 pub struct FastQwen35Pretokenizer<'a> {

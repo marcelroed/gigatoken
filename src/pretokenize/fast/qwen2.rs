@@ -1,7 +1,7 @@
-//! Fast pretokenizer for the Qwen2/Qwen3 regex — on aarch64 a mask
-//! scanner via the shared `family::family_batch_masks` boundary algebra
+//! Fast pretokenizer for the Qwen2/Qwen3 regex — on aarch64 (NEON)
+//! and x86_64 with AVX-512 (runtime-detected) a mask scanner via the shared `family::family_batch_masks` boundary algebra
 //! (single-digit mode), with the scalar `advance_pos` below as reference,
-//! non-aarch64 fallback, and bad-zone/tail executor:
+//! no-SIMD fallback, and bad-zone/tail executor:
 //! `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
 //!
 //! Differences from the cl100k scheme:
@@ -11,6 +11,7 @@
 //!   even at EOS, and the remaining whitespace becomes a separate token
 //!   (cl100k keeps trailing whitespace at EOS as one token via `\s+$`)
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::family::family_batch_masks;
 use super::mask::{MaskScheme, MaskState};
 use super::{decode_cp, is_ascii_ws, is_digit, is_letter, scan_letters_from, scan_other_from};
@@ -25,14 +26,15 @@ impl MaskScheme for Qwen2Scheme {
         advance_pos(bytes, pos)
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[inline(always)]
     fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
         family_batch_masks(bytes, scan, false, unicode::class_of)
     }
 }
 
-/// On aarch64, iteration runs the shared cl100k-family mask scanner (see
+/// With SIMD support (aarch64 NEON, or x86_64 AVX-512 detected at runtime),
+/// iteration runs the shared cl100k-family mask scanner (see
 /// `family::family_batch_masks`); elsewhere every token takes the scalar
 /// `advance_pos`.
 pub struct FastQwen2Pretokenizer<'a> {

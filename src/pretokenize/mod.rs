@@ -23,6 +23,12 @@ use std::collections::HashMap;
 pub mod fast;
 mod options;
 mod pretoken;
+// Leftover single-import module; `simd::unicode` only exists behind these
+// compile-time features (see src/simd/mod.rs).
+#[cfg(any(
+    target_feature = "avx512vbmi",
+    all(target_arch = "aarch64", target_feature = "neon")
+))]
 mod pretoken_chunks;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
 pub mod pretoken_avx512;
