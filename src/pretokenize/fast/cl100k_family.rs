@@ -115,7 +115,7 @@ fn ascii_carries(bytes: &[u8], scan: usize) -> Carries {
 /// register allocation stays clean.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-pub(crate) fn family_batch_masks(
+pub(crate) fn batch_masks(
     bytes: &[u8],
     scan: usize,
     digits3: bool,
@@ -197,13 +197,13 @@ pub(crate) fn family_batch_masks(
 }
 
 /// AVX-512 front-end for the family schemes: same contract as the NEON
-/// `family_batch_masks` above. The classification collapses to one
+/// `batch_masks` above. The classification collapses to one
 /// 64-byte load and one k-register compare per class
 /// ([`mask::ascii_masks_avx512`]); the boundary algebra and the extended
 /// (non-ASCII) path are the shared scalar code.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub(crate) fn family_batch_masks(
+pub(crate) fn batch_masks(
     bytes: &[u8],
     scan: usize,
     digits3: bool,
@@ -212,13 +212,13 @@ pub(crate) fn family_batch_masks(
     debug_assert!(mask::simd_scanner_available());
     // SAFETY: MaskState enables the mask-scanner path only after runtime
     // AVX-512 detection (mask::simd_scanner_available).
-    unsafe { family_batch_masks_avx512(bytes, scan, digits3, class) }
+    unsafe { batch_masks_avx512(bytes, scan, digits3, class) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 #[inline]
-fn family_batch_masks_avx512(
+fn batch_masks_avx512(
     bytes: &[u8],
     scan: usize,
     digits3: bool,
@@ -255,7 +255,19 @@ fn family_batch_masks_avx512(
 /// applies unchanged. Only number chars (their `\p{N}{1,3}` grouping is
 /// char-counted, inexpressible in byte masks), whitespace straddling the
 /// batch end, and stray continuation bytes stay bad zones.
+///
+/// On x86_64 the `target_feature` re-declaration keeps the bit-scan
+/// loops on tzcnt/lzcnt/blsr in a baseline (non-native) build — this
+/// function is out-of-line, so without it the ~21% of OWT batches
+/// landing here would compile against baseline x86-64 even though every
+/// caller is an AVX-512 batch classifier. Measured neutral on the OWT
+/// mask-compute diagnostic (ASCII-dominated); kept for codegen parity on
+/// non-ASCII-heavy corpora where this path dominates.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg_attr(
+    target_arch = "x86_64",
+    target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")
+)]
 #[inline(never)]
 fn family_extended_masks(
     bytes: &[u8],

@@ -6,7 +6,7 @@
 //! as another submodule reusing these primitives where its character
 //! classes line up.
 
-pub(crate) mod family;
+pub(crate) mod cl100k_family;
 pub(crate) mod mask;
 
 pub mod cl100k;

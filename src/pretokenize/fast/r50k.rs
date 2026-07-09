@@ -55,7 +55,7 @@ use crate::pretokenize::Pretoken;
 /// NEON classifies the ASCII classes (letter, digit, space, whitespace:
 /// 4 movemasks; apostrophe and non-ASCII behind horizontal any-tests)
 /// and the boundary bits come from u64 shifted-mask algebra in scalar
-/// registers, as in `family::family_batch_masks`. Batches with any
+/// registers, as in `cl100k_family::batch_masks`. Batches with any
 /// non-ASCII byte (~21% on OWT, mostly curly quotes) take
 /// [`extended_masks`]. Inlining that path here measured 0.98x, and
 /// `#[inline(never)]` on this whole function 0.94x — the split keeps the
@@ -234,7 +234,19 @@ fn ascii_batch_algebra(
 /// table hot in cache) plus edge-char resolution was worth ~13% end to
 /// end. `#[inline(never)]`: inlining this into the walker wrecks the
 /// clean path's register allocation (step 15).
+///
+/// On x86_64 the `target_feature` re-declaration keeps the bit-scan
+/// loops on tzcnt/lzcnt/blsr in a baseline (non-native) build — this
+/// function is out-of-line, so without it the ~21% of OWT batches
+/// landing here would compile against baseline x86-64 even though every
+/// caller is an AVX-512 batch classifier. Measured neutral on the OWT
+/// mask-compute diagnostic (ASCII-dominated); kept for codegen parity on
+/// non-ASCII-heavy corpora where this path dominates.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg_attr(
+    target_arch = "x86_64",
+    target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")
+)]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn extended_masks(

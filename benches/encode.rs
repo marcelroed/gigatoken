@@ -10,6 +10,7 @@
 
 use gigatok_rs::load_tokenizer::hf::load_hf_bpe;
 use gigatok_rs::{WorkerPool, encode_docs_ragged};
+use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -64,7 +65,8 @@ fn main() {
     );
     let workers = WorkerPool::new();
     let start = Instant::now();
-    let (ids, _lens) = encode_docs_ragged(&workers, &tokenizer, &[&input]);
+    let (ids, lens) = encode_docs_ragged(&workers, &tokenizer, &[&input]);
+    black_box((&ids, lens));
     let elapsed = start.elapsed().as_secs_f64();
     let throughput_gb = size_gb / elapsed;
 
