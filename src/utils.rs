@@ -48,7 +48,7 @@ pub fn chunks_at_utf8_boundaries(bytes: &[u8], num_chunks: usize) -> Vec<usize> 
     }
     let len = bytes.len();
     // Compute the size of each chunk (possibly uneven division)
-    let chunk_size = (len + num_chunks - 1) / num_chunks;
+    let chunk_size = len.div_ceil(num_chunks);
 
     let mut boundaries = Vec::with_capacity(num_chunks + 1);
     boundaries.push(0);

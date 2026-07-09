@@ -152,17 +152,15 @@ pub fn bpe_merge_symbols_with_scratch<S: std::hash::BuildHasher>(
 
                 // Re-check pair with left neighbor
                 let left = prev[pos];
-                if left != NONE {
-                    if let Some(&m) = merges.get(&(symbols[left as usize], symbols[pos])) {
+                if left != NONE
+                    && let Some(&m) = merges.get(&(symbols[left as usize], symbols[pos])) {
                         heap.push(Reverse(pack_merge_entry(m, left)));
                     }
-                }
                 // Re-check pair with new right neighbor
-                if next[pos] != NONE {
-                    if let Some(&m) = merges.get(&(symbols[pos], symbols[next[pos] as usize])) {
+                if next[pos] != NONE
+                    && let Some(&m) = merges.get(&(symbols[pos], symbols[next[pos] as usize])) {
                         heap.push(Reverse(pack_merge_entry(m, pos as u32)));
                     }
-                }
             }
             _ => continue,
         }
@@ -202,7 +200,7 @@ fn bpe_merge_symbols_small<S: std::hash::BuildHasher>(
 ) {
     let get_rank = |a: TokenId, b: TokenId| merges.get(&(a, b)).map_or(u32::MAX, |m| m.0);
     let n = symbols.len();
-    debug_assert!(2 <= n && n <= SMALL_MERGE_MAX);
+    debug_assert!((2..=SMALL_MERGE_MAX).contains(&n));
     // Stack-resident doubly-linked list, so a merge is O(1) pointer updates
     // instead of shifting the tail (which lowers to a libc memmove call).
     // Sentinels: next[last] == n, prev[0] == u8::MAX; both fail `< n` checks.
@@ -306,16 +304,9 @@ pub fn bpe_merge_symbols_ranked<S: std::hash::BuildHasher>(
 
     // Doubly-linked list via index arrays. NONE = no neighbor.
     const NONE: usize = usize::MAX;
-    let mut next = vec![NONE; n];
-    let mut prev = vec![NONE; n];
+    let mut next: Vec<usize> = (1..n).chain(std::iter::once(NONE)).collect();
+    let mut prev: Vec<usize> = std::iter::once(NONE).chain(0..n - 1).collect();
     let mut token = symbols.clone();
-
-    for i in 0..n - 1 {
-        next[i] = i + 1;
-    }
-    for i in 1..n {
-        prev[i] = i - 1;
-    }
 
     // Min-heap of (rank, position). Position refers to the left symbol of the pair.
     let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
@@ -356,17 +347,15 @@ pub fn bpe_merge_symbols_ranked<S: std::hash::BuildHasher>(
 
                 // Re-check pair with left neighbor
                 let left = prev[pos];
-                if left != NONE {
-                    if let Some(&(_, rank)) = merges.get(&(token[left], token[pos])) {
+                if left != NONE
+                    && let Some(&(_, rank)) = merges.get(&(token[left], token[pos])) {
                         heap.push(Reverse((rank, left)));
                     }
-                }
                 // Re-check pair with new right neighbor
-                if next[pos] != NONE {
-                    if let Some(&(_, rank)) = merges.get(&(token[pos], token[next[pos]])) {
+                if next[pos] != NONE
+                    && let Some(&(_, rank)) = merges.get(&(token[pos], token[next[pos]])) {
                         heap.push(Reverse((rank, pos)));
                     }
-                }
             }
             _ => continue, // Stale entry, skip
         }

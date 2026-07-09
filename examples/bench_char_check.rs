@@ -22,7 +22,7 @@ pub fn main() {
     let n_threads = rayon::current_num_threads();
 
     let text_len = text.len();
-    let chunk_size = (text_len + n_threads - 1) / n_threads;
+    let chunk_size = text_len.div_ceil(n_threads);
     // To avoid splitting a character in the middle of a multi-byte UTF-8 sequence,
     // we'll chunk by byte and correct the boundaries.
     let bytes = text.as_bytes();

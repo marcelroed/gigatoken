@@ -403,7 +403,7 @@ fn pretoken<'a>(input: &mut &'a str) -> ModalResult<Pretoken<'a>> {
     }
 
     let consumed = before.len() - input.len();
-    Ok(Pretoken(before[..consumed].as_bytes()))
+    Ok(Pretoken(&before.as_bytes()[..consumed]))
 }
 
 /// Try whitespace_run first (2+ ws chars with non-ws following), fall back to single.
@@ -429,6 +429,9 @@ pub fn pretoken_next<'a>(input: &mut &'a str) -> Option<Pretoken<'a>> {
     pretoken(input).ok()
 }
 
+// The `impl FnMut` parser type is unnameable, so this signature can't be
+// factored into a type alias.
+#[allow(clippy::type_complexity)]
 pub fn pretokens_iterator<'a>(
     input: &'a mut &'a str,
 ) -> winnow::combinator::ParserIterator<
@@ -488,7 +491,7 @@ mod tests {
             let mut fast: Vec<String> = Vec::new();
             let mut it =
                 crate::pretokenize::fast::FastR50kPretokenizer::new(case.as_bytes());
-            while let Some(p) = it.next() {
+            for p in it {
                 fast.push(String::from_utf8(p.as_ref().to_vec()).unwrap());
             }
             assert_eq!(fast, expected, "fast mismatch for {case:?}");
@@ -532,7 +535,7 @@ mod tests {
                             [a_offset.saturating_sub(32)..min(input_bytes.len(), a_offset + 32)];
                         eprintln!("Context: {:?}", String::from_utf8_lossy(region));
 
-                        assert!(false);
+                        panic!("combinator pretoken differs from standard pretokenizer");
                     }
                 }
                 itertools::EitherOrBoth::Left(a) => {
@@ -547,7 +550,7 @@ mod tests {
                         [a_offset.saturating_sub(32)..min(input_bytes.len(), a_offset + 32)];
                     eprintln!("Context: {:?}", String::from_utf8_lossy(region));
 
-                    assert!(false);
+                    panic!("standard pretokenizer produced an extra pretoken");
                 }
                 itertools::EitherOrBoth::Right(b) => {
                     eprintln!("Right only: {:?}", String::from_utf8_lossy(b.0));
@@ -561,7 +564,7 @@ mod tests {
                         [b_offset.saturating_sub(32)..min(input_bytes.len(), b_offset + 32)];
                     eprintln!("Context: {:?}", String::from_utf8_lossy(region));
 
-                    assert!(false);
+                    panic!("combinator pretokenizer produced an extra pretoken");
                 }
             }
         }

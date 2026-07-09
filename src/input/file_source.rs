@@ -182,7 +182,8 @@ pub fn chunk_ranges(
                     .map(|off| (probe + off, probe + off + sep.len()))
             })
         }
-        DocFormat::Text { .. } => vec![0..len],
+        // One chunk spanning the whole file (a single Range element, not 0..len values).
+        DocFormat::Text { .. } => std::iter::once(0..len).collect(),
     }
 }
 
@@ -340,7 +341,7 @@ impl<R: std::io::BufRead> Iterator for SeparatorReader<R> {
 
         loop {
             let available = match self.reader.fill_buf() {
-                Ok(buf) if buf.is_empty() => {
+                Ok([]) => {
                     // EOF
                     self.finished = true;
                     return if self.buf.is_empty() {

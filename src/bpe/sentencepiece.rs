@@ -102,11 +102,10 @@ impl<'a> Encoder<'a> {
         while !remaining.is_empty() {
             let mut best: Option<(usize, &str, TokenId)> = None;
             for (content, id) in &self.model.added_tokens {
-                if let Some(pos) = remaining.find(content.as_str()) {
-                    if best.is_none() || pos < best.unwrap().0 {
+                if let Some(pos) = remaining.find(content.as_str())
+                    && (best.is_none() || pos < best.unwrap().0) {
                         best = Some((pos, content, *id));
                     }
-                }
             }
 
             match best {

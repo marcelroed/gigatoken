@@ -105,7 +105,7 @@ pub fn safe_split_ranges(
     let blockers: Vec<memchr::memmem::Finder> = added_tokens
         .iter()
         .filter(|t| t.contains(&b' '))
-        .map(|t| memchr::memmem::Finder::new(t))
+        .map(memchr::memmem::Finder::new)
         .collect();
     let max_blocker = blockers.iter().map(|f| f.needle().len()).max().unwrap_or(0);
     // Whether an added-token occurrence spans the cut between `p - 1` and

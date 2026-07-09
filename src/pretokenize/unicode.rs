@@ -24,7 +24,7 @@ pub(crate) fn is_whitespace(c: char) -> bool {
     // The set is a static compiled-data lookup, but cache the borrowed handle
     // to avoid repeated constructor overhead.
     static WS: std::sync::LazyLock<icu::properties::CodePointSetDataBorrowed<'static>> =
-        std::sync::LazyLock::new(|| CodePointSetData::new::<WhiteSpace>());
+        std::sync::LazyLock::new(CodePointSetData::new::<WhiteSpace>);
     WS.contains(c)
 }
 
@@ -116,7 +116,7 @@ fn build_class_table() -> Box<[u8]> {
         classes[*range.start() as usize..=*range.end() as usize].fill(CharClass::Whitespace as u8);
     }
     classes
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| c[0] | (c[1] << 2) | (c[2] << 4) | (c[3] << 6))
         .collect()
 }
@@ -195,7 +195,7 @@ fn build_ds_class_table() -> Box<[u8]> {
             .fill(DsCharClass::Whitespace as u8);
     }
     classes
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|c| c[0] | (c[1] << 4))
         .collect()
 }

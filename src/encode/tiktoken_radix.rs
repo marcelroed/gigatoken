@@ -1,12 +1,12 @@
+//! Complete radix-sort implementation for tiktoken style tokenizers.
+//! Takes a stream of pretokens, fingerprints each of them and sorts by fingerprint, then applies a single merge per pretoken in fingerprint order.
+
 use std::hash::{BuildHasher, Hash};
 
 use rustc_hash::FxBuildHasher;
 use voracious_radix_sort::{RadixSort, Radixable};
 
 use crate::{bpe::Tokenizer, pretokenize::Pretoken, token::TokenId};
-
-///! Complete radix-sort implementation for tiktoken style tokenizers.
-///! Takes a stream of pretokens, fingerprints each of them and sorts by fingerprint, then applies a single merge per pretoken in fingerprint order.
 
 #[derive(Copy, Clone, PartialEq, PartialOrd)]
 struct IndexedFingerprint {
@@ -26,13 +26,13 @@ pub fn encode_radix_sort<'a>(
     tokenizer: &Tokenizer,
 ) -> Vec<TokenId> {
     let mut pretoken_vec = vec![];
-    let hasher = FxBuildHasher::default();
+    let hasher = FxBuildHasher;
     let mut sort_keys: Vec<IndexedFingerprint> = pretokens
         .enumerate()
         .map(|(i, pretoken)| {
             pretoken_vec.push(pretoken);
             IndexedFingerprint {
-                fingerprint: hasher.hash_one(&pretoken),
+                fingerprint: hasher.hash_one(pretoken),
                 index: i,
             }
         })

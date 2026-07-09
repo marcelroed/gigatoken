@@ -274,7 +274,7 @@ impl Tokenizer {
             .filter(|(content, _)| !content.is_empty())
             .map(|(content, id)| (content.into(), id))
             .collect();
-        added_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        added_tokens.sort_by_key(|(content, _)| std::cmp::Reverse(content.len()));
         let mut first_bytes: Vec<u8> = added_tokens.iter().map(|(c, _)| c[0]).collect();
         first_bytes.sort_unstable();
         first_bytes.dedup();
@@ -498,8 +498,8 @@ mod tests {
                 let (base64_token, id_str) = line.split_once(' ').unwrap();
                 let id = id_str.trim().parse::<u32>().unwrap();
                 assert!(id == i as u32);
-                let token_bytes = BASE64_STANDARD.decode(base64_token).unwrap();
-                token_bytes
+                
+                BASE64_STANDARD.decode(base64_token).unwrap()
             })
             .collect();
         for (i, token) in vocab.iter().enumerate().skip(256).take(20) {

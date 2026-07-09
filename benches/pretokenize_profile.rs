@@ -69,7 +69,7 @@ fn main() {
     // Hand each real pretoken slice to black_box so the bounds computation can't
     // be optimized down to a counter.
     let mut iter = FastR50kPretokenizer::new(buf);
-    while let Some(pretoken) = iter.next() {
+    for pretoken in iter {
         black_box(pretoken);
         total_tokens += 1;
     }

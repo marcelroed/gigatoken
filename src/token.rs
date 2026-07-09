@@ -23,15 +23,15 @@ impl From<i32> for TokenId {
     }
 }
 
-impl Into<u32> for TokenId {
-    fn into(self) -> u32 {
-        self.0
+impl From<TokenId> for u32 {
+    fn from(val: TokenId) -> Self {
+        val.0
     }
 }
 
-impl Into<usize> for TokenId {
-    fn into(self) -> usize {
-        self.0 as usize
+impl From<TokenId> for usize {
+    fn from(val: TokenId) -> Self {
+        val.0 as usize
     }
 }
 

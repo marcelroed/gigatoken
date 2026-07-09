@@ -25,7 +25,7 @@ pub fn main() {
         .par_bridge()
         .map(|(start, end)| {
             let mut local_hashes = vec![];
-            let hasher = FxBuildHasher::default();
+            let hasher = FxBuildHasher;
             let chunk = &text.as_bytes()[start..end];
             // let chunk_str = unsafe { std::str::from_utf8_unchecked(chunk) };
 
@@ -36,7 +36,7 @@ pub fn main() {
             local_hashes
         })
         .reduce(
-            || vec![],
+            std::vec::Vec::new,
             |mut acc, hashes| {
                 acc.extend(hashes);
                 acc

@@ -14,7 +14,7 @@ fn main() {
 
     // let mut counts: HashMap<&str, usize> = HashMap::new();
     let mut counts: HashMap<&[u8], usize, FxBuildHasher> =
-        HashMap::with_hasher(FxBuildHasher::default());
+        HashMap::with_hasher(FxBuildHasher);
 
     // Count words in the file
     // I have tested, and this is faster than looping explicitly and checking for space bytes.

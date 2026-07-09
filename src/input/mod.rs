@@ -319,7 +319,7 @@ mod tests {
 
         let chunks = bytes.par_document_chunks(sep, 4);
         // All documents should be found across all chunks
-        let all_docs: Vec<&[u8]> = chunks.into_iter().flat_map(|c| c).collect();
+        let all_docs: Vec<&[u8]> = chunks.into_iter().flatten().collect();
         let single_docs: Vec<&[u8]> = bytes.documents(sep).collect();
         assert_eq!(all_docs, single_docs);
     }
@@ -329,7 +329,7 @@ mod tests {
         let data = b"a<SEP>b<SEP>c";
         let chunks = data.as_slice().par_document_chunks(b"<SEP>", 1);
         assert_eq!(chunks.len(), 1);
-        let docs: Vec<&[u8]> = chunks.into_iter().flat_map(|c| c).collect();
+        let docs: Vec<&[u8]> = chunks.into_iter().flatten().collect();
         assert_eq!(docs, vec![b"a".as_slice(), b"b", b"c"]);
     }
 }

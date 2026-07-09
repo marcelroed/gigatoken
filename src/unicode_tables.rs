@@ -129,7 +129,7 @@ fn table_from_text(text: &str) -> CodePointTrie<'static, UnicodeClass> {
     // eprintln!("Charset: {:#?}, size: {}", charset, charset.len());
     let values_by_codepoint = charset
         .into_iter()
-        .map(|cp| UnicodeClass::from(cp))
+        .map(UnicodeClass::from)
         .collect::<Vec<_>>();
     let cpt = build_unicode_tables(&values_by_codepoint[..]);
     let cpt_time = start_time.elapsed() - charset_time;

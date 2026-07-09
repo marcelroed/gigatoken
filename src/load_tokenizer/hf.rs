@@ -4,6 +4,9 @@
 //! - SentencePiece BPE with `byte_fallback=true` (e.g. Llama) → [`load_hf_sentencepiece`]
 //! - ByteLevel BPE without byte_fallback (e.g. GPT-2) → [`load_hf_bpe`]
 
+// The tokenizer variants differ greatly in size
+#![allow(clippy::large_enum_variant)]
+
 use crate::bpe::{self, SentencePieceBPE};
 use crate::token::TokenId;
 use eyre::{Context, Result, ensure};
@@ -112,11 +115,10 @@ struct AddedToken {
 /// - Byte-fallback tokens `<0xHH>` → the single byte.
 /// - Everything else → its UTF-8 bytes (▁ is kept as-is).
 fn token_str_to_bytes(s: &str) -> Vec<u8> {
-    if s.len() == 6 && s.starts_with("<0x") && s.ends_with('>') {
-        if let Ok(byte) = u8::from_str_radix(&s[3..5], 16) {
+    if s.len() == 6 && s.starts_with("<0x") && s.ends_with('>')
+        && let Ok(byte) = u8::from_str_radix(&s[3..5], 16) {
             return vec![byte];
         }
-    }
     s.as_bytes().to_vec()
 }
 

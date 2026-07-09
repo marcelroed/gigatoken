@@ -9,7 +9,7 @@ pub struct Pretoken<'a>(pub &'a [u8]);
 
 impl AsRef<[u8]> for Pretoken<'_> {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        self.0
     }
 }
 

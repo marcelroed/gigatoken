@@ -29,13 +29,16 @@ use std::sync::{Mutex, OnceLock, TryLockError};
 // Helper: convert BPEResult to Python objects
 // ---------------------------------------------------------------------------
 
+/// Vocab dict plus ordered merge pairs, as Python objects.
+type PyVocabAndMerges<'py> = (
+    Bound<'py, PyDict>,
+    Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>,
+);
+
 fn bpe_result_to_python<'py>(
     py: Python<'py>,
     result: bpe_train::BPEResult,
-) -> PyResult<(
-    Bound<'py, PyDict>,
-    Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>,
-)> {
+) -> PyResult<PyVocabAndMerges<'py>> {
     let vocab_py = result
         .vocab
         .into_iter()
@@ -483,9 +486,10 @@ fn assemble_ragged(chunks: Vec<ChunkTokens>) -> (Vec<u32>, Vec<i64>) {
 /// flat uint8 content and per-document counts directly — no per-document
 /// Python objects are materialized. Returns None when `inputs` is not an
 /// awkward Array (or awkward is not importable).
-fn extract_awkward_docs<'py>(
-    inputs: &Bound<'py, PyAny>,
-) -> PyResult<Option<(Bound<'py, numpy::PyArray1<u8>>, Vec<i64>)>> {
+/// Flat uint8 content array plus per-document byte counts.
+type FlatDocs<'py> = (Bound<'py, numpy::PyArray1<u8>>, Vec<i64>);
+
+fn extract_awkward_docs<'py>(inputs: &Bound<'py, PyAny>) -> PyResult<Option<FlatDocs<'py>>> {
     let py = inputs.py();
     let Ok(ak) = py.import("awkward") else {
         return Ok(None);
@@ -562,6 +566,12 @@ fn chunk_target_bytes(total_bytes: usize) -> usize {
 /// stays warm when encoding is invoked repeatedly (e.g. in a loop).
 pub struct WorkerPool {
     slots: OnceLock<Vec<Mutex<Option<Tokenizer>>>>,
+}
+
+impl Default for WorkerPool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkerPool {
