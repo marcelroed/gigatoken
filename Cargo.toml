@@ -1,7 +1,8 @@
 [package]
 name = "gigatok"
-version = "0.1.1"
+version = "0.3.0"
 edition = "2024"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
@@ -22,7 +23,11 @@ numpy = "0.29"
 rayon = "1.11"
 # xxhash-rust = { version = "0.8.15", features = ["xxh3", "std", "const_xxh3"] }
 rustc-hash = "2.1"
-polars = { version = "0.54", features = ["lazy", "parquet", "strings"], optional = true }
+polars = { version = "0.54", features = [
+    "lazy",
+    "parquet",
+    "strings",
+], optional = true }
 memmap2 = { version = "0.9", features = ["stable_deref_trait"] }
 base64 = "0.22"
 icu = { version = "2.2", features = ["compiled_data", "datagen"] }
@@ -41,6 +46,7 @@ simdutf = "0.7.0"
 serde = { version = "1.0.228", features = ["derive"] }
 flate2 = "1.1"
 zstd = "0.13"
+spm_precompiled = "0.1.4"
 
 [profile.release]
 lto = "fat"
@@ -77,6 +83,11 @@ test = false
 
 [[bench]]
 name = "encode_st"
+harness = false
+test = false
+
+[[bench]]
+name = "encode_st_sp"
 harness = false
 test = false
 
