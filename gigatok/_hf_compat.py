@@ -3,10 +3,16 @@ fast-tokenizer API (PreTrainedTokenizerFast / TokenizersBackend)."""
 
 from __future__ import annotations
 
+import functools
 import json
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, overload
 
 from gigatok._load.hf import to_tokenizer_json
 from gigatok._tokenizer import Tokenizer
+
+if TYPE_CHECKING:
+    from gigatok._load.hf import TokenizerJsonSource
 
 _NAMED_SPECIAL_ATTRS = (
     "bos_token",
@@ -21,6 +27,7 @@ _NAMED_SPECIAL_ATTRS = (
 _SENTENCEPIECE_SPACE = "▁"
 
 
+@functools.cache
 def _gpt2_unicode_to_byte() -> dict[str, int]:
     """The GPT-2 ByteLevel char -> byte table (inverse of bytes_to_unicode)."""
     allowed = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
@@ -33,10 +40,7 @@ def _gpt2_unicode_to_byte() -> dict[str, int]:
     return {ch: b for b, ch in b2u.items()}
 
 
-_U2B: dict[str, int] | None = None
-
-
-def _template_special_ids(pp) -> tuple[list[int], list[int]]:
+def _template_special_ids(pp: dict[str, Any] | None) -> tuple[list[int], list[int]]:
     """Resolve a post_processor into (prefix_ids, suffix_ids) added around a
     single sequence, e.g. Llama's TemplateProcessing BOS. Raises for
     post-processors whose effect on ids cannot be reproduced."""
@@ -74,7 +78,7 @@ class BatchEncoding(dict):
     """Minimal stand-in for transformers.BatchEncoding: a dict whose keys
     (input_ids, attention_mask) are also attributes."""
 
-    def __getattr__(self, item):
+    def __getattr__(self, item: str) -> Any:
         try:
             return self[item]
         except KeyError:
@@ -89,8 +93,9 @@ class HFCompat:
     plus the vocab and special-token accessors.
 
     Accepts the same sources as `gigatok.Tokenizer`: a path to a
-    tokenizer.json, a `tokenizers.Tokenizer`, or a `transformers` tokenizer
-    (fast or slow). Named special-token attributes (eos_token, ...) are
+    tokenizer.json, a HuggingFace Hub repo id, a `tokenizers.Tokenizer`, or a
+    `transformers` tokenizer (fast or slow). Named special-token attributes
+    (eos_token, ...) are
     copied from the source tokenizer when it has them; otherwise they are
     None, like a TokenizersBackend built from a bare tokenizer_object.
 
@@ -98,12 +103,31 @@ class HFCompat:
     supported and raise instead of silently diverging.
     """
 
-    model_input_names = ["input_ids", "attention_mask"]
-    is_fast = True
-    padding_side = "right"
-    truncation_side = "right"
+    model_input_names: list[str] = ["input_ids", "attention_mask"]
+    is_fast: bool = True
+    padding_side: str = "right"
+    truncation_side: str = "right"
 
-    def __init__(self, tokenizer):
+    # Set in __init__ from the source tokenizer (see _NAMED_SPECIAL_ATTRS).
+    bos_token: str | None
+    eos_token: str | None
+    unk_token: str | None
+    sep_token: str | None
+    pad_token: str | None
+    cls_token: str | None
+    mask_token: str | None
+    additional_special_tokens: list[str]
+
+    # Derived properties attached at module bottom via _named_special_id_property.
+    bos_token_id: int | None
+    eos_token_id: int | None
+    unk_token_id: int | None
+    sep_token_id: int | None
+    pad_token_id: int | None
+    cls_token_id: int | None
+    mask_token_id: int | None
+
+    def __init__(self, tokenizer: TokenizerJsonSource) -> None:
         data = to_tokenizer_json(tokenizer)
         self._tokenizer = Tokenizer.from_json(data)
         config = json.loads(data)
@@ -113,6 +137,7 @@ class HFCompat:
         self._special_ids = frozenset(int(t["id"]) for t in added if t.get("special"))
         self._id_to_token: dict[int, str] = {i: tok for tok, i in self._model_vocab.items()}
         self._id_to_token.update((i, tok) for tok, i in self._added_tokens.items())
+        self._vocab_len = len(self._model_vocab.keys() | self._added_tokens.keys())
         self._byte_fallback = bool(config["model"].get("byte_fallback"))
         try:
             self._prefix_ids, self._suffix_ids = _template_special_ids(config.get("post_processor"))
@@ -136,7 +161,15 @@ class HFCompat:
 
     # -- encoding -----------------------------------------------------------
 
-    def _check_call_args(self, text_pair, padding, truncation, max_length, return_tensors, kwargs):
+    def _check_call_args(
+        self,
+        text_pair: str | None,
+        padding: bool | str,
+        truncation: bool | str | None,
+        max_length: int | None,
+        return_tensors: str | None,
+        kwargs: dict[str, Any],
+    ) -> None:
         if text_pair is not None:
             raise ValueError("gigatok.HFCompat does not support sequence pairs")
         if padding:
@@ -148,12 +181,9 @@ class HFCompat:
         if kwargs.get("is_split_into_words"):
             raise NotImplementedError("gigatok.HFCompat does not support pre-tokenized input")
 
-    def _check_post_processor(self):
+    def _check_post_processor(self) -> None:
         if self._post_processor_error is not None:
-            raise ValueError(
-                f"cannot add special tokens: {self._post_processor_error}; "
-                "pass add_special_tokens=False and add them yourself if needed"
-            )
+            raise ValueError(f"cannot add special tokens: {self._post_processor_error}; pass add_special_tokens=False and add them yourself if needed")
 
     def _encode_ids(self, text: str, add_special_tokens: bool) -> list[int]:
         ids = self._tokenizer.encode(text).tolist()
@@ -165,15 +195,15 @@ class HFCompat:
 
     def __call__(
         self,
-        text=None,
-        text_pair=None,
+        text: str | Iterable[str] | None = None,
+        text_pair: str | None = None,
         add_special_tokens: bool = True,
-        padding=False,
-        truncation=None,
-        max_length=None,
-        return_tensors=None,
-        return_attention_mask=None,
-        **kwargs,
+        padding: bool | str = False,
+        truncation: bool | str | None = None,
+        max_length: int | None = None,
+        return_tensors: str | None = None,
+        return_attention_mask: bool | None = None,
+        **kwargs: Any,
     ) -> BatchEncoding:
         self._check_call_args(text_pair, padding, truncation, max_length, return_tensors, kwargs)
         if text is None:
@@ -199,58 +229,74 @@ class HFCompat:
 
     def encode(
         self,
-        text,
-        text_pair=None,
+        text: str,
+        text_pair: str | None = None,
         add_special_tokens: bool = True,
-        padding=False,
-        truncation=None,
-        max_length=None,
-        **kwargs,
+        padding: bool | str = False,
+        truncation: bool | str | None = None,
+        max_length: int | None = None,
+        **kwargs: Any,
     ) -> list[int]:
         self._check_call_args(text_pair, padding, truncation, max_length, None, kwargs)
         return self._encode_ids(text, add_special_tokens)
 
-    def tokenize(self, text: str, pair=None, add_special_tokens: bool = False, **kwargs) -> list[str]:
+    def tokenize(self, text: str, pair: str | None = None, add_special_tokens: bool = False, **kwargs: Any) -> list[str | None]:
         if pair is not None:
             raise ValueError("gigatok.HFCompat does not support sequence pairs")
         return self.convert_ids_to_tokens(self._encode_ids(text, add_special_tokens))
 
     # -- decoding -----------------------------------------------------------
 
-    def decode(self, token_ids, skip_special_tokens: bool = False, **kwargs):
-        if hasattr(token_ids, "tolist"):
-            token_ids = token_ids.tolist()
+    @overload
+    def decode(self, token_ids: int | Iterable[int], skip_special_tokens: bool = False, **kwargs: Any) -> str: ...
+    @overload
+    def decode(self, token_ids: Iterable[Iterable[int]], skip_special_tokens: bool = False, **kwargs: Any) -> list[str]: ...
+    def decode(
+        self,
+        token_ids: int | Iterable[int] | Iterable[Iterable[int]],
+        skip_special_tokens: bool = False,
+        **kwargs: Any,
+    ) -> str | list[str]:
+        tolist = getattr(token_ids, "tolist", None)
+        if callable(tolist):
+            token_ids = tolist()
         if isinstance(token_ids, int):
             token_ids = [token_ids]
-        token_ids = list(token_ids)
-        if token_ids and isinstance(token_ids[0], list):
-            return self.batch_decode(token_ids, skip_special_tokens=skip_special_tokens, **kwargs)
-        ids = [int(i) for i in token_ids]
+        seq: list[Any] = list(token_ids)
+        if seq and isinstance(seq[0], list):
+            return self.batch_decode(seq, skip_special_tokens=skip_special_tokens, **kwargs)
+        ids = [int(i) for i in seq]
         if skip_special_tokens:
             ids = [i for i in ids if i not in self._special_ids]
         return self._tokenizer.decode(ids).decode("utf-8", errors="replace")
 
-    def batch_decode(self, sequences, skip_special_tokens: bool = False, **kwargs) -> list[str]:
+    def batch_decode(self, sequences: Iterable[Iterable[int]], skip_special_tokens: bool = False, **kwargs: Any) -> list[str]:
         return [self.decode(ids, skip_special_tokens=skip_special_tokens, **kwargs) for ids in sequences]
 
     # -- token/id conversions ----------------------------------------------
 
-    def convert_ids_to_tokens(self, ids, skip_special_tokens: bool = False):
+    @overload
+    def convert_ids_to_tokens(self, ids: int, skip_special_tokens: bool = False) -> str | None: ...
+    @overload
+    def convert_ids_to_tokens(self, ids: Iterable[int], skip_special_tokens: bool = False) -> list[str | None]: ...
+    def convert_ids_to_tokens(self, ids: int | Iterable[int], skip_special_tokens: bool = False) -> str | None | list[str | None]:
         if isinstance(ids, int):
             return self._id_to_token.get(ids)
         if skip_special_tokens:
             ids = [i for i in ids if int(i) not in self._special_ids]
         return [self._id_to_token.get(int(i)) for i in ids]
 
-    def convert_tokens_to_ids(self, tokens):
+    @overload
+    def convert_tokens_to_ids(self, tokens: str) -> int | None: ...
+    @overload
+    def convert_tokens_to_ids(self, tokens: Iterable[str]) -> list[int | None]: ...
+    def convert_tokens_to_ids(self, tokens: str | Iterable[str]) -> int | None | list[int | None]:
         if isinstance(tokens, str):
             return self._token_to_id(tokens)
         return [self._token_to_id(t) for t in tokens]
 
     def _token_to_id(self, token: str) -> int | None:
-        id_ = self._added_tokens.get(token)
-        if id_ is None:
-            id_ = self._model_vocab.get(token)
+        id_ = self._token_to_id_no_unk(token)
         if id_ is None and self.unk_token is not None:
             id_ = self._token_to_id_no_unk(self.unk_token)
         return id_
@@ -271,13 +317,11 @@ class HFCompat:
                     raw += token.replace(_SENTENCEPIECE_SPACE, " ").encode("utf-8")
             text = raw.decode("utf-8", errors="replace")
             return text[1:] if text.startswith(" ") else text
-        global _U2B
-        if _U2B is None:
-            _U2B = _gpt2_unicode_to_byte()
+        u2b = _gpt2_unicode_to_byte()
         raw = bytearray()
         for token in tokens:
             for ch in token:
-                b = _U2B.get(ch)
+                b = u2b.get(ch)
                 if b is None:
                     raw += ch.encode("utf-8")
                 else:
@@ -310,7 +354,7 @@ class HFCompat:
         return {i: tok for tok, i in self._added_tokens.items()}
 
     def __len__(self) -> int:
-        return len(self.get_vocab())
+        return self._vocab_len
 
     @property
     def special_tokens_map(self) -> dict[str, str | list[str]]:
@@ -321,14 +365,11 @@ class HFCompat:
 
     @property
     def all_special_tokens(self) -> list[str]:
-        seen = dict.fromkeys(
-            [getattr(self, attr) for attr in _NAMED_SPECIAL_ATTRS if getattr(self, attr) is not None]
-            + list(self.additional_special_tokens)
-        )
+        seen = dict.fromkeys([getattr(self, attr) for attr in _NAMED_SPECIAL_ATTRS if getattr(self, attr) is not None] + list(self.additional_special_tokens))
         return list(seen)
 
     @property
-    def all_special_ids(self) -> list[int]:
+    def all_special_ids(self) -> list[int | None]:
         return [self._token_to_id_no_unk(t) for t in self.all_special_tokens]
 
     def num_special_tokens_to_add(self, pair: bool = False) -> int:
@@ -342,7 +383,7 @@ class HFCompat:
 
 
 def _named_special_id_property(attr: str) -> property:
-    def get(self) -> int | None:
+    def get(self: HFCompat) -> int | None:
         token = getattr(self, attr)
         return None if token is None else self._token_to_id_no_unk(token)
 

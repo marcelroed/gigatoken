@@ -40,20 +40,24 @@ def train_bpe(
 class BPETokenizer:
     def __new__(cls) -> "BPETokenizer": ...
     def encode(self, input: str | bytes) -> npt.NDArray[np.uint32]: ...
-    def encode_batch(
-        self, inputs: list[str] | list[bytes] | ak.Array
-    ) -> ak.Array: ...
+    def encode_batch(self, inputs: list[str] | list[bytes] | ak.Array) -> ak.Array: ...
     def encode_files(
         self,
-        source: FileSource
-        | str
-        | Path
-        | PathLike[str]
-        | list[str | Path | PathLike[str]],
+        source: FileSource | str | Path | PathLike[str] | list[str | Path | PathLike[str]],
     ) -> ak.Array: ...
-    def decode(
-        self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array
-    ) -> bytes: ...
+    def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes: ...
+    @property
+    def vocab_size(self) -> int:
+        """Size of the vocabulary: one greater than the largest token ID,
+        including added tokens."""
+    @property
+    def vocab(self) -> dict[int, bytes]:
+        """The vocabulary as a freshly built dict mapping token ID to token
+        bytes, in ID order, including added tokens."""
+    @property
+    def merges(self) -> list[tuple[bytes, bytes]]:
+        """The merge rules as a freshly built list of `(left, right)` byte
+        pairs in merge-priority order."""
     @staticmethod
     def from_tiktoken(path: str | Path) -> "BPETokenizer": ...
     @staticmethod
@@ -63,20 +67,26 @@ class BPETokenizer:
 class SentencePieceTokenizer:
     @staticmethod
     def from_hf(path: str | Path) -> "SentencePieceTokenizer": ...
-    def encode(self, text: str) -> npt.NDArray[np.uint32]: ...
-    def encode_batch(
-        self, inputs: list[str] | list[bytes] | ak.Array
-    ) -> ak.Array: ...
+    def encode(self, input: str | bytes) -> npt.NDArray[np.uint32]: ...
+    def encode_batch(self, inputs: list[str] | list[bytes] | ak.Array) -> ak.Array: ...
     def encode_no_normalize(self, text: str) -> npt.NDArray[np.uint32]: ...
     def encode_files(
         self,
-        source: FileSource
-        | str
-        | Path
-        | PathLike[str]
-        | list[str | Path | PathLike[str]],
+        source: FileSource | str | Path | PathLike[str] | list[str | Path | PathLike[str]],
     ) -> ak.Array: ...
-    def decode(self, tokens: list[int] | npt.NDArray[np.uint32]) -> bytes: ...
+    def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes: ...
+    @property
+    def vocab_size(self) -> int:
+        """Size of the vocabulary: one greater than the largest token ID,
+        including added tokens."""
+    @property
+    def vocab(self) -> dict[int, bytes]:
+        """The vocabulary as a freshly built dict mapping token ID to token
+        bytes, in ID order, including added tokens."""
+    @property
+    def merges(self) -> list[tuple[bytes, bytes]]:
+        """The merge rules as a freshly built list of `(left, right)` byte
+        pairs in merge-priority order."""
     def __repr__(self) -> str: ...
 
 def load_hf_json(
@@ -91,5 +101,6 @@ class PretokenizerIter:
 
 def pretokenizer(text: bytes) -> PretokenizerIter: ...
 def pretokenized_counts(
-    text: bytes, separator: bytes | None = None,
+    text: bytes,
+    separator: bytes | None = None,
 ) -> list[tuple[bytes, int]]: ...
