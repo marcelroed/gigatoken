@@ -94,7 +94,7 @@ jobs:
       - name: Upload release bundle
         uses: actions/upload-artifact@v4
         with:
-          name: gigatok-release
+          name: gigatoken-release
           path: |
             dist/*.whl
             dist/*.tar.gz
@@ -152,5 +152,5 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           python -m pip install --only-binary=:all: numpy awkward
-          python -m pip install --no-index --find-links dist gigatok
-          python -c 'import gigatok; tokens = list(gigatok.pretokenizer(b"Hello, world!")); assert b"".join(tokens) == b"Hello, world!", tokens'
+          python -m pip install --no-index --find-links dist gigatoken
+          python -c 'import gigatoken; tokens = list(gigatoken.pretokenizer(b"Hello, world!")); assert b"".join(tokens) == b"Hello, world!", tokens'

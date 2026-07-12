@@ -1,4 +1,4 @@
-from gigatok.gigatok_rs import (
+from gigatoken.gigatoken_rs import (
     FileSource,
     JsonlFileSource,
     TextFileSource,
@@ -6,9 +6,9 @@ from gigatok.gigatok_rs import (
     train_bpe,
 )
 
-from gigatok._hf_compat import HFCompat
-from gigatok._tiktoken_compat import TiktokenCompat
-from gigatok._tokenizer import Tokenizer
+from gigatoken._hf_compat import HFCompat
+from gigatoken._tiktoken_compat import TiktokenCompat
+from gigatoken._tokenizer import Tokenizer
 
 __all__ = [
     "FileSource",

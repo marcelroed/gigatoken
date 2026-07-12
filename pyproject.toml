@@ -3,11 +3,13 @@ requires = ["maturin>=1.14.1,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "gigatok"
+name = "gigatoken"
+description = "Tokenize your documents at GB/s"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{ name = "Marcel Rød", email = "roed@stanford.edu" }]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3 :: Only",
@@ -28,7 +30,7 @@ dependencies = [
 ]
 
 [tool.maturin]
-module-name = "gigatok.gigatok_rs"
+module-name = "gigatoken.gigatoken_rs"
 
 
 [tool.uv]

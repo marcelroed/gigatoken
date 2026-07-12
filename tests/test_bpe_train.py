@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from gigatok import train_bpe
+from gigatoken import train_bpe
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 

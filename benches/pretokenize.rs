@@ -4,12 +4,12 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
     target_feature = "avx512bw",
     target_feature = "avx512vl"
 ))]
-use gigatok_rs::pretokenize::pretoken_avx512::Avx512PretokenizerIter;
-use gigatok_rs::pretokenize::{
+use gigatoken_rs::pretokenize::pretoken_avx512::Avx512PretokenizerIter;
+use gigatoken_rs::pretokenize::{
     pretoken_combinator::pretokens_iterator, FastCl100kPretokenizer, FastQwen2Pretokenizer,
     FastQwen35Pretokenizer, FastR50kPretokenizer, PretokenizerIter,
 };
-use gigatok_rs::pretokenize::pretoken_simd::SimdPretokIter;
+use gigatoken_rs::pretokenize::pretoken_simd::SimdPretokIter;
 use std::hint::black_box;
 
 const TARGET_BENCH_SIZE: usize = 100_000_000; // ~100 MB

@@ -1,12 +1,12 @@
 [package]
-name = "gigatok"
+name = "gigatoken"
 version = "0.3.0"
 edition = "2024"
 license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "gigatok_rs"
+name = "gigatoken_rs"
 crate-type = ["cdylib", "lib"]
 
 [features]

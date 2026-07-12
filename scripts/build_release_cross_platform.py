@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""Build and validate a complete gigatok PyPI release from macOS.
+"""Build and validate a complete gigatoken PyPI release from macOS.
 
 This produces abi3 wheels for CPython 3.10+ on macOS, manylinux2014,
 and Windows, for both x86-64 and ARM64, plus a source distribution.
@@ -73,7 +73,7 @@ def maturin() -> list[str]:
 
 def clean_dist() -> None:
     DIST.mkdir(exist_ok=True)
-    for pattern in ("gigatok-*.whl", "gigatok-*.tar.gz"):
+    for pattern in ("gigatoken-*.whl", "gigatoken-*.tar.gz"):
         for artifact in DIST.glob(pattern):
             artifact.unlink()
 
@@ -156,7 +156,7 @@ def build_windows_wheels() -> None:
 def build_linux_wheel(architecture: str, target: str) -> None:
     docker_platform = {"x86_64": "linux/amd64", "aarch64": "linux/arm64"}[architecture]
     container_command = (
-        f"rustup toolchain install nightly --profile minimal && maturin build --release --locked --target {target} --manylinux 2014 --target-dir /tmp/gigatok-target --out /out"
+        f"rustup toolchain install nightly --profile minimal && maturin build --release --locked --target {target} --manylinux 2014 --target-dir /tmp/gigatoken-target --out /out"
     )
     run(
         [
@@ -192,13 +192,13 @@ def build_sdist() -> None:
 
 def expected_artifacts(version: str) -> list[Path]:
     names = [
-        f"gigatok-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
-        f"gigatok-{version}-cp310-abi3-macosx_11_0_arm64.whl",
-        f"gigatok-{version}-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-        f"gigatok-{version}-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
-        f"gigatok-{version}-cp310-abi3-win_amd64.whl",
-        f"gigatok-{version}-cp310-abi3-win_arm64.whl",
-        f"gigatok-{version}.tar.gz",
+        f"gigatoken-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
+        f"gigatoken-{version}-cp310-abi3-macosx_11_0_arm64.whl",
+        f"gigatoken-{version}-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        f"gigatoken-{version}-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        f"gigatoken-{version}-cp310-abi3-win_amd64.whl",
+        f"gigatoken-{version}-cp310-abi3-win_arm64.whl",
+        f"gigatoken-{version}.tar.gz",
     ]
     artifacts = [DIST / name for name in names]
     missing = [path.name for path in artifacts if not path.is_file()]
@@ -213,15 +213,15 @@ def venv_python(venv: Path) -> Path:
 
 def smoke_test_wheel(wheel: Path) -> None:
     smoke_code = (
-        "import importlib.metadata, gigatok; "
-        "assert importlib.metadata.version('gigatok') == VERSION; "
-        "tokens = list(gigatok.pretokenizer(b'Hello, world!')); "
+        "import importlib.metadata, gigatoken; "
+        "assert importlib.metadata.version('gigatoken') == VERSION; "
+        "tokens = list(gigatoken.pretokenizer(b'Hello, world!')); "
         "assert b''.join(tokens) == b'Hello, world!'"
     )
     version = project_version()
     smoke_code = f"VERSION = {version!r}; {smoke_code}"
 
-    with tempfile.TemporaryDirectory(prefix="gigatok-wheel-test-") as temp:
+    with tempfile.TemporaryDirectory(prefix="gigatoken-wheel-test-") as temp:
         temp_path = Path(temp)
         for python_version in PYTHON_VERSIONS:
             venv = temp_path / python_version.replace(".", "")
@@ -256,7 +256,7 @@ def smoke_test_wheel(wheel: Path) -> None:
 
 
 def smoke_test_sdist(sdist: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix="gigatok-sdist-test-") as temp:
+    with tempfile.TemporaryDirectory(prefix="gigatoken-sdist-test-") as temp:
         temp_path = Path(temp)
         venv = temp_path / "venv"
         run(["uv", "venv", "--python", "3.14", str(venv)])
@@ -282,7 +282,7 @@ def smoke_test_sdist(sdist: Path) -> None:
                 "--no-project",
                 "python",
                 "-c",
-                "import gigatok; assert b''.join(gigatok.pretokenizer(b'sdist works')) == b'sdist works'",
+                "import gigatoken; assert b''.join(gigatoken.pretokenizer(b'sdist works')) == b'sdist works'",
             ],
             cwd=temp_path,
             env=env,
@@ -302,7 +302,7 @@ def validate(artifacts: list[Path], *, skip_smoke_tests: bool) -> None:
 
 
 def check_pypi_version(version: str, *, required: bool) -> None:
-    url = "https://pypi.org/pypi/gigatok/json"
+    url = "https://pypi.org/pypi/gigatoken/json"
     try:
         with urllib.request.urlopen(url, timeout=15) as response:
             releases = json.load(response).get("releases", {})
@@ -312,7 +312,7 @@ def check_pypi_version(version: str, *, required: bool) -> None:
         print(f"warning: could not check existing PyPI releases: {error}")
         return
     if version in releases:
-        raise SystemExit(f"gigatok {version} already exists on PyPI")
+        raise SystemExit(f"gigatoken {version} already exists on PyPI")
 
 
 def print_hashes(artifacts: list[Path]) -> None:

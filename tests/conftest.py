@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from gigatok._hf_compat import _gpt2_unicode_to_byte
+from gigatoken._hf_compat import _gpt2_unicode_to_byte
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -170,7 +170,7 @@ def olmo3_tokenizer_path() -> Path:
 
 # ---------------------------------------------------------------------------
 # GPT-2 byte <-> unicode helpers (reused by test_bpe_train_compare, etc.)
-# The canonical Python copy of the table lives in gigatok._hf_compat.
+# The canonical Python copy of the table lives in gigatoken._hf_compat.
 # ---------------------------------------------------------------------------
 
 GPT2_U2B = _gpt2_unicode_to_byte()

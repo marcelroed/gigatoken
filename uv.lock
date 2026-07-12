@@ -663,7 +663,7 @@ wheels = [
 ]
 
 [[package]]
-name = "gigatok"
+name = "gigatoken"
 source = { editable = "." }
 dependencies = [
     { name = "awkward" },

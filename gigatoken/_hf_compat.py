@@ -1,4 +1,4 @@
-"""HFCompat: a gigatok-backed drop-in for the HuggingFace `transformers`
+"""HFCompat: a gigatoken-backed drop-in for the HuggingFace `transformers`
 fast-tokenizer API (PreTrainedTokenizerFast / TokenizersBackend)."""
 
 from __future__ import annotations
@@ -7,8 +7,8 @@ import functools
 from collections.abc import Iterable
 from typing import Any, overload
 
-from gigatok._load.hf import NAMED_SPECIAL_TOKEN_ATTRS as _NAMED_SPECIAL_ATTRS
-from gigatok._tokenizer import Tokenizer
+from gigatoken._load.hf import NAMED_SPECIAL_TOKEN_ATTRS as _NAMED_SPECIAL_ATTRS
+from gigatoken._tokenizer import Tokenizer
 
 _SENTENCEPIECE_SPACE = "▁"
 
@@ -72,16 +72,16 @@ class BatchEncoding(dict):
 
 
 class HFCompat:
-    """Adapt a `gigatok.Tokenizer` to the `transformers` fast-tokenizer API
+    """Adapt a `gigatoken.Tokenizer` to the `transformers` fast-tokenizer API
     (TokenizersBackend / PreTrainedTokenizerFast), so it can replace the
     original tokenizer in existing code:
     `__call__`/`encode`/`decode`/`batch_decode`/`tokenize`/`convert_*`
     plus the vocab and special-token accessors.
 
-    Obtain one with `gigatok.Tokenizer(source).as_hf()`, where `source` is
-    anything `gigatok.Tokenizer` accepts — for a drop-in replacement of an
+    Obtain one with `gigatoken.Tokenizer(source).as_hf()`, where `source` is
+    anything `gigatoken.Tokenizer` accepts — for a drop-in replacement of an
     existing HuggingFace tokenizer:
-    `hf_tokenizer_compatible = gigatok.Tokenizer(hf_tokenizer).as_hf()`.
+    `hf_tokenizer_compatible = gigatoken.Tokenizer(hf_tokenizer).as_hf()`.
     Named special-token attributes (eos_token, ...) are copied from the
     source tokenizer when it has them; otherwise they are None, like a
     TokenizersBackend built from a bare tokenizer_object.
@@ -117,8 +117,8 @@ class HFCompat:
     def __init__(self, tokenizer: Tokenizer) -> None:
         if not isinstance(tokenizer, Tokenizer):
             raise TypeError(
-                f"HFCompat wraps a gigatok.Tokenizer, not {type(tokenizer).__name__!r}; "
-                "construct one first, e.g. gigatok.Tokenizer(hf_tokenizer).as_hf()"
+                f"HFCompat wraps a gigatoken.Tokenizer, not {type(tokenizer).__name__!r}; "
+                "construct one first, e.g. gigatoken.Tokenizer(hf_tokenizer).as_hf()"
             )
         self._tokenizer = tokenizer
         config = tokenizer._hf_config()
@@ -148,7 +148,7 @@ class HFCompat:
 
     @property
     def tokenizer(self) -> Tokenizer:
-        """The underlying gigatok Tokenizer (numpy/awkward-native API)."""
+        """The underlying gigatoken Tokenizer (numpy/awkward-native API)."""
         return self._tokenizer
 
     # -- encoding -----------------------------------------------------------
@@ -163,15 +163,15 @@ class HFCompat:
         kwargs: dict[str, Any],
     ) -> None:
         if text_pair is not None:
-            raise ValueError("gigatok.HFCompat does not support sequence pairs")
+            raise ValueError("gigatoken.HFCompat does not support sequence pairs")
         if padding:
-            raise NotImplementedError("gigatok.HFCompat does not support padding")
+            raise NotImplementedError("gigatoken.HFCompat does not support padding")
         if truncation or max_length is not None:
-            raise NotImplementedError("gigatok.HFCompat does not support truncation")
+            raise NotImplementedError("gigatoken.HFCompat does not support truncation")
         if return_tensors is not None:
-            raise NotImplementedError("gigatok.HFCompat does not support return_tensors")
+            raise NotImplementedError("gigatoken.HFCompat does not support return_tensors")
         if kwargs.get("is_split_into_words"):
-            raise NotImplementedError("gigatok.HFCompat does not support pre-tokenized input")
+            raise NotImplementedError("gigatoken.HFCompat does not support pre-tokenized input")
 
     def _check_post_processor(self) -> None:
         if self._post_processor_error is not None:
@@ -234,7 +234,7 @@ class HFCompat:
 
     def tokenize(self, text: str, pair: str | None = None, add_special_tokens: bool = False, **kwargs: Any) -> list[str | None]:
         if pair is not None:
-            raise ValueError("gigatok.HFCompat does not support sequence pairs")
+            raise ValueError("gigatoken.HFCompat does not support sequence pairs")
         return self.convert_ids_to_tokens(self._encode_ids(text, add_special_tokens))
 
     # -- decoding -----------------------------------------------------------
@@ -366,7 +366,7 @@ class HFCompat:
 
     def num_special_tokens_to_add(self, pair: bool = False) -> int:
         if pair:
-            raise ValueError("gigatok.HFCompat does not support sequence pairs")
+            raise ValueError("gigatoken.HFCompat does not support sequence pairs")
         self._check_post_processor()
         return len(self._prefix_ids) + len(self._suffix_ids)
 

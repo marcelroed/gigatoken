@@ -1154,7 +1154,7 @@ fn pretokenized_counts<'py>(
 // ---------------------------------------------------------------------------
 
 #[pymodule]
-fn gigatok_rs<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
+fn gigatoken_rs<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(train_bpe, m)?)?;
     m.add_class::<FileSource>()?;
     m.add_class::<TextFileSource>()?;

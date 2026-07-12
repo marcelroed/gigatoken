@@ -1,6 +1,6 @@
 import pytest
 
-# from gigatok import Tokenizer — high-level Tokenizer API not yet implemented
+# from gigatoken import Tokenizer — high-level Tokenizer API not yet implemented
 
 
 @pytest.mark.skip(reason="High-level Tokenizer API not yet implemented")

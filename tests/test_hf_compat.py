@@ -1,8 +1,8 @@
-"""Tests for the unified gigatok.Tokenizer and the gigatok.HFCompat wrapper.
+"""Tests for the unified gigatoken.Tokenizer and the gigatoken.HFCompat wrapper.
 
-gigatok.Tokenizer loads standard-format tokenizers (paths or already
+gigatoken.Tokenizer loads standard-format tokenizers (paths or already
 initialized HuggingFace tokenizer objects) and picks the right Rust backend.
-gigatok.Tokenizer(source).as_hf() adapts it to the `transformers`
+gigatoken.Tokenizer(source).as_hf() adapts it to the `transformers`
 fast-tokenizer API so it can replace a HuggingFace tokenizer in existing
 code.
 """
@@ -14,8 +14,8 @@ import numpy as np
 import pytest
 from tokenizers import Tokenizer as HFTokenizer
 
-import gigatok
-from gigatok.gigatok_rs import BPETokenizer, SentencePieceTokenizer
+import gigatoken
+from gigatoken.gigatoken_rs import BPETokenizer, SentencePieceTokenizer
 
 TEXTS = [
     "Hello world",
@@ -39,19 +39,19 @@ def tinyllama_hf(tinyllama_tokenizer_path):
 
 
 # ---------------------------------------------------------------------------
-# gigatok.Tokenizer: unified loading and backend dispatch
+# gigatoken.Tokenizer: unified loading and backend dispatch
 # ---------------------------------------------------------------------------
 
 
 def test_tokenizer_from_path_dispatches_bpe(gpt2_tokenizer_path, gpt2_hf):
-    tok = gigatok.Tokenizer(gpt2_tokenizer_path)
+    tok = gigatoken.Tokenizer(gpt2_tokenizer_path)
     assert isinstance(tok.backend, BPETokenizer)
     for text in TEXTS:
         assert tok.encode(text).tolist() == gpt2_hf.encode(text).ids
 
 
 def test_tokenizer_from_path_dispatches_sentencepiece(tinyllama_tokenizer_path, tinyllama_hf):
-    tok = gigatok.Tokenizer(tinyllama_tokenizer_path)
+    tok = gigatoken.Tokenizer(tinyllama_tokenizer_path)
     assert isinstance(tok.backend, SentencePieceTokenizer)
     for text in TEXTS:
         expected = tinyllama_hf.encode(text, add_special_tokens=False).ids
@@ -60,7 +60,7 @@ def test_tokenizer_from_path_dispatches_sentencepiece(tinyllama_tokenizer_path, 
 
 def test_tokenizer_from_tokenizers_object(gpt2_hf):
     """Load from an already initialized tokenizers.Tokenizer."""
-    tok = gigatok.Tokenizer(gpt2_hf)
+    tok = gigatoken.Tokenizer(gpt2_hf)
     assert isinstance(tok.backend, BPETokenizer)
     text = "Hello world, this is a test."
     assert tok.encode(text).tolist() == gpt2_hf.encode(text).ids
@@ -71,7 +71,7 @@ def test_tokenizer_from_transformers_fast():
     transformers = pytest.importorskip("transformers")
     hf = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2")
     assert hf.is_fast
-    tok = gigatok.Tokenizer(hf)
+    tok = gigatoken.Tokenizer(hf)
     assert isinstance(tok.backend, BPETokenizer)
     text = "Hello world, this is a test."
     assert tok.encode(text).tolist() == hf.encode(text)
@@ -82,7 +82,7 @@ def test_tokenizer_from_json_with_legacy_string_merges(gpt2_tokenizer_path, gpt2
     with open(gpt2_tokenizer_path) as f:
         config = json.load(f)
     config["model"]["merges"] = [f"{a} {b}" for a, b in config["model"]["merges"]]
-    tok = gigatok.Tokenizer.from_json(json.dumps(config, ensure_ascii=False))
+    tok = gigatoken.Tokenizer.from_json(json.dumps(config, ensure_ascii=False))
     text = "Hello world, this is a test."
     assert tok.encode(text).tolist() == gpt2_hf.encode(text).ids
 
@@ -90,23 +90,23 @@ def test_tokenizer_from_json_with_legacy_string_merges(gpt2_tokenizer_path, gpt2
 def test_tokenizer_from_directory(tmp_path, gpt2_tokenizer_path, gpt2_hf):
     """A directory containing tokenizer.json also works."""
     (tmp_path / "tokenizer.json").write_bytes(gpt2_tokenizer_path.read_bytes())
-    tok = gigatok.Tokenizer(tmp_path)
+    tok = gigatoken.Tokenizer(tmp_path)
     assert tok.encode("Hello").tolist() == gpt2_hf.encode("Hello").ids
 
 
 def test_tokenizer_rejects_unknown_object():
     with pytest.raises(TypeError):
-        gigatok.Tokenizer(object())
+        gigatoken.Tokenizer(object())
 
 
 # ---------------------------------------------------------------------------
-# gigatok.Tokenizer: single API across both backends
+# gigatoken.Tokenizer: single API across both backends
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("fixture", ["gpt2_tokenizer_path", "tinyllama_tokenizer_path"])
 def test_unified_api(fixture, request):
-    tok = gigatok.Tokenizer(request.getfixturevalue(fixture))
+    tok = gigatoken.Tokenizer(request.getfixturevalue(fixture))
 
     ids = tok.encode(TEXTS[0])
     assert isinstance(ids, np.ndarray) and ids.dtype == np.uint32
@@ -127,7 +127,7 @@ def test_unified_api(fixture, request):
 
 @pytest.mark.parametrize("fixture", ["gpt2_tokenizer_path", "tinyllama_tokenizer_path"])
 def test_unified_encode_files(fixture, request, tmp_path):
-    tok = gigatok.Tokenizer(request.getfixturevalue(fixture))
+    tok = gigatoken.Tokenizer(request.getfixturevalue(fixture))
     path = tmp_path / "doc.txt"
     path.write_text(TEXTS[1])
     result = tok.encode_files(path)
@@ -136,7 +136,7 @@ def test_unified_encode_files(fixture, request, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# gigatok.HFCompat: transformers fast-tokenizer (TokenizersBackend) API
+# gigatoken.HFCompat: transformers fast-tokenizer (TokenizersBackend) API
 # ---------------------------------------------------------------------------
 #
 # gpt2_ref is a fully configured transformers tokenizer (named special
@@ -153,7 +153,7 @@ def gpt2_ref():
 
 @pytest.fixture(scope="module")
 def gpt2_compat(gpt2_ref):
-    return gigatok.Tokenizer(gpt2_ref).as_hf()
+    return gigatoken.Tokenizer(gpt2_ref).as_hf()
 
 
 @pytest.fixture(scope="module")
@@ -164,7 +164,7 @@ def tinyllama_ref(tinyllama_hf):
 
 @pytest.fixture(scope="module")
 def tinyllama_compat(tinyllama_tokenizer_path):
-    return gigatok.Tokenizer(tinyllama_tokenizer_path).as_hf()
+    return gigatoken.Tokenizer(tinyllama_tokenizer_path).as_hf()
 
 
 # The part of the PreTrainedTokenizerFast / TokenizersBackend surface that
@@ -330,20 +330,20 @@ def test_as_hf_accepts_all_source_kinds(gpt2_tokenizer_path, gpt2_hf, gpt2_ref):
     text = "Hello world, this is a test."
     expected = gpt2_ref.encode(text)
     for source in [gpt2_tokenizer_path, gpt2_hf, gpt2_ref]:
-        compat = gigatok.Tokenizer(source).as_hf()
+        compat = gigatoken.Tokenizer(source).as_hf()
         assert compat.encode(text) == expected
         assert compat.decode(expected) == text
 
 
-def test_hf_compat_requires_gigatok_tokenizer(gpt2_ref):
+def test_hf_compat_requires_gigatoken_tokenizer(gpt2_ref):
     """HFCompat no longer loads sources itself; wrap with Tokenizer first."""
     with pytest.raises(TypeError, match="as_hf"):
-        gigatok.HFCompat(gpt2_ref)
+        gigatoken.HFCompat(gpt2_ref)
 
 
 def test_as_hf_unavailable_without_hf_config(r50k_tiktoken_path):
     """A tokenizer loaded from a .tiktoken file has no tokenizer.json to
     reconstruct the HF-side configuration from."""
-    tok = gigatok.Tokenizer.from_tiktoken(r50k_tiktoken_path)
+    tok = gigatoken.Tokenizer.from_tiktoken(r50k_tiktoken_path)
     with pytest.raises(ValueError, match="tokenizer.json"):
         tok.as_hf()

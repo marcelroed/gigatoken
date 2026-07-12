@@ -1,4 +1,4 @@
-"""TiktokenCompat: a gigatok-backed drop-in for the `tiktoken.Encoding` API."""
+"""TiktokenCompat: a gigatoken-backed drop-in for the `tiktoken.Encoding` API."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import functools
 from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, Literal
 
-from gigatok._tokenizer import Tokenizer
+from gigatoken._tokenizer import Tokenizer
 
 if TYPE_CHECKING:
     import numpy as np
@@ -16,16 +16,16 @@ _ENDOFTEXT = "<|endoftext|>"
 
 
 class TiktokenCompat:
-    """Adapt a `gigatok.Tokenizer` to the `tiktoken.Encoding` API, so it can
+    """Adapt a `gigatoken.Tokenizer` to the `tiktoken.Encoding` API, so it can
     replace a tiktoken encoding in existing code: `encode`/`encode_ordinary`
     (and their batch variants), `decode`/`decode_bytes`/`decode_batch`,
     single-token conversions, and the vocab/special-token accessors.
 
-    Obtain one with `gigatok.Tokenizer.from_tiktoken(path).as_tiktoken()` (or
-    `gigatok.Tokenizer(source).as_tiktoken()` for any other source).
+    Obtain one with `gigatoken.Tokenizer.from_tiktoken(path).as_tiktoken()` (or
+    `gigatoken.Tokenizer(source).as_tiktoken()` for any other source).
 
     One semantic difference is surfaced loudly instead of silently diverging:
-    the gigatok backend always recognizes special tokens while encoding, so
+    the gigatoken backend always recognizes special tokens while encoding, so
     text that contains a special token which tiktoken would encode as
     ordinary text (encode_ordinary, or encode with the special neither
     allowed nor disallowed) raises NotImplementedError. The common paths —
@@ -33,11 +33,11 @@ class TiktokenCompat:
     tiktoken exactly.
     """
 
-    def __init__(self, tokenizer: Tokenizer, name: str = "gigatok") -> None:
+    def __init__(self, tokenizer: Tokenizer, name: str = "gigatoken") -> None:
         if not isinstance(tokenizer, Tokenizer):
             raise TypeError(
-                f"TiktokenCompat wraps a gigatok.Tokenizer, not {type(tokenizer).__name__!r}; construct "
-                "one first, e.g. gigatok.Tokenizer.from_tiktoken(path).as_tiktoken()"
+                f"TiktokenCompat wraps a gigatoken.Tokenizer, not {type(tokenizer).__name__!r}; construct "
+                "one first, e.g. gigatoken.Tokenizer.from_tiktoken(path).as_tiktoken()"
             )
         self.name = name
         self._tokenizer = tokenizer
@@ -45,7 +45,7 @@ class TiktokenCompat:
 
     @property
     def tokenizer(self) -> Tokenizer:
-        """The underlying gigatok Tokenizer (numpy/awkward-native API)."""
+        """The underlying gigatoken Tokenizer (numpy/awkward-native API)."""
         return self._tokenizer
 
     # -- encoding -----------------------------------------------------------
@@ -73,7 +73,7 @@ class TiktokenCompat:
         ordinary = sorted(present - allowed)
         if ordinary:
             raise NotImplementedError(
-                f"gigatok always recognizes special tokens while encoding, so {ordinary[0]!r} cannot be "
+                f"gigatoken always recognizes special tokens while encoding, so {ordinary[0]!r} cannot be "
                 "encoded as ordinary text; pass it in allowed_special (to encode it as a special token) "
                 "or leave it disallowed (to reject it, tiktoken's default)"
             )
@@ -125,7 +125,7 @@ class TiktokenCompat:
         return self._id_by_bytes[piece]
 
     def encode_with_unstable(self, *args: object, **kwargs: object) -> tuple[list[int], list[list[int]]]:
-        raise NotImplementedError("gigatok.TiktokenCompat does not support encode_with_unstable")
+        raise NotImplementedError("gigatoken.TiktokenCompat does not support encode_with_unstable")
 
     # -- decoding -----------------------------------------------------------
 
@@ -148,7 +148,7 @@ class TiktokenCompat:
         return [self.decode_bytes(tokens) for tokens in batch]
 
     def decode_with_offsets(self, tokens: Sequence[int]) -> tuple[str, list[int]]:
-        raise NotImplementedError("gigatok.TiktokenCompat does not support decode_with_offsets")
+        raise NotImplementedError("gigatoken.TiktokenCompat does not support decode_with_offsets")
 
     # -- vocab and special tokens ---------------------------------------------
 

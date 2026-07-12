@@ -1097,7 +1097,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gigatok"
+name = "gigatoken"
 version = "0.3.0"
 dependencies = [
  "aho-corasick",

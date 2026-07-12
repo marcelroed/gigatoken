@@ -4,7 +4,7 @@
 //! r50k is also what ByteLevel tokenizers like ModernBERT resolve to. Used
 //! for interleaved A/B runs of the mask-scanner schemes.
 
-use gigatok_rs::pretokenize::{
+use gigatoken_rs::pretokenize::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
 };

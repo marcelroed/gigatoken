@@ -4,7 +4,7 @@ can substitute it entirely.
 
 Covers the fast pretokenizers, added-token extraction, NFC normalization
 (Qwen2), and the BPE merge itself. The large-scale test streams OWT and
-encodes both sides in parallel: HF via encode_batch_fast (rayon), gigatok via
+encodes both sides in parallel: HF via encode_batch_fast (rayon), gigatoken via
 encode_batch (rayon).
 
 Environment knobs for the OWT test:
@@ -32,15 +32,15 @@ DOC_BYTES = 1024 * 1024  # target document size within a slab
 # ---------------------------------------------------------------------------
 
 
-def _assert_ids_match(hf_tok, gigatok_tok, text: str):
-    # add_special_tokens=False: gigatok encodes raw text without template
+def _assert_ids_match(hf_tok, gigatoken_tok, text: str):
+    # add_special_tokens=False: gigatoken encodes raw text without template
     # wrapping, so HF post-processors that inject tokens (ModernBERT's
     # TemplateProcessing adds [CLS]/[SEP]) must be disabled. A no-op for the
     # other tokenizers, whose ByteLevel post-processors add nothing.
     hf_ids = hf_tok.encode(text, add_special_tokens=False).ids
-    gigatok_ids = gigatok_tok.encode(text.encode("utf-8")).tolist()
-    assert gigatok_ids == hf_ids, (
-        f"Mismatch for {text!r}:\n  HF:    {hf_ids}\n  gigatok: {gigatok_ids}"
+    gigatoken_ids = gigatoken_tok.encode(text.encode("utf-8")).tolist()
+    assert gigatoken_ids == hf_ids, (
+        f"Mismatch for {text!r}:\n  HF:    {hf_ids}\n  gigatoken: {gigatoken_ids}"
     )
 
 
@@ -127,34 +127,34 @@ SPECIAL_TEXTS = [
 
 
 @pytest.mark.parametrize("text", TEXTS, ids=lambda t: repr(t)[:50])
-def test_encode_matches_hf(hf_tok, gigatok_tok, text):
-    _assert_ids_match(hf_tok, gigatok_tok, text)
+def test_encode_matches_hf(hf_tok, gigatoken_tok, text):
+    _assert_ids_match(hf_tok, gigatoken_tok, text)
 
 
 @pytest.mark.parametrize("text", SPECIAL_TEXTS, ids=lambda t: repr(t)[:50])
-def test_added_tokens_match_hf(hf_tok, gigatok_tok, text):
-    _assert_ids_match(hf_tok, gigatok_tok, text)
+def test_added_tokens_match_hf(hf_tok, gigatoken_tok, text):
+    _assert_ids_match(hf_tok, gigatoken_tok, text)
 
 
-def test_endoftext_id(spec, gigatok_tok):
-    ids = gigatok_tok.encode(f"a{spec.eot_text}b".encode()).tolist()
+def test_endoftext_id(spec, gigatoken_tok):
+    ids = gigatoken_tok.encode(f"a{spec.eot_text}b".encode()).tolist()
     assert spec.eot_id in ids
 
 
 @pytest.mark.parametrize("text", TEXTS + SPECIAL_TEXTS, ids=lambda t: repr(t)[:50])
-def test_decode_roundtrip(spec, gigatok_tok, text):
-    ids = gigatok_tok.encode(text.encode("utf-8"))
+def test_decode_roundtrip(spec, gigatoken_tok, text):
+    ids = gigatoken_tok.encode(text.encode("utf-8"))
     # An NFC-normalizing tokenizer roundtrips to the normalized form,
     # exactly like HF.
     expected = unicodedata.normalize("NFC", text) if spec.normalizes_nfc else text
-    assert gigatok_tok.decode(ids) == expected.encode("utf-8")
+    assert gigatoken_tok.decode(ids) == expected.encode("utf-8")
 
 
-def test_encode_batch_matches_encode(gigatok_tok):
+def test_encode_batch_matches_encode(gigatoken_tok):
     docs = [t.encode("utf-8") for t in TEXTS + SPECIAL_TEXTS]
-    batched = gigatok_tok.encode_batch(docs)
+    batched = gigatoken_tok.encode_batch(docs)
     for doc, batch_ids in zip(docs, batched):
-        assert gigatok_tok.encode(doc).tolist() == batch_ids.tolist()
+        assert gigatoken_tok.encode(doc).tolist() == batch_ids.tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -214,11 +214,11 @@ def _first_diff(a: list[int], b: list[int]) -> int:
 
 
 @pytest.mark.skipif(not OWT_PATH.exists(), reason="OWT data not available")
-def test_owt_matches_hf(hf_tok, gigatok_tok):
+def test_owt_matches_hf(hf_tok, gigatoken_tok):
     """Compare token IDs against HF on OWT (100 MB unless OWT_MAX_BYTES).
 
     Both sides are internally multithreaded: HF's encode_batch_fast and
-    gigatok's encode_batch each fan documents out over rayon.
+    gigatoken's encode_batch each fan documents out over rayon.
     """
     total_bytes = 0
     total_docs = 0
@@ -231,9 +231,9 @@ def test_owt_matches_hf(hf_tok, gigatok_tok):
         texts = [d.decode("utf-8") for d in docs]
 
         hf_encodings = hf_tok.encode_batch_fast(texts, add_special_tokens=False)
-        gigatok_arrays = gigatok_tok.encode_batch(docs)
+        gigatoken_arrays = gigatoken_tok.encode_batch(docs)
 
-        for i, (enc, jt) in enumerate(zip(hf_encodings, gigatok_arrays)):
+        for i, (enc, jt) in enumerate(zip(hf_encodings, gigatoken_arrays)):
             hf_ids = np.asarray(enc.ids, dtype=np.uint32)
             total_tokens += len(hf_ids)
             if not np.array_equal(hf_ids, jt):
@@ -245,9 +245,9 @@ def test_owt_matches_hf(hf_tok, gigatok_tok):
                     print(
                         f"\nMISMATCH slab {slab_idx} doc {i} "
                         f"(byte ~{total_bytes + i * DOC_BYTES}):\n"
-                        f"  lens: HF {len(h)} vs gigatok {len(j)}, first diff at {d}\n"
+                        f"  lens: HF {len(h)} vs gigatoken {len(j)}, first diff at {d}\n"
                         f"  HF:    ...{h[ctx_lo:d + 5]}\n"
-                        f"  gigatok: ...{j[ctx_lo:d + 5]}\n"
+                        f"  gigatoken: ...{j[ctx_lo:d + 5]}\n"
                         f"  HF toks there: "
                         f"{[hf_tok.decode([t]) for t in h[ctx_lo:d + 5]]!r}"
                     )

@@ -23,7 +23,7 @@ from typing import Any
 _REPO_ID_RE = re.compile(r"[A-Za-z0-9][\w.\-]*(?:/[\w.\-]+)?")
 
 # Filename suffixes of local tokenizer files (tokenizer.json contents and raw
-# sentencepiece models — the formats `gigatok._load.hf.to_tokenizer_json`
+# sentencepiece models — the formats `gigatoken._load.hf.to_tokenizer_json`
 # reads from disk). A name ending in one of these is never treated as a Hub
 # repo id, so a mistyped local path fails fast instead of hitting the network.
 TOKENIZER_FILE_SUFFIXES = (".json", ".model")
@@ -76,7 +76,7 @@ def download_hub_file(repo_id: str, filename: str = "tokenizer.json", *, revisio
 
     endpoint = (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
     url = f"{endpoint}/{repo_id}/resolve/{revision}/{filename}"
-    headers = {"User-Agent": "gigatok"}
+    headers = {"User-Agent": "gigatoken"}
     token = get_hf_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"

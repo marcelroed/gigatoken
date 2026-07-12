@@ -5,7 +5,7 @@ use std::{hash::BuildHasher, time::Instant};
 use itertools::Itertools;
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
-use gigatok_rs::utils::chunks_at_utf8_boundaries;
+use gigatoken_rs::utils::chunks_at_utf8_boundaries;
 use voracious_radix_sort::RadixSort;
 
 pub fn main() {

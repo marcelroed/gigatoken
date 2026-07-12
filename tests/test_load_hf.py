@@ -2,9 +2,9 @@ import sys
 
 import pytest
 
-from gigatok import Tokenizer
-from gigatok._load.hf import load_hf_tokenizer
-from gigatok._load.hub import get_hf_token, looks_like_repo_id
+from gigatoken import Tokenizer
+from gigatoken._load.hf import load_hf_tokenizer
+from gigatoken._load.hub import get_hf_token, looks_like_repo_id
 
 
 @pytest.mark.parametrize("name_or_path", ["openai-community/gpt2", "Qwen/Qwen2-1.5B-Instruct"])
@@ -43,7 +43,7 @@ def test_tokenizer_from_repo_id_without_huggingface_hub(monkeypatch, gpt2_tokeni
             opened.append(req.full_url)
             return _FakeResponse()
 
-    monkeypatch.setattr("gigatok._load.hub.urllib.request.build_opener", lambda *handlers: _FakeOpener())
+    monkeypatch.setattr("gigatoken._load.hub.urllib.request.build_opener", lambda *handlers: _FakeOpener())
     tokenizer = Tokenizer("openai-community/gpt2")
     assert len(opened) == 1
     assert opened[0].endswith("/openai-community/gpt2/resolve/main/tokenizer.json")

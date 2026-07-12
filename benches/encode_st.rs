@@ -1,5 +1,5 @@
-use gigatok_rs::load_tokenizer::hf::load_hf_bpe;
-use gigatok_rs::pretokenize::FastR50kPretokenizer;
+use gigatoken_rs::load_tokenizer::hf::load_hf_bpe;
+use gigatoken_rs::pretokenize::FastR50kPretokenizer;
 use std::path::PathBuf;
 use std::time::Instant;
 

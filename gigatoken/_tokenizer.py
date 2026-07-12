@@ -6,8 +6,8 @@ import json
 import os
 from typing import TYPE_CHECKING, Any
 
-from gigatok._load.hf import capture_named_special_tokens, to_tokenizer_json
-from gigatok.gigatok_rs import BPETokenizer, SentencePieceTokenizer, load_hf_json
+from gigatoken._load.hf import capture_named_special_tokens, to_tokenizer_json
+from gigatoken.gigatoken_rs import BPETokenizer, SentencePieceTokenizer, load_hf_json
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -17,10 +17,10 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
-    from gigatok._hf_compat import HFCompat
-    from gigatok._load.hf import HFTokenizerLike
-    from gigatok._tiktoken_compat import TiktokenCompat
-    from gigatok.gigatok_rs import FileSource
+    from gigatoken._hf_compat import HFCompat
+    from gigatoken._load.hf import HFTokenizerLike
+    from gigatoken._tiktoken_compat import TiktokenCompat
+    from gigatoken.gigatoken_rs import FileSource
 
 _BACKEND_TYPES = (BPETokenizer, SentencePieceTokenizer)
 
@@ -43,7 +43,7 @@ class Tokenizer:
     For drop-in use in code written against another tokenizer API, wrap it
     with `as_hf()` (transformers fast-tokenizer API) or `as_tiktoken()`
     (tiktoken.Encoding API), e.g.
-    `hf_compatible = gigatok.Tokenizer(hf_tokenizer).as_hf()`.
+    `hf_compatible = gigatoken.Tokenizer(hf_tokenizer).as_hf()`.
     """
 
     def __init__(
@@ -98,22 +98,22 @@ class Tokenizer:
         honored. Neither sentencepiece nor protobuf needs to be installed."""
         from pathlib import Path as _Path
 
-        from gigatok._load.sentencepiece import sentencepiece_to_tokenizer_json
+        from gigatoken._load.sentencepiece import sentencepiece_to_tokenizer_json
 
         data = source if isinstance(source, bytes) else _Path(source).read_bytes()
         return cls.from_json(sentencepiece_to_tokenizer_json(data))
 
     def as_hf(self) -> HFCompat:
-        """Wrap this tokenizer in a `gigatok.HFCompat`, a drop-in for the
+        """Wrap this tokenizer in a `gigatoken.HFCompat`, a drop-in for the
         HuggingFace `transformers` fast-tokenizer API."""
-        from gigatok._hf_compat import HFCompat
+        from gigatoken._hf_compat import HFCompat
 
         return HFCompat(self)
 
     def as_tiktoken(self) -> TiktokenCompat:
-        """Wrap this tokenizer in a `gigatok.TiktokenCompat`, a drop-in for
+        """Wrap this tokenizer in a `gigatoken.TiktokenCompat`, a drop-in for
         the `tiktoken.Encoding` API."""
-        from gigatok._tiktoken_compat import TiktokenCompat
+        from gigatoken._tiktoken_compat import TiktokenCompat
 
         return TiktokenCompat(self)
 

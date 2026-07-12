@@ -6,7 +6,7 @@
 //!
 //! Usage: cargo run --release --example cache_memory [tokenizer.json]
 
-use gigatok_rs::load_tokenizer::hf::load_hf_bpe;
+use gigatoken_rs::load_tokenizer::hf::load_hf_bpe;
 use std::path::PathBuf;
 use std::time::Instant;
 

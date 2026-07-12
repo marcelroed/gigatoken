@@ -10,8 +10,8 @@
 //!           ENCODE_MB=500 cargo bench --bench encode_doc
 //!           TOKENIZER_JSON=data/qwen3_5_tokenizer.json cargo bench --bench encode_doc
 
-use gigatok_rs::load_tokenizer::hf::load_hf_bpe;
-use gigatok_rs::{WorkerPool, encode_docs_ragged};
+use gigatoken_rs::load_tokenizer::hf::load_hf_bpe;
+use gigatoken_rs::{WorkerPool, encode_docs_ragged};
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Instant;

@@ -2,14 +2,14 @@
 //! handed to the library's parallel encode path (`encode_docs_ragged`) —
 //! the same chunking policy, pretoken-safe splitting, and persistent worker
 //! pool as `BPETokenizer.encode_batch` / `encode_files` — so this measures
-//! gigatok's own parallelism, not a bench-local split.
+//! gigatoken's own parallelism, not a bench-local split.
 //!
 //! Run with: cargo bench --bench encode                 (full OWT)
 //!           ENCODE_MB=500 cargo bench --bench encode
 //!           TOKENIZER_JSON=data/qwen3_5_tokenizer.json cargo bench --bench encode
 
-use gigatok_rs::load_tokenizer::hf::load_hf_bpe;
-use gigatok_rs::{WorkerPool, encode_docs_ragged};
+use gigatoken_rs::load_tokenizer::hf::load_hf_bpe;
+use gigatoken_rs::{WorkerPool, encode_docs_ragged};
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Instant;

@@ -1,4 +1,4 @@
-"""Verify gigatok encoding matches HuggingFace on curated DCLM data.
+"""Verify gigatoken encoding matches HuggingFace on curated DCLM data.
 
 The corpus (~20 MB) is DCLM-baseline documents selected for tokenizer-hostile
 content — CJK/RTL scripts, NFC-divergent text, emoji, control whitespace,
@@ -13,8 +13,8 @@ import awkward as ak
 import pytest
 from tokenizers import Tokenizer as HFTokenizer
 
-import gigatok
-from gigatok import JsonlFileSource
+import gigatoken
+from gigatoken import JsonlFileSource
 
 TOKENIZER_FIXTURES = [
     "tinyllama_tokenizer_path",  # SentencePiece backend
@@ -44,7 +44,7 @@ def test_encode_dclm_matches_hf(tok_fixture, request, dclm_docs):
     """Exact token-ID parity with HuggingFace over the full DCLM sample."""
     path = request.getfixturevalue(tok_fixture)
     hf_tok = HFTokenizer.from_file(str(path))
-    tok = gigatok.Tokenizer(path)
+    tok = gigatoken.Tokenizer(path)
 
     hf_ids = [e.ids for e in hf_tok.encode_batch(dclm_docs, add_special_tokens=False)]
     got = ak.to_list(tok.encode_batch(dclm_docs))
@@ -59,17 +59,17 @@ def test_encode_dclm_matches_hf(tok_fixture, request, dclm_docs):
         for j in range(min(len(ours), len(theirs))):
             if ours[j] != theirs[j]:
                 ctx = bytes(tok.decode(ours[max(0, j - 3) : j]))
-                print(f"\n  Doc {i}: first diff at token {j}, gigatok={ours[j]}, hf={theirs[j]}, context=...{ctx!r}")
+                print(f"\n  Doc {i}: first diff at token {j}, gigatoken={ours[j]}, hf={theirs[j]}, context=...{ctx!r}")
                 break
         else:
-            print(f"\n  Doc {i}: length differs gigatok={len(ours)}, hf={len(theirs)}")
+            print(f"\n  Doc {i}: length differs gigatoken={len(ours)}, hf={len(theirs)}")
 
     assert mismatches == 0, f"{mismatches}/{len(dclm_docs)} documents differ"
 
 
 def test_encode_batch_matches_single_docs(olmo3_tokenizer_path, dclm_docs):
     """Parallel batch encoding agrees with one-doc-at-a-time encoding."""
-    tok = gigatok.Tokenizer(olmo3_tokenizer_path)
+    tok = gigatoken.Tokenizer(olmo3_tokenizer_path)
     batch = ak.to_list(tok.encode_batch(dclm_docs))
     for doc, row in zip(dclm_docs, batch):
         assert tok.encode(doc).tolist() == row
@@ -77,7 +77,7 @@ def test_encode_batch_matches_single_docs(olmo3_tokenizer_path, dclm_docs):
 
 def test_encode_files_dclm_fixture(olmo3_tokenizer_path, dclm_sample_path, dclm_docs):
     """encode_files on the fixture .jsonl.zst matches encode_batch on its docs."""
-    tok = gigatok.Tokenizer(olmo3_tokenizer_path)
+    tok = gigatoken.Tokenizer(olmo3_tokenizer_path)
     from_file = ak.to_list(tok.encode_files(JsonlFileSource([dclm_sample_path])))
     assert len(from_file) == len(dclm_docs)
     assert from_file == ak.to_list(tok.encode_batch(dclm_docs))
@@ -85,6 +85,6 @@ def test_encode_files_dclm_fixture(olmo3_tokenizer_path, dclm_sample_path, dclm_
 
 def test_decode_roundtrip_dclm(olmo3_tokenizer_path, dclm_docs):
     """Byte-level BPE without normalizer must roundtrip every document."""
-    tok = gigatok.Tokenizer(olmo3_tokenizer_path)
+    tok = gigatoken.Tokenizer(olmo3_tokenizer_path)
     for doc in dclm_docs:
         assert bytes(tok.decode(tok.encode(doc))) == doc.encode("utf-8")

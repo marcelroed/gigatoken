@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from gigatok.gigatok_rs import BPETokenizer
+from gigatoken.gigatoken_rs import BPETokenizer
 
 OWT_PATH = Path.home() / "data" / "owt_train.txt"
 DOC_BYTES = 8 * 2**20  # several fragments at the 1 MiB minimum chunk size
@@ -30,19 +30,19 @@ def big_text() -> str:
     return seed * (DOC_BYTES // len(seed))
 
 
-def test_whole_doc_parallel_matches_serial(gigatok_tok, big_text, tmp_path):
+def test_whole_doc_parallel_matches_serial(gigatoken_tok, big_text, tmp_path):
     path = tmp_path / "doc.txt"
     path.write_text(big_text)
-    parallel = gigatok_tok.encode_files([str(path)])  # whole file = one doc
-    serial = gigatok_tok.encode(big_text)
+    parallel = gigatoken_tok.encode_files([str(path)])  # whole file = one doc
+    serial = gigatoken_tok.encode(big_text)
     assert len(parallel) == 1
     assert parallel[0].tolist() == serial.tolist()
 
 
-def test_single_doc_batch_matches_serial(gigatok_tok, big_text):
-    out = gigatok_tok.encode_batch([big_text])
+def test_single_doc_batch_matches_serial(gigatoken_tok, big_text):
+    out = gigatoken_tok.encode_batch([big_text])
     assert len(out) == 1
-    assert out[0].tolist() == gigatok_tok.encode(big_text).tolist()
+    assert out[0].tolist() == gigatoken_tok.encode(big_text).tolist()
 
 
 def test_space_added_token_chunked_matches_serial(

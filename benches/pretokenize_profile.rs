@@ -2,7 +2,7 @@
 //! single-pass `main` (no criterion, no BPE encode) that `black_box`es every
 //! yielded pretoken slice, so the slice production can't be optimized away.
 
-use gigatok_rs::pretokenize::FastR50kPretokenizer;
+use gigatoken_rs::pretokenize::FastR50kPretokenizer;
 use std::hint::black_box;
 use std::time::Instant;
 

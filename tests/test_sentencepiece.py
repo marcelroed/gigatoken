@@ -16,7 +16,7 @@ from tokenizers import Tokenizer as HFTokenizer
 from tokenizers import normalizers, pre_tokenizers
 from tokenizers.models import BPE
 
-from gigatok import Tokenizer
+from gigatoken import Tokenizer
 
 TEXTS = [
     "Hello, world!",
@@ -53,11 +53,11 @@ TEXTS = [
 ]
 
 
-def _assert_parity(hf_tok: HFTokenizer, gigatok_tok: Tokenizer, texts=TEXTS):
+def _assert_parity(hf_tok: HFTokenizer, gigatoken_tok: Tokenizer, texts=TEXTS):
     for text in texts:
         hf_ids = hf_tok.encode(text, add_special_tokens=False).ids
-        gigatok_ids = gigatok_tok.encode(text).tolist()
-        assert gigatok_ids == hf_ids, f"Mismatch for {text!r}:\n  HF:      {hf_ids}\n  gigatok: {gigatok_ids}"
+        gigatoken_ids = gigatoken_tok.encode(text).tolist()
+        assert gigatoken_ids == hf_ids, f"Mismatch for {text!r}:\n  HF:      {hf_ids}\n  gigatoken: {gigatoken_ids}"
 
 
 # ---------------------------------------------------------------------------
@@ -74,16 +74,16 @@ def test_hf_json_parity(path_fixture, request):
     added tokens and the legacy Llama normalized=true added tokens."""
     path = request.getfixturevalue(path_fixture)
     hf_tok = HFTokenizer.from_file(str(path))
-    gigatok_tok = Tokenizer(path)
-    _assert_parity(hf_tok, gigatok_tok)
+    gigatoken_tok = Tokenizer(path)
+    _assert_parity(hf_tok, gigatoken_tok)
 
 
 def test_hf_json_decode_parity(tinyllama_tokenizer_path):
     hf_tok = HFTokenizer.from_file(str(tinyllama_tokenizer_path))
-    gigatok_tok = Tokenizer(tinyllama_tokenizer_path)
+    gigatoken_tok = Tokenizer(tinyllama_tokenizer_path)
     for text in TEXTS:
         ids = hf_tok.encode(text, add_special_tokens=False).ids
-        assert gigatok_tok.decode(ids).decode("utf-8", "replace") == hf_tok.decode(ids, skip_special_tokens=False)
+        assert gigatoken_tok.decode(ids).decode("utf-8", "replace") == hf_tok.decode(ids, skip_special_tokens=False)
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +130,8 @@ def test_metaspace_added_token_matrix(scheme, split, lstrip, rstrip, normalized)
         ]
     )
     hf_tok.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme=scheme, split=split)
-    gigatok_tok = Tokenizer(hf_tok)
-    _assert_parity(hf_tok, gigatok_tok, _MATRIX_TEXTS)
+    gigatoken_tok = Tokenizer(hf_tok)
+    _assert_parity(hf_tok, gigatoken_tok, _MATRIX_TEXTS)
 
 
 def test_prepend_replace_normalizer_matches_hf():
@@ -139,8 +139,8 @@ def test_prepend_replace_normalizer_matches_hf():
     hf_tok = HFTokenizer(BPE(_VOCAB, _MERGES, unk_token="<unk>", fuse_unk=True, byte_fallback=True))
     hf_tok.add_tokens([AddedToken("<s>", normalized=False, special=True)])
     hf_tok.normalizer = normalizers.Sequence([normalizers.Prepend("▁"), normalizers.Replace(" ", "▁")])
-    gigatok_tok = Tokenizer(hf_tok)
-    _assert_parity(hf_tok, gigatok_tok, _MATRIX_TEXTS)
+    gigatoken_tok = Tokenizer(hf_tok)
+    _assert_parity(hf_tok, gigatoken_tok, _MATRIX_TEXTS)
 
 
 def test_unsupported_normalizer_errors():

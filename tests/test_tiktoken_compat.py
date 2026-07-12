@@ -1,6 +1,6 @@
-"""Tests for the gigatok.TiktokenCompat wrapper.
+"""Tests for the gigatoken.TiktokenCompat wrapper.
 
-gigatok.Tokenizer(source).as_tiktoken() adapts a gigatok Tokenizer to the
+gigatoken.Tokenizer(source).as_tiktoken() adapts a gigatoken Tokenizer to the
 `tiktoken.Encoding` API so it can replace a tiktoken encoding in existing
 code. Parity is asserted against the real r50k_base encoding.
 """
@@ -8,7 +8,7 @@ code. Parity is asserted against the real r50k_base encoding.
 import pytest
 import tiktoken
 
-import gigatok
+import gigatoken
 
 TEXTS = [
     "Hello, world!",
@@ -31,8 +31,8 @@ def r50k_ref() -> tiktoken.Encoding:
 
 
 @pytest.fixture(scope="module")
-def r50k_compat(r50k_tiktoken_path) -> gigatok.TiktokenCompat:
-    return gigatok.Tokenizer.from_tiktoken(r50k_tiktoken_path).as_tiktoken()
+def r50k_compat(r50k_tiktoken_path) -> gigatoken.TiktokenCompat:
+    return gigatoken.Tokenizer.from_tiktoken(r50k_tiktoken_path).as_tiktoken()
 
 
 # The part of the tiktoken.Encoding surface that TiktokenCompat implements.
@@ -97,7 +97,7 @@ def test_encode_disallowed_special_raises(r50k_ref, r50k_compat):
 
 
 def test_encode_special_as_ordinary_raises_loudly(r50k_compat):
-    """tiktoken would encode the special as plain text here; the gigatok
+    """tiktoken would encode the special as plain text here; the gigatoken
     backend cannot, and must raise rather than silently diverge."""
     with pytest.raises(NotImplementedError):
         r50k_compat.encode_ordinary(SPECIAL_TEXT)
@@ -141,7 +141,7 @@ def test_vocab_and_specials_match(r50k_ref, r50k_compat):
 def test_as_tiktoken_from_hf_source(gpt2_tokenizer_path, r50k_ref):
     """GPT-2's tokenizer.json is the same vocabulary as r50k_base, so a
     tokenizer.json-loaded compat matches the real tiktoken encoding too."""
-    compat = gigatok.Tokenizer(gpt2_tokenizer_path).as_tiktoken()
+    compat = gigatoken.Tokenizer(gpt2_tokenizer_path).as_tiktoken()
     assert compat.special_tokens_set == {ENDOFTEXT}
     assert compat.eot_token == r50k_ref.eot_token
     for text in TEXTS:
@@ -151,6 +151,6 @@ def test_as_tiktoken_from_hf_source(gpt2_tokenizer_path, r50k_ref):
         compat.encode(SPECIAL_TEXT)
 
 
-def test_tiktoken_compat_requires_gigatok_tokenizer(r50k_ref):
+def test_tiktoken_compat_requires_gigatoken_tokenizer(r50k_ref):
     with pytest.raises(TypeError, match="as_tiktoken"):
-        gigatok.TiktokenCompat(r50k_ref)
+        gigatoken.TiktokenCompat(r50k_ref)

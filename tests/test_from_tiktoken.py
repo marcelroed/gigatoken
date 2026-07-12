@@ -1,7 +1,7 @@
 import pytest
 import tiktoken
 
-from gigatok.gigatok_rs import BPETokenizer
+from gigatoken.gigatoken_rs import BPETokenizer
 
 
 @pytest.fixture
@@ -15,7 +15,7 @@ def r50k(r50k_tiktoken_path) -> tuple[tiktoken.Encoding, BPETokenizer]:
 def _assert_same(tt_enc, bpe_tok, text: str):
     expected = tt_enc.encode(text)
     actual = bpe_tok.encode(text.encode("utf-8")).tolist()
-    assert actual == expected, f"Mismatch for {text!r}:\n  tiktoken: {expected}\n  gigatok:    {actual}"
+    assert actual == expected, f"Mismatch for {text!r}:\n  tiktoken: {expected}\n  gigatoken:    {actual}"
 
 
 SIMPLE_STRINGS = [
@@ -90,7 +90,7 @@ def test_paragraphs(r50k, text):
 
 
 def test_roundtrip_token_count(r50k):
-    """Token counts should match between tiktoken and gigatok."""
+    """Token counts should match between tiktoken and gigatoken."""
     tt, bpe = r50k
     text = "Here is a moderately long sentence with some numbers 42 and symbols @#$%."
     assert len(tt.encode(text)) == len(bpe.encode(text.encode("utf-8")))

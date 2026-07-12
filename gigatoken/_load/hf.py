@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
 
-from gigatok._load.hub import download_hub_file, looks_like_repo_id
+from gigatoken._load.hub import download_hub_file, looks_like_repo_id
 
 if TYPE_CHECKING:
     import tokenizers
@@ -69,11 +69,11 @@ def to_tokenizer_json(source: TokenizerJsonSource) -> str | bytes:
         if path.is_dir():
             path = path / "tokenizer.json"
         if path.is_file():
-            # Suffix dispatch; keep gigatok._load.hub.TOKENIZER_FILE_SUFFIXES
+            # Suffix dispatch; keep gigatoken._load.hub.TOKENIZER_FILE_SUFFIXES
             # in sync so these names are never mistaken for Hub repo ids.
             if path.suffix == ".model":
                 # A raw sentencepiece model rather than a tokenizer.json.
-                from gigatok._load.sentencepiece import sentencepiece_to_tokenizer_json
+                from gigatoken._load.sentencepiece import sentencepiece_to_tokenizer_json
 
                 return sentencepiece_to_tokenizer_json(path.read_bytes())
             return path.read_bytes()

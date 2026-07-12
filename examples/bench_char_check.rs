@@ -28,7 +28,7 @@ pub fn main() {
     let bytes = text.as_bytes();
 
     // Use the chunks_at_utf8_boundaries function from utils.rs
-    use gigatok_rs::utils::chunks_at_utf8_boundaries;
+    use gigatoken_rs::utils::chunks_at_utf8_boundaries;
 
     let boundaries = if bytes.len() > 100_000 {
         chunks_at_utf8_boundaries(bytes, n_threads)
