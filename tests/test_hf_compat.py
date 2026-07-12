@@ -2,8 +2,9 @@
 
 gigatok.Tokenizer loads standard-format tokenizers (paths or already
 initialized HuggingFace tokenizer objects) and picks the right Rust backend.
-gigatok.HFCompat wraps the same sources behind the `tokenizers.Tokenizer` API
-so it can replace a HuggingFace tokenizer in existing code.
+gigatok.Tokenizer(source).as_hf() adapts it to the `transformers`
+fast-tokenizer API so it can replace a HuggingFace tokenizer in existing
+code.
 """
 
 import json
@@ -152,7 +153,7 @@ def gpt2_ref():
 
 @pytest.fixture(scope="module")
 def gpt2_compat(gpt2_ref):
-    return gigatok.HFCompat(gpt2_ref)
+    return gigatok.Tokenizer(gpt2_ref).as_hf()
 
 
 @pytest.fixture(scope="module")
@@ -163,7 +164,7 @@ def tinyllama_ref(tinyllama_hf):
 
 @pytest.fixture(scope="module")
 def tinyllama_compat(tinyllama_tokenizer_path):
-    return gigatok.HFCompat(tinyllama_tokenizer_path)
+    return gigatok.Tokenizer(tinyllama_tokenizer_path).as_hf()
 
 
 # The part of the PreTrainedTokenizerFast / TokenizersBackend surface that
@@ -324,11 +325,25 @@ def test_hf_compat_unsupported_features_raise(gpt2_compat):
         gpt2_compat.encode("Hello", text_pair="world")
 
 
-def test_hf_compat_accepts_all_source_kinds(gpt2_tokenizer_path, gpt2_hf, gpt2_ref):
+def test_as_hf_accepts_all_source_kinds(gpt2_tokenizer_path, gpt2_hf, gpt2_ref):
     """Path, tokenizers.Tokenizer, and transformers tokenizer all load."""
     text = "Hello world, this is a test."
     expected = gpt2_ref.encode(text)
     for source in [gpt2_tokenizer_path, gpt2_hf, gpt2_ref]:
-        compat = gigatok.HFCompat(source)
+        compat = gigatok.Tokenizer(source).as_hf()
         assert compat.encode(text) == expected
         assert compat.decode(expected) == text
+
+
+def test_hf_compat_requires_gigatok_tokenizer(gpt2_ref):
+    """HFCompat no longer loads sources itself; wrap with Tokenizer first."""
+    with pytest.raises(TypeError, match="as_hf"):
+        gigatok.HFCompat(gpt2_ref)
+
+
+def test_as_hf_unavailable_without_hf_config(r50k_tiktoken_path):
+    """A tokenizer loaded from a .tiktoken file has no tokenizer.json to
+    reconstruct the HF-side configuration from."""
+    tok = gigatok.Tokenizer.from_tiktoken(r50k_tiktoken_path)
+    with pytest.raises(ValueError, match="tokenizer.json"):
+        tok.as_hf()
