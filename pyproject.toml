@@ -82,6 +82,7 @@ dev = [
     "huggingface-hub>=0.20.0",
     "transformers>=4.17.0",
     "ty>=0.0.25",
+    "sentencepiece>=0.2.1",
 ]
 
 [tool.ruff]

@@ -37,10 +37,45 @@ def train_bpe(
     separator: bytes | None = None,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]: ...
 
+class PadTruncate:
+    """How encode_batch_padded assembles rows into a rectangular matrix; see
+    src/bindings/padding.rs for the semantics. Frozen: fields are validated
+    at construction and read-only afterwards."""
+
+    def __init__(
+        self,
+        pad_id: int,
+        max_length: int | None = None,
+        pad_to_max_length: bool = False,
+        truncate: bool = False,
+        pad_left: bool = False,
+        truncate_left: bool = False,
+        prefix: list[int] = [],
+        suffix: list[int] = [],
+    ) -> None: ...
+
+    pad_id: int
+    max_length: int | None
+    pad_to_max_length: bool
+    truncate: bool
+    pad_left: bool
+    truncate_left: bool
+    prefix: list[int]
+    suffix: list[int]
+    def __repr__(self) -> str: ...
+
 class BPETokenizer:
     def __new__(cls) -> "BPETokenizer": ...
     def encode(self, input: str | bytes) -> npt.NDArray[np.uint32]: ...
     def encode_batch(self, inputs: list[str] | list[bytes] | ak.Array) -> ak.Array: ...
+    def encode_batch_padded(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        options: PadTruncate,
+    ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.int64]]:
+        """encode_batch as one padded (rows x width) matrix plus each row's
+        real (unpadded) length; prefer the keyword-argument wrapper
+        gigatoken.Tokenizer.encode_batch_padded."""
     def encode_files(
         self,
         source: FileSource | str | Path | PathLike[str] | list[str | Path | PathLike[str]],
@@ -69,6 +104,14 @@ class SentencePieceTokenizer:
     def from_hf(path: str | Path) -> "SentencePieceTokenizer": ...
     def encode(self, input: str | bytes) -> npt.NDArray[np.uint32]: ...
     def encode_batch(self, inputs: list[str] | list[bytes] | ak.Array) -> ak.Array: ...
+    def encode_batch_padded(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        options: PadTruncate,
+    ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.int64]]:
+        """encode_batch as one padded (rows x width) matrix plus each row's
+        real (unpadded) length; prefer the keyword-argument wrapper
+        gigatoken.Tokenizer.encode_batch_padded."""
     def encode_no_normalize(self, text: str) -> npt.NDArray[np.uint32]: ...
     def encode_files(
         self,

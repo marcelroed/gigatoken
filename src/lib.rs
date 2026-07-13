@@ -1,6 +1,8 @@
 #![feature(test)]
 #![feature(portable_simd)]
 
+pub(crate) mod batch;
+pub(crate) mod bindings;
 pub(crate) mod bpe;
 pub(crate) mod bpe_train;
 pub(crate) mod encode;
@@ -10,715 +12,32 @@ pub(crate) mod simd;
 pub(crate) mod token;
 pub(crate) mod unicode_tables;
 pub mod utils;
+pub use crate::batch::{WorkerPool, encode_docs_ragged};
 pub use crate::bpe::Tokenizer;
 pub use crate::bpe::sentencepiece::EncodeState;
-use crate::input::file_source::{
-    DocFormat, FileSourceSpec, LoadedFile, chunk_ranges, detect_default_format, load_file,
-};
-use crate::input::{DocumentIter, MmappedFile, Resource};
 pub mod load_tokenizer;
-use itertools::Itertools;
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
+
+use crate::batch::{
+    ChunkTokens, EncodeChunk, assemble_ragged, chunk_target_bytes, encode_chunks_pooled,
+    encode_into, for_each_doc, map_maybe_par, sp_encode_into,
+};
+use crate::bindings::bridge::{
+    EncodeInput, encode_batch_ragged, extract_doc, extract_token_ids, merges_to_pylist,
+    ragged_to_python, utf8_doc, vocab_to_pydict,
+};
+use crate::bindings::padding;
+use crate::bindings::pretokenize::{PretokenizerIter, pretokenized_counts, pretokenizer};
+use crate::bindings::sources::{
+    FileSource, JsonlFileSource, TextFileSource, load_files, resolve_files_source,
+};
+use crate::bindings::train::train_bpe;
+use crate::input::file_source::{DocFormat, chunk_ranges};
+use numpy::{IntoPyArray, PyArray1};
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
-use pyo3::types::{IntoPyDict, PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict};
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock, TryLockError};
-
-// ---------------------------------------------------------------------------
-// Helper: convert BPEResult to Python objects
-// ---------------------------------------------------------------------------
-
-/// Vocab dict plus ordered merge pairs, as Python objects.
-type PyVocabAndMerges<'py> = (
-    Bound<'py, PyDict>,
-    Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>,
-);
-
-fn bpe_result_to_python<'py>(
-    py: Python<'py>,
-    result: bpe_train::BPEResult,
-) -> PyResult<PyVocabAndMerges<'py>> {
-    let vocab_py = result
-        .vocab
-        .into_iter()
-        .map(|(k, v)| (k, PyBytes::new(py, &v)))
-        .sorted_by(|e1, e2| Ord::cmp(&e1.0, &e2.0))
-        .into_py_dict(py);
-    let merges_py: Vec<_> = result
-        .merges
-        .into_iter()
-        .map(|(k, v)| (PyBytes::new(py, &k), PyBytes::new(py, &v)))
-        .collect();
-    Ok((vocab_py?, merges_py))
-}
-
-fn parse_tie_breaking(s: &str) -> PyResult<bpe_train::TieBreaking> {
-    match s {
-        "huggingface" => Ok(bpe_train::TieBreaking::HuggingFace),
-        "raw_token_ids" => Ok(bpe_train::TieBreaking::RawTokenIds),
-        "assembled_bytes" => Ok(bpe_train::TieBreaking::AssembledBytes),
-        other => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "tie_breaking must be 'huggingface', 'raw_token_ids', or 'assembled_bytes', got {other:?}"
-        ))),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FileSource Python classes
-// ---------------------------------------------------------------------------
-
-/// Base class for file sources. Not directly constructible from Python —
-/// use `TextFileSource` or `JsonlFileSource`, which pin down the document
-/// format and its parameters. Compression (.gz/.zst) is always detected
-/// from the file extension, independent of the source type.
-#[pyclass(subclass, from_py_object)]
-#[derive(Clone)]
-struct FileSource {
-    paths: Vec<PathBuf>,
-    format: DocFormat,
-}
-
-#[pymethods]
-impl FileSource {
-    fn __repr__(&self) -> String {
-        let n = self.paths.len();
-        match &self.format {
-            DocFormat::Jsonl { field } => {
-                format!("JsonlFileSource(paths=[{n} files], field={field:?})")
-            }
-            DocFormat::Text {
-                separator: Some(sep),
-            } => format!(
-                "TextFileSource(paths=[{n} files], separator={:?})",
-                String::from_utf8_lossy(sep)
-            ),
-            DocFormat::Text { separator: None } => {
-                format!("TextFileSource(paths=[{n} files])")
-            }
-        }
-    }
-}
-
-/// Plain-text files. With `separator`, documents are the pieces between
-/// separator occurrences (the separator itself belongs to no document);
-/// without one, each file is a single document.
-#[pyclass(extends = FileSource)]
-struct TextFileSource;
-
-#[pymethods]
-impl TextFileSource {
-    #[new]
-    #[pyo3(signature = (paths, separator = None))]
-    fn new(paths: Vec<PathBuf>, separator: Option<Vec<u8>>) -> PyClassInitializer<Self> {
-        PyClassInitializer::from(FileSource {
-            paths,
-            format: DocFormat::Text { separator },
-        })
-        .add_subclass(Self)
-    }
-}
-
-/// JSON Lines files: one document per line, text taken from `field`.
-#[pyclass(extends = FileSource)]
-struct JsonlFileSource;
-
-#[pymethods]
-impl JsonlFileSource {
-    #[new]
-    #[pyo3(signature = (paths, field = "text"))]
-    fn new(paths: Vec<PathBuf>, field: &str) -> PyClassInitializer<Self> {
-        PyClassInitializer::from(FileSource {
-            paths,
-            format: DocFormat::Jsonl {
-                field: field.to_string(),
-            },
-        })
-        .add_subclass(Self)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// train_bpe Python function
-// ---------------------------------------------------------------------------
-
-#[pyfunction]
-#[allow(clippy::type_complexity)]
-#[pyo3(signature = (in_data, vocab_size, special_tokens, tie_breaking = "huggingface", separator = None))]
-fn train_bpe<'py>(
-    py: Python<'py>,
-    in_data: Bound<'py, PyAny>,
-    vocab_size: usize,
-    special_tokens: Vec<String>,
-    tie_breaking: &str,
-    separator: Option<&[u8]>,
-) -> PyResult<(
-    Bound<'py, PyDict>,
-    Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>,
-)> {
-    assert!(
-        vocab_size <= 2_usize.pow(32),
-        "vocab_size must be less than 2^32"
-    );
-    let tie_breaking = parse_tie_breaking(tie_breaking)?;
-    let separator = separator.unwrap_or(pretokenize::DEFAULT_SEPARATOR);
-
-    // --- FileSource: multi-file parallel processing ---
-    if let Ok(file_source) = in_data.extract::<FileSource>() {
-        let spec = FileSourceSpec {
-            paths: file_source.paths,
-            format: file_source.format,
-        };
-        let counts = spec.pretokenize().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
-                "FileSource processing failed: {}",
-                e
-            ))
-        })?;
-        let result = bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
-        return bpe_result_to_python(py, result);
-    }
-
-    // --- Single bytes or file path ---
-    let mmap_resource;
-    let bytes: &[u8] = if in_data.is_instance_of::<PyBytes>() {
-        in_data.extract::<&[u8]>()?
-    } else if let Ok(path) = in_data.extract::<PathBuf>() {
-        if let Some(ext) = path.extension()
-            && ext == "parquet"
-        {
-            #[cfg(not(feature = "parquet"))]
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "The 'parquet' feature is not enabled in this build, cannot read parquet files",
-            ));
-            #[cfg(feature = "parquet")]
-            {
-                let counts = pretokenize::pretokenize_par_parquet(&path);
-                let result = bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
-                return bpe_result_to_python(py, result);
-            }
-        }
-        mmap_resource = MmappedFile::open(&path).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
-                "Failed to open file {:?}: {}",
-                path, e
-            ))
-        })?;
-        mmap_resource.as_bytes()
-    } else {
-        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-            "in_data must be bytes, a path, or a FileSource",
-        ));
-    };
-
-    let counts = pretokenize::pretokenize_par_bytes(bytes, separator);
-    let result = bpe_train::train_bpe(counts, vocab_size, special_tokens, tie_breaking);
-    bpe_result_to_python(py, result)
-}
-
-// ---------------------------------------------------------------------------
-// Other Python classes and functions
-// ---------------------------------------------------------------------------
-
-/// A document to encode: str (UTF-8 text) or bytes. Both variants borrow
-/// the Python object's buffer without copying and are usable with the GIL
-/// released. Paths are deliberately not accepted here — encoding from files
-/// goes through `encode_files`, which mmaps and chunks them.
-enum EncodeInput {
-    Text(PyBackedStr),
-    Bytes(PyBackedBytes),
-}
-
-impl EncodeInput {
-    fn as_bytes(&self) -> &[u8] {
-        match self {
-            EncodeInput::Text(s) => s.as_bytes(),
-            EncodeInput::Bytes(b) => b,
-        }
-    }
-}
-
-/// Shared front-end of encode_batch: extract the documents (a list of str, a
-/// list of bytes, or an awkward Array of strings — whose flat buffer is used
-/// directly, with no per-document Python objects), run `encode` on the
-/// resolved byte slices with the GIL released, and hand the ragged result to
-/// Python as an awkward.Array.
-fn encode_batch_ragged<'py>(
-    py: Python<'py>,
-    inputs: &Bound<'py, PyAny>,
-    encode: impl Fn(&[&[u8]]) -> PyResult<(Vec<u32>, Vec<i64>)> + Send + Sync,
-) -> PyResult<Bound<'py, PyAny>> {
-    // Awkward input: encode straight from the flat content buffer.
-    if let Some((content, in_counts)) = extract_awkward_docs(inputs)? {
-        let content = content.readonly();
-        let bytes: &[u8] = content.as_slice()?;
-        let (flat, counts) = py.detach(|| -> PyResult<_> {
-            let mut docs = Vec::with_capacity(in_counts.len());
-            let mut pos = 0usize;
-            for &n in &in_counts {
-                docs.push(&bytes[pos..pos + n as usize]);
-                pos += n as usize;
-            }
-            encode(&docs)
-        })?;
-        return ragged_to_python(py, flat, counts);
-    }
-
-    let inputs: Vec<Bound<'py, PyAny>> = inputs.extract().map_err(|_| {
-        PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-            "expected a list of str, a list of bytes, or an awkward Array of strings",
-        )
-    })?;
-    if inputs.is_empty() {
-        return ragged_to_python(py, vec![], vec![]);
-    }
-    let mut docs = Vec::with_capacity(inputs.len());
-    docs.push(extract_doc(&inputs[0])?);
-    for obj in &inputs[1..] {
-        let doc = extract_doc(obj)?;
-        if std::mem::discriminant(&doc) != std::mem::discriminant(&docs[0]) {
-            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                "all documents in a batch must be of the same type \
-                 (a list of str or a list of bytes)",
-            ));
-        }
-        docs.push(doc);
-    }
-
-    let (flat, counts) = py.detach(|| {
-        let slices: Vec<&[u8]> = docs.iter().map(|d| d.as_bytes()).collect();
-        encode(&slices)
-    })?;
-    ragged_to_python(py, flat, counts)
-}
-
-/// Extract one document, pointing path-holders at encode_files.
-fn extract_doc(obj: &Bound<'_, PyAny>) -> PyResult<EncodeInput> {
-    if let Ok(s) = obj.extract::<PyBackedStr>() {
-        return Ok(EncodeInput::Text(s));
-    }
-    if let Ok(b) = obj.extract::<PyBackedBytes>() {
-        return Ok(EncodeInput::Bytes(b));
-    }
-    let hint = if obj.extract::<PathBuf>().is_ok() {
-        "; to encode files, use encode_files"
-    } else {
-        ""
-    };
-    Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-        "expected str or bytes, got {}{hint}",
-        obj.get_type()
-    )))
-}
-
-/// Append one document's token ids to `ids` and its row length to `lens`.
-fn encode_into(tokenizer: &mut Tokenizer, doc: &[u8], ids: &mut Vec<u32>, lens: &mut Vec<i64>) {
-    let before = ids.len();
-    tokenizer.encode_with_added_tokens(doc, |tokens| {
-        for &e in tokens {
-            ids.push(e.into())
-        }
-    });
-    lens.push((ids.len() - before) as i64);
-}
-
-/// View one document's bytes as UTF-8 text for the SentencePiece path.
-fn utf8_doc(doc: &[u8]) -> PyResult<&str> {
-    std::str::from_utf8(doc).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("invalid UTF-8 in document: {e}"))
-    })
-}
-
-/// SentencePiece analog of `encode_into`, using `encoder`'s pretoken cache.
-fn sp_encode_into(
-    encoder: &mut bpe::sentencepiece::Encoder<'_>,
-    text: &str,
-    ids: &mut Vec<u32>,
-    lens: &mut Vec<i64>,
-) {
-    let before = ids.len();
-    encoder.encode_raw_cb(text, &mut |tokens| {
-        ids.extend(tokens.iter().map(|&t| u32::from(t)))
-    });
-    lens.push((ids.len() - before) as i64);
-}
-
-/// Iterate the documents in a byte region per `format`: JSONL lines,
-/// separator-delimited text, or the whole region as one document.
-fn for_each_doc(bytes: &[u8], format: &DocFormat, mut f: impl FnMut(&[u8])) {
-    use crate::input::jsonl::JsonLinesSlice;
-    match format {
-        DocFormat::Jsonl { field } => {
-            for doc in JsonLinesSlice::new(bytes, field) {
-                f(doc.as_ref());
-            }
-        }
-        DocFormat::Text {
-            separator: Some(sep),
-        } if !sep.is_empty() => {
-            for doc in DocumentIter::new(bytes, sep) {
-                f(doc);
-            }
-        }
-        DocFormat::Text { .. } => f(bytes),
-    }
-}
-
-/// Extract decode() input: a numpy uint32 array or any sequence of ints.
-fn extract_token_ids(tokens: &Bound<'_, PyAny>) -> PyResult<Vec<crate::token::TokenId>> {
-    if let Ok(arr) = tokens.cast::<PyArray1<u32>>() {
-        let arr = arr.readonly();
-        Ok(arr.as_slice()?.iter().map(|&t| t.into()).collect())
-    } else {
-        Ok(tokens
-            .extract::<Vec<u32>>()?
-            .into_iter()
-            .map(Into::into)
-            .collect())
-    }
-}
-
-/// Build a `vocab` getter's dict from `(id, bytes)` entries.
-fn vocab_to_pydict<'py, 'a>(
-    py: Python<'py>,
-    entries: impl Iterator<Item = (u32, &'a [u8])>,
-) -> PyResult<Bound<'py, PyDict>> {
-    entries
-        .map(|(id, bytes)| (id, PyBytes::new(py, bytes)))
-        .into_py_dict(py)
-}
-
-/// Build a `merges` getter's list from `(left, right)` byte pairs.
-fn merges_to_pylist<'py>(
-    py: Python<'py>,
-    entries: Vec<(&[u8], &[u8])>,
-) -> Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
-    entries
-        .into_iter()
-        .map(|(a, b)| (PyBytes::new(py, a), PyBytes::new(py, b)))
-        .collect()
-}
-
-/// Work unit for parallel encoding.
-enum EncodeChunk<'a> {
-    /// A run of whole documents, one output row each.
-    Docs(Vec<&'a [u8]>),
-    /// A byte region holding many documents, split during encoding
-    /// (JSONL lines or separator-delimited text).
-    Region {
-        bytes: &'a [u8],
-        format: &'a DocFormat,
-    },
-    /// A pretoken-safe fragment of one oversized document (see
-    /// `pretokenize::safe_split_ranges`). Fragments of a document are
-    /// consecutive chunks; `first` marks the document's first fragment.
-    Fragment { bytes: &'a [u8], first: bool },
-}
-
-/// Token output of one chunk: a flat id buffer plus one length per document
-/// row. `continues` means the first length extends the previous chunk's
-/// last row (a non-first fragment of a split document).
-struct ChunkTokens {
-    ids: Vec<u32>,
-    lens: Vec<i64>,
-    continues: bool,
-}
-
-fn encode_chunk(tokenizer: &mut Tokenizer, chunk: &EncodeChunk) -> ChunkTokens {
-    let mut ids = Vec::new();
-    let mut lens = Vec::new();
-    let mut continues = false;
-    match chunk {
-        EncodeChunk::Docs(docs) => {
-            for doc in docs {
-                encode_into(tokenizer, doc, &mut ids, &mut lens);
-            }
-        }
-        EncodeChunk::Region { bytes, format } => {
-            for_each_doc(bytes, format, |doc| {
-                encode_into(tokenizer, doc, &mut ids, &mut lens)
-            })
-        }
-        EncodeChunk::Fragment { bytes, first } => {
-            encode_into(tokenizer, bytes, &mut ids, &mut lens);
-            continues = !*first;
-        }
-    }
-    ChunkTokens {
-        ids,
-        lens,
-        continues,
-    }
-}
-
-/// Group documents into parallel chunks of at least `target` cumulative
-/// bytes. A document larger than the target is split into consecutive
-/// Fragment chunks at pretoken-safe boundaries that no added-token
-/// occurrence straddles, so even a single huge document is encoded across
-/// all cores with token-identical output.
-fn build_doc_chunks<'a>(
-    docs: &[&'a [u8]],
-    target: usize,
-    added_tokens: &[&[u8]],
-) -> Vec<EncodeChunk<'a>> {
-    let mut chunks = Vec::new();
-    let mut group: Vec<&[u8]> = Vec::new();
-    let mut acc = 0usize;
-    for &doc in docs {
-        if doc.len() > 2 * target {
-            if !group.is_empty() {
-                chunks.push(EncodeChunk::Docs(std::mem::take(&mut group)));
-                acc = 0;
-            }
-            for (k, r) in pretokenize::safe_split_ranges(doc, target, added_tokens)
-                .into_iter()
-                .enumerate()
-            {
-                chunks.push(EncodeChunk::Fragment {
-                    bytes: &doc[r],
-                    first: k == 0,
-                });
-            }
-            continue;
-        }
-        group.push(doc);
-        acc += doc.len();
-        if acc >= target {
-            chunks.push(EncodeChunk::Docs(std::mem::take(&mut group)));
-            acc = 0;
-        }
-    }
-    if !group.is_empty() {
-        chunks.push(EncodeChunk::Docs(group));
-    }
-    chunks
-}
-
-/// Map items serially when there is at most one (small inputs skip the
-/// thread fan-out), in parallel otherwise.
-fn map_maybe_par<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    use rayon::prelude::*;
-    if items.len() <= 1 {
-        items.iter().map(&f).collect()
-    } else {
-        items.par_iter().map(&f).collect()
-    }
-}
-
-/// Encode all chunks with pooled workers — in parallel when there is more
-/// than one chunk, serially otherwise.
-fn encode_chunks_pooled(
-    workers: &WorkerPool,
-    proto: &Tokenizer,
-    chunks: &[EncodeChunk],
-) -> Vec<ChunkTokens> {
-    map_maybe_par(chunks, |c| {
-        workers.with_worker(proto, |tok| encode_chunk(tok, c))
-    })
-}
-
-/// Merge per-chunk outputs into one flat id buffer and per-document row
-/// counts. The flat gather copies chunk buffers in parallel into a single
-/// allocation.
-fn assemble_ragged(chunks: Vec<ChunkTokens>) -> (Vec<u32>, Vec<i64>) {
-    use rayon::prelude::*;
-    let mut counts: Vec<i64> = Vec::new();
-    for chunk in &chunks {
-        let mut lens = chunk.lens.iter().copied();
-        if chunk.continues
-            && let Some(l) = lens.next()
-        {
-            *counts
-                .last_mut()
-                .expect("continuation fragment before any document") += l;
-        }
-        counts.extend(lens);
-    }
-    let total: usize = chunks.iter().map(|c| c.ids.len()).sum();
-    let mut flat = vec![0u32; total];
-    let mut rest: &mut [u32] = &mut flat;
-    let mut slices = Vec::with_capacity(chunks.len());
-    for chunk in &chunks {
-        let (head, tail) = rest.split_at_mut(chunk.ids.len());
-        slices.push(head);
-        rest = tail;
-    }
-    slices
-        .into_par_iter()
-        .zip(chunks.par_iter())
-        .for_each(|(dst, chunk)| dst.copy_from_slice(&chunk.ids));
-    (flat, counts)
-}
-
-/// If `inputs` is an awkward Array of strings or bytestrings, pull out its
-/// flat uint8 content and per-document counts directly — no per-document
-/// Python objects are materialized. Returns None when `inputs` is not an
-/// awkward Array (or awkward is not importable).
-/// Flat uint8 content array plus per-document byte counts.
-type FlatDocs<'py> = (Bound<'py, numpy::PyArray1<u8>>, Vec<i64>);
-
-fn extract_awkward_docs<'py>(inputs: &Bound<'py, PyAny>) -> PyResult<Option<FlatDocs<'py>>> {
-    let py = inputs.py();
-    let Ok(ak) = py.import("awkward") else {
-        return Ok(None);
-    };
-    if !inputs.is_instance(&ak.getattr("Array")?)? {
-        return Ok(None);
-    }
-    let type_err = |_| {
-        PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-            "awkward input must be an array of strings or bytestrings",
-        )
-    };
-    // Stripping the string/bytestring parameters turns the array into plain
-    // lists of uint8, whose flattened content and row lengths are views of
-    // the existing buffers.
-    let raw = ak
-        .call_method1("without_parameters", (inputs,))
-        .map_err(type_err)?;
-    let flat = ak.call_method1("flatten", (&raw,)).map_err(type_err)?;
-    let content = ak
-        .call_method1("to_numpy", (flat,))?
-        .cast_into::<PyArray1<u8>>()
-        .map_err(|e| type_err(e.into()))?;
-    let counts = ak
-        .call_method1("to_numpy", (ak.call_method1("num", (&raw,))?,))?
-        .cast_into::<PyArray1<i64>>()
-        .map_err(|e| type_err(e.into()))?;
-    let counts = counts.readonly().as_slice()?.to_vec();
-    Ok(Some((content, counts)))
-}
-
-/// Hand a ragged token batch to Python as an `awkward.Array`: one flat
-/// contents array plus per-document counts — two allocations total instead
-/// of one numpy array per document. Falls back to a list of zero-copy numpy
-/// views when awkward is not importable.
-fn ragged_to_python<'py>(
-    py: Python<'py>,
-    flat: Vec<u32>,
-    counts: Vec<i64>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let n_rows = counts.len();
-    let content = flat.into_pyarray(py);
-    let counts = counts.into_pyarray(py);
-    match py.import("awkward") {
-        Ok(ak) => ak.call_method1("unflatten", (content, counts)),
-        Err(_) => {
-            if n_rows == 0 {
-                return Ok(pyo3::types::PyList::empty(py).into_any());
-            }
-            let np = py.import("numpy")?;
-            let bounds = np.call_method1("cumsum", (&counts,))?;
-            let split_at = bounds.get_item(pyo3::types::PySlice::new(py, 0, -1, 1))?;
-            np.call_method1("split", (content, split_at))
-        }
-    }
-}
-
-/// Parallel chunks must hold at least this many bytes: a chunk this size
-/// encodes for tens of milliseconds, so worker acquisition and rayon
-/// scheduling/work-stealing overhead is noise. An input that does not fill
-/// more than one chunk is encoded serially — for small inputs the thread
-/// fan-out costs more than it saves.
-const MIN_CHUNK_BYTES: usize = 1 << 20;
-
-/// Target bytes per parallel chunk: ~16 chunks per thread for work-stealing
-/// load balancing, floored at MIN_CHUNK_BYTES so chunks stay coarse.
-fn chunk_target_bytes(total_bytes: usize) -> usize {
-    (total_bytes / (16 * rayon::current_num_threads())).max(MIN_CHUNK_BYTES)
-}
-
-/// Persistent pool of forked tokenizer workers used by encode_batch and
-/// encode_files. One slot per rayon thread, forked lazily on first use and
-/// retained for the tokenizer's lifetime, so each worker's pretoken cache
-/// stays warm when encoding is invoked repeatedly (e.g. in a loop).
-pub struct WorkerPool {
-    slots: OnceLock<Vec<Mutex<Option<Tokenizer>>>>,
-}
-
-impl Default for WorkerPool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WorkerPool {
-    pub fn new() -> Self {
-        Self {
-            slots: OnceLock::new(),
-        }
-    }
-
-    /// Run `f` with exclusive access to a pooled worker. Rayon never runs
-    /// more tasks concurrently than it has threads, and there is one slot
-    /// per thread, so a free slot always exists; the yield loop only spins
-    /// when non-rayon threads encode at the same time.
-    fn with_worker<R>(&self, proto: &Tokenizer, f: impl FnOnce(&mut Tokenizer) -> R) -> R {
-        let slots = self.slots.get_or_init(|| {
-            (0..rayon::current_num_threads())
-                .map(|_| Mutex::new(None))
-                .collect()
-        });
-        loop {
-            for slot in slots {
-                match slot.try_lock() {
-                    Ok(mut guard) => {
-                        return f(guard.get_or_insert_with(|| proto.fork()));
-                    }
-                    Err(TryLockError::Poisoned(poisoned)) => {
-                        // A worker panicked mid-encode; its cache may be
-                        // inconsistent, so rebuild it from the prototype.
-                        let mut guard = poisoned.into_inner();
-                        *guard = None;
-                        return f(guard.get_or_insert_with(|| proto.fork()));
-                    }
-                    Err(TryLockError::WouldBlock) => {}
-                }
-            }
-            std::thread::yield_now();
-        }
-    }
-}
-
-/// Resolve an encode_files argument: a FileSource (TextFileSource /
-/// JsonlFileSource), a single path, or a list of paths. Bare paths get a
-/// default format from the first path's extension — all inputs in a batch
-/// are assumed to be of the same type.
-fn resolve_files_source(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<PathBuf>, DocFormat)> {
-    if let Ok(fs) = obj.extract::<FileSource>() {
-        return Ok((fs.paths, fs.format));
-    }
-    if let Ok(path) = obj.extract::<PathBuf>() {
-        let format = detect_default_format(&path);
-        return Ok((vec![path], format));
-    }
-    if let Ok(paths) = obj.extract::<Vec<PathBuf>>() {
-        let format = paths
-            .first()
-            .map(|p| detect_default_format(p))
-            .unwrap_or(DocFormat::Text { separator: None });
-        return Ok((paths, format));
-    }
-    Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-        "expected a TextFileSource/JsonlFileSource, a path, or a list of paths, got {}",
-        obj.get_type()
-    )))
-}
-
-/// Load all files in parallel: mmap when stored uncompressed, decompress
-/// .gz/.zst into memory otherwise (parallel chunking needs random access).
-fn load_files(paths: &[PathBuf]) -> PyResult<Vec<LoadedFile>> {
-    use rayon::prelude::*;
-    paths
-        .par_iter()
-        .map(|p| {
-            load_file(p).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}: {e}", p.display()))
-            })
-        })
-        .collect()
-}
 
 #[pyclass]
 struct BPETokenizer {
@@ -726,25 +45,8 @@ struct BPETokenizer {
     workers: WorkerPool,
 }
 
-/// Shared core of encode_batch / encode_files for pre-resolved document
-/// slices: chunk (splitting oversized documents at pretoken-safe
-/// boundaries), encode with pooled workers, and assemble the ragged result
-/// (one flat id buffer plus per-document row lengths). Public so Rust
-/// benches exercise the identical parallel path as the Python bindings.
-pub fn encode_docs_ragged(
-    workers: &WorkerPool,
-    proto: &Tokenizer,
-    docs: &[&[u8]],
-) -> (Vec<u32>, Vec<i64>) {
-    let total: usize = docs.iter().map(|d| d.len()).sum();
-    let added = proto.added_token_contents();
-    let chunks = build_doc_chunks(docs, chunk_target_bytes(total), &added);
-    let outs = encode_chunks_pooled(workers, proto, &chunks);
-    assemble_ragged(outs)
-}
-
 impl BPETokenizer {
-    /// See `encode_docs_ragged`. Call with the GIL released.
+    /// See `batch::encode_docs_ragged`. Call with the GIL released.
     fn encode_slices_ragged(&self, docs: &[&[u8]]) -> (Vec<u32>, Vec<i64>) {
         encode_docs_ragged(&self.workers, &self.tokenizer, docs)
     }
@@ -808,6 +110,20 @@ impl BPETokenizer {
         inputs: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         encode_batch_ragged(py, &inputs, |docs| Ok(self.encode_slices_ragged(docs)))
+    }
+
+    /// encode_batch assembled into one padded/truncated (rows x width)
+    /// uint32 matrix plus each row's real length, serving the compatibility
+    /// APIs — see src/bindings/padding.rs for the semantics (`options` is a
+    /// PadTruncate) and gigatoken.Tokenizer.encode_batch_padded for the
+    /// friendly keyword signature.
+    fn encode_batch_padded<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Bound<'py, PyAny>,
+        options: padding::PadTruncate,
+    ) -> PyResult<padding::PaddedMatrix<'py>> {
+        padding::encode_batch_matrix(py, &inputs, options, |docs| Ok(self.encode_slices_ragged(docs)))
     }
 
     /// Encode all documents from files in parallel, releasing the GIL.
@@ -957,6 +273,17 @@ impl SentencePieceTokenizer {
         encode_batch_ragged(py, &inputs, |docs| self.encode_slices_ragged(docs))
     }
 
+    /// See BPETokenizer.encode_batch_padded: the same padded-matrix batch
+    /// encode, for the SentencePiece backend.
+    fn encode_batch_padded<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Bound<'py, PyAny>,
+        options: padding::PadTruncate,
+    ) -> PyResult<padding::PaddedMatrix<'py>> {
+        padding::encode_batch_matrix(py, &inputs, options, |docs| self.encode_slices_ragged(docs))
+    }
+
     /// Encode a single document (str or UTF-8 bytes), with a pretoken cache
     /// that persists across calls.
     fn encode<'py>(
@@ -1103,52 +430,6 @@ fn load_hf_json(py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     }
 }
 
-#[pyclass]
-struct PretokenizerIter {
-    /// Byte offset into `bytes`; the pretokenizer is stateless beyond this, so
-    /// each `__next__` resumes a fresh `FastR50kPretokenizer` at this position.
-    pos: usize,
-    bytes: Py<PyBytes>,
-}
-
-#[pymethods]
-impl PretokenizerIter {
-    fn __iter__<'py>(slf: PyRef<'py, Self>) -> PyRef<'py, PretokenizerIter> {
-        slf
-    }
-
-    fn __next__<'py>(&'py mut self, py: Python<'py>) -> Option<&'py [u8]> {
-        let bytes: &'py [u8] = self.bytes.as_bytes(py);
-        let mut iter = pretokenize::FastR50kPretokenizer::with_pos(bytes, self.pos);
-        let result = iter.next();
-        self.pos = iter.pos();
-        Some(result?.0)
-    }
-}
-
-#[pyfunction]
-fn pretokenizer<'py>(text: Bound<'py, PyBytes>) -> PyResult<PretokenizerIter> {
-    Ok(PretokenizerIter {
-        pos: 0,
-        bytes: text.into(),
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (text, separator = None))]
-fn pretokenized_counts<'py>(
-    text: Bound<'py, PyBytes>,
-    separator: Option<&[u8]>,
-) -> PyResult<Vec<(Bound<'py, PyBytes>, usize)>> {
-    let separator = separator.unwrap_or(pretokenize::DEFAULT_SEPARATOR);
-    let tokens_counts = pretokenize::pretokenize_par_bytes(text.as_bytes(), separator);
-    let tokens_counts = tokens_counts
-        .into_iter()
-        .map(|(k, v)| (PyBytes::new(text.py(), k.as_ref()), v))
-        .collect::<Vec<_>>();
-    Ok(tokens_counts)
-}
-
 // ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
@@ -1160,6 +441,7 @@ fn gigatoken_rs<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
     m.add_class::<TextFileSource>()?;
     m.add_class::<JsonlFileSource>()?;
     m.add_class::<PretokenizerIter>()?;
+    m.add_class::<padding::PadTruncate>()?;
     m.add_class::<BPETokenizer>()?;
     m.add_class::<SentencePieceTokenizer>()?;
     m.add_function(wrap_pyfunction!(pretokenizer, m)?)?;

@@ -7,7 +7,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from gigatoken._load.hf import capture_named_special_tokens, to_tokenizer_json
-from gigatoken.gigatoken_rs import BPETokenizer, SentencePieceTokenizer, load_hf_json
+from gigatoken.gigatoken_rs import BPETokenizer, PadTruncate, SentencePieceTokenizer, load_hf_json
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -167,6 +167,33 @@ class Tokenizer:
 
     def encode_batch(self, inputs: list[str] | list[bytes] | ak.Array) -> ak.Array:
         return self._backend.encode_batch(inputs)
+
+    def encode_batch_padded(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        pad_id: int,
+        max_length: int | None = None,
+        pad_to_max_length: bool = False,
+        truncate: bool = False,
+        pad_left: bool = False,
+        truncate_left: bool = False,
+        prefix: list[int] | None = None,
+        suffix: list[int] | None = None,
+    ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.int64]]:
+        """encode_batch assembled in Rust into one padded (rows x width)
+        uint32 matrix, plus each row's real (unpadded) length; see
+        gigatoken_rs.BPETokenizer.encode_batch_padded for the semantics."""
+        options = PadTruncate(
+            pad_id,
+            max_length=max_length,
+            pad_to_max_length=pad_to_max_length,
+            truncate=truncate,
+            pad_left=pad_left,
+            truncate_left=truncate_left,
+            prefix=prefix or [],
+            suffix=suffix or [],
+        )
+        return self._backend.encode_batch_padded(inputs, options)
 
     def encode_files(
         self,
