@@ -2,9 +2,15 @@
 //! `BPETokenizer.encode_files` on a single plain-text file: the entire input
 //! is ONE document handed to the library's parallel encode path
 //! (`encode_docs_ragged`), which splits it at pretoken-safe boundaries
-//! (token-identical to a serial pass), encodes with a pooled worker per
-//! thread, and gathers one flat id buffer. Five rounds, each with a fresh
-//! worker pool so every round is a cold-cache sample.
+//! (token-identical to a serial pass), encodes with a persistent worker
+//! pool, and gathers one flat id buffer.
+//!
+//! One round per process by default: a first pass over a fresh dataset is
+//! the workload that matters, and everything a second in-process round
+//! reuses — worker pretoken caches, allocator arenas, faulted pages, grown
+//! buffer capacities — makes later rounds unrealistically fast. Restart the
+//! binary to collect independent samples; ENCODE_ROUNDS>1 remains available
+//! for cache-behavior experiments.
 //!
 //! Run with: cargo bench --bench encode_doc              (2 GB default)
 //!           ENCODE_MB=500 cargo bench --bench encode_doc
@@ -21,6 +27,13 @@ mod common;
 const DEFAULT_MB: usize = 2000;
 
 fn main() {
+    // Some session managers launch children with PR_SET_THP_DISABLE, which
+    // silently vetoes MADV_HUGEPAGE; clear it so the bench measures the
+    // tokenizer, not the launcher's memory policy (same as encode_st).
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_THP_DISABLE, 0, 0, 0, 0);
+    }
     let tokenizer_json = std::env::var("TOKENIZER_JSON")
         .unwrap_or_else(|_| "data/olmo3_tokenizer.json".to_string());
     let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&tokenizer_json);
@@ -31,12 +44,14 @@ fn main() {
     let size_mb = input.len() as f64 / 1e6;
     eprintln!("1 document, {} threads\n", rayon::current_num_threads());
 
-    for round in 0..5 {
-        // Fresh worker pool every round: the pool retains one forked
-        // tokenizer (and its pretoken caches) per rayon thread, so reusing
-        // it would measure warm-cache reruns of the same input rather than
-        // realistic first-pass encoding. Each round is an independent
-        // cold-cache sample.
+    let rounds: usize = std::env::var("ENCODE_ROUNDS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1);
+    for round in 0..rounds {
+        // Fresh worker pool per round so extra rounds at least start with
+        // cold pretoken caches (the pool retains one forked tokenizer per
+        // rayon thread).
         let workers = WorkerPool::new();
         let t0 = Instant::now();
         let (flat, lens) = encode_docs_ragged(&workers, &tokenizer, &[&input]);
