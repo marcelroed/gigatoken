@@ -2,9 +2,9 @@
 //! `BPETokenizer.encode_files` on a single plain-text file: the entire input
 //! is ONE document handed to the library's parallel encode path
 //! (`encode_docs_ragged`), which splits it at pretoken-safe boundaries
-//! (token-identical to a serial pass), encodes with a persistent worker
-//! pool, and gathers one flat id buffer. Five rounds, so warm rounds show
-//! the retained worker caches.
+//! (token-identical to a serial pass), encodes with a pooled worker per
+//! thread, and gathers one flat id buffer. Five rounds, each with a fresh
+//! worker pool so every round is a cold-cache sample.
 //!
 //! Run with: cargo bench --bench encode_doc              (2 GB default)
 //!           ENCODE_MB=500 cargo bench --bench encode_doc
@@ -31,10 +31,13 @@ fn main() {
     let size_mb = input.len() as f64 / 1e6;
     eprintln!("1 document, {} threads\n", rayon::current_num_threads());
 
-    // Persistent worker pool, retained across rounds like the binding's —
-    // pretoken caches stay warm after round 0.
-    let workers = WorkerPool::new();
     for round in 0..5 {
+        // Fresh worker pool every round: the pool retains one forked
+        // tokenizer (and its pretoken caches) per rayon thread, so reusing
+        // it would measure warm-cache reruns of the same input rather than
+        // realistic first-pass encoding. Each round is an independent
+        // cold-cache sample.
+        let workers = WorkerPool::new();
         let t0 = Instant::now();
         let (flat, lens) = encode_docs_ragged(&workers, &tokenizer, &[&input]);
         black_box((&flat, lens));
