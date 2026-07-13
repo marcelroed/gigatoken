@@ -28,9 +28,7 @@ pub(crate) fn chunk_target_bytes(total_bytes: usize) -> usize {
 pub(crate) fn encode_into(tokenizer: &mut Tokenizer, doc: &[u8], ids: &mut Vec<u32>, lens: &mut Vec<i64>) {
     let before = ids.len();
     tokenizer.encode_with_added_tokens(doc, |tokens| {
-        for &e in tokens {
-            ids.push(e.into())
-        }
+        ids.extend(tokens.iter().map(|&t| u32::from(t)))
     });
     lens.push((ids.len() - before) as i64);
 }
@@ -96,7 +94,15 @@ pub(crate) struct ChunkTokens {
 }
 
 fn encode_chunk(tokenizer: &mut Tokenizer, chunk: &EncodeChunk) -> ChunkTokens {
-    let mut ids = Vec::new();
+    // Reserve the output once, from a bytes-per-token estimate on the low
+    // side of natural language (~4.4 on OWT/GPT-2). Growing from empty
+    // instead re-copies roughly the final size in doublings — per chunk,
+    // on every chunk of a first pass.
+    let byte_len = match chunk {
+        EncodeChunk::Docs(docs) => docs.iter().map(|d| d.len()).sum::<usize>(),
+        EncodeChunk::Region { bytes, .. } | EncodeChunk::Fragment { bytes, .. } => bytes.len(),
+    };
+    let mut ids = Vec::with_capacity(byte_len / 4 + 16);
     let mut lens = Vec::new();
     let mut continues = false;
     match chunk {
@@ -207,6 +213,21 @@ pub(crate) fn assemble_ragged(chunks: Vec<ChunkTokens>) -> (Vec<u32>, Vec<i64>) 
     }
     let total: usize = chunks.iter().map(|c| c.ids.len()).sum();
     let mut flat = vec![0u32; total];
+    // Ask for 2 MiB pages before first touch: the parallel copy below
+    // faults in the whole (multi-GB) buffer, and huge pages cut the fault
+    // count ~500x. No-op where THP is unavailable.
+    #[cfg(target_os = "linux")]
+    if total > 0 {
+        // SAFETY: the range is exactly this allocation; MADV_HUGEPAGE only
+        // hints page sizing.
+        unsafe {
+            libc::madvise(
+                flat.as_mut_ptr() as *mut libc::c_void,
+                total * std::mem::size_of::<u32>(),
+                libc::MADV_HUGEPAGE,
+            );
+        }
+    }
     let mut rest: &mut [u32] = &mut flat;
     let mut slices = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
