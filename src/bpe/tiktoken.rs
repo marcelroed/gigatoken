@@ -1,5 +1,9 @@
 use crate::bpe::{ByteRemapping, MergeScratch, bpe_merge_symbols_with_scratch, simple_bpe_merge};
-use crate::pretokenize::{Pretoken, PretokenizerType};
+use crate::pretokenize::{
+    FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
+    FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer, Pretoken,
+    PretokenizerType,
+};
 use crate::token::TokenId;
 use eyre::Result;
 use std::collections::HashMap;
@@ -26,6 +30,11 @@ pub struct Tokenizer {
     /// instead of a `memcmp` call, and hashing is two multiply-mixes instead of
     /// a byte loop. Keys are `Copy`, so cache misses no longer allocate.
     pretoken_cache: HashMap<u128, (u32, u32), rustc_hash::FxBuildHasher>,
+    /// Direct-mapped front cache for packed pretokens. Natural-language
+    /// pretokens are heavily Zipf-distributed, so most hits avoid probing the
+    /// much larger SwissTable. Each entry keeps its key and arena range
+    /// together so a hit usually requires one cache-line fetch.
+    pretoken_front: Vec<PretokenFrontEntry>,
     /// Fallback cache for pretokens longer than 15 bytes.
     pretoken_cache_long: HashMap<Box<[u8]>, (u32, u32), rustc_hash::FxBuildHasher>,
     /// Scratch buffers reused across cache-missing pretokens so the merge loop
@@ -47,6 +56,32 @@ pub struct Tokenizer {
     /// Apply NFC normalization to non-added-token segments before
     /// pretokenization, like HuggingFace's `NFC` normalizer (e.g. Qwen2).
     normalize_nfc: bool,
+}
+
+/// A 24-byte front-cache entry. Splitting the `u128` key into two words avoids
+/// the 16-byte alignment padding that would otherwise make this 32 bytes.
+#[derive(Clone, Copy, Default)]
+struct PretokenFrontEntry {
+    key_lo: u64,
+    key_hi: u64,
+    value: u64,
+}
+
+impl PretokenFrontEntry {
+    #[inline(always)]
+    fn new(key: u128, offset: u32, len: u32) -> Self {
+        Self {
+            key_lo: key as u64,
+            key_hi: (key >> 64) as u64,
+            value: offset as u64 | ((len as u64) << 32),
+        }
+    }
+
+    #[inline(always)]
+    fn get(self, key: u128) -> Option<(u32, u32)> {
+        (self.key_lo == key as u64 && self.key_hi == (key >> 64) as u64)
+            .then_some((self.value as u32, (self.value >> 32) as u32))
+    }
 }
 
 /// NFC-normalize a segment if needed, using `buf` as scratch on the slow path.
@@ -95,11 +130,30 @@ const PACK_MASK_TAG: [(u128, u128); 16] = {
     t
 };
 
+/// Log2 of the direct-mapped packed-pretoken front cache size. 2^18 entries use
+/// 6 MiB per tokenizer and retain the broad working set while the authoritative
+/// HashMap keeps every key.
+const PRETOKEN_FRONT_BITS: u32 = 18;
+
+#[inline(always)]
+fn pretoken_cache_hash(key: u128) -> u64 {
+    let folded = (key as u64) ^ ((key >> 64) as u64);
+    folded.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+#[inline(always)]
+fn pretoken_front_index(hash: u64) -> usize {
+    (hash >> (64 - PRETOKEN_FRONT_BITS)) as usize
+}
+
 #[inline(always)]
 pub(crate) fn pack_pretoken_key(bytes: &[u8]) -> Option<u128> {
     let n = bytes.len();
     if n > 15 {
         return None;
+    }
+    if n == 0 {
+        return Some(0);
     }
     let p = bytes.as_ptr();
     // Keep the low `n` bytes, zero the rest; lane 15 stays zero, ready for the
@@ -140,6 +194,7 @@ impl Tokenizer {
             byte_remapping,
             token_arena: Vec::new(),
             pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            pretoken_front: vec![PretokenFrontEntry::default(); 1 << PRETOKEN_FRONT_BITS],
             pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
@@ -187,6 +242,7 @@ impl Tokenizer {
             vocab_inv,
             token_arena: Vec::new(),
             pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            pretoken_front: vec![PretokenFrontEntry::default(); 1 << PRETOKEN_FRONT_BITS],
             pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
@@ -207,6 +263,7 @@ impl Tokenizer {
             byte_remapping: self.byte_remapping.clone(),
             token_arena: Vec::new(),
             pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            pretoken_front: vec![PretokenFrontEntry::default(); 1 << PRETOKEN_FRONT_BITS],
             pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
@@ -334,7 +391,26 @@ impl Tokenizer {
             } else {
                 &bytes[pos..seg_end]
             };
-            self.memoized_encode(pretokenizer_type.pretokenize(segment), &mut f);
+            match pretokenizer_type {
+                PretokenizerType::GPT2 => {
+                    self.memoized_encode(FastR50kPretokenizer::new(segment), &mut f)
+                }
+                PretokenizerType::GPT4 => {
+                    self.memoized_encode(FastCl100kPretokenizer::new(segment), &mut f)
+                }
+                PretokenizerType::Qwen2 => {
+                    self.memoized_encode(FastQwen2Pretokenizer::new(segment), &mut f)
+                }
+                PretokenizerType::Qwen35 => {
+                    self.memoized_encode(FastQwen35Pretokenizer::new(segment), &mut f)
+                }
+                PretokenizerType::Olmo3 => {
+                    self.memoized_encode(FastOlmo3Pretokenizer::new(segment), &mut f)
+                }
+                PretokenizerType::DeepSeekV3 => {
+                    self.memoized_encode(FastDeepSeekV3Pretokenizer::new(segment), &mut f)
+                }
+            }
             match added {
                 Some((end, id)) => {
                     f(&[id]);
@@ -360,11 +436,34 @@ impl Tokenizer {
             // to the slice-keyed map. The key is computed once and reused on the
             // miss path's insert.
             let key = pack_pretoken_key(bytes);
+            // Packed key zero represents an empty pretoken and is reserved as
+            // the front cache's empty sentinel. Real pretokenizers never yield
+            // empty slices, but keep the public iterator API correct for one.
+            let front_key = key.filter(|&key| key != 0);
+            let mut front_idx = 0;
+            if let Some(key) = front_key {
+                let hash = pretoken_cache_hash(key);
+                front_idx = pretoken_front_index(hash);
+                // SAFETY: pretoken_front_index returns PRETOKEN_FRONT_BITS bits
+                // and the array has exactly 2^PRETOKEN_FRONT_BITS entries.
+                if let Some((offset, len)) =
+                    unsafe { *self.pretoken_front.get_unchecked(front_idx) }.get(key)
+                {
+                    let start = offset as usize;
+                    // SAFETY: front entries are copied from authoritative cache
+                    // entries, whose arena ranges remain valid forever.
+                    f(unsafe { self.token_arena.get_unchecked(start..start + len as usize) });
+                    continue;
+                }
+            }
             let cached = match key {
                 Some(key) => self.pretoken_cache.get(&key).copied(),
                 None => self.pretoken_cache_long.get(bytes).copied(),
             };
             if let Some((offset, len)) = cached {
+                if let Some(key) = front_key {
+                    self.pretoken_front[front_idx] = PretokenFrontEntry::new(key, offset, len);
+                }
                 let start = offset as usize;
                 // SAFETY: every cached (offset, len) was recorded right after
                 // appending those `len` tokens at `offset`, and `token_arena`
@@ -386,6 +485,10 @@ impl Tokenizer {
                 match key {
                     Some(key) => {
                         self.pretoken_cache.insert(key, (offset, len));
+                        if let Some(key) = front_key {
+                            self.pretoken_front[front_idx] =
+                                PretokenFrontEntry::new(key, offset, len);
+                        }
                     }
                     None => {
                         self.pretoken_cache_long.insert(bytes.into(), (offset, len));
@@ -404,6 +507,7 @@ impl Tokenizer {
 
     /// Detailed cache stats for memory accounting (see examples/cache_memory.rs):
     /// (short_len, short_cap, long_len, long_cap, long_key_bytes, arena_len, arena_cap).
+    /// The fixed-size 6 MiB front cache is not represented in the tuple.
     pub fn cache_mem_stats(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
         let long_key_bytes: usize = self.pretoken_cache_long.keys().map(|k| k.len()).sum();
         (
@@ -433,6 +537,75 @@ mod tests {
     use super::*;
     use crate::load_tokenizer::tiktoken::load_tiktoken;
     use std::io::Read;
+
+    #[test]
+    fn packed_front_cache_serves_repeated_pretokens() {
+        let merges = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+        let vocab = (0..=u8::MAX).map(|byte| vec![byte]).collect();
+        let mut tokenizer = Tokenizer::new(merges, vocab, None);
+        let bytes = b"hello";
+
+        let mut first = Vec::new();
+        tokenizer.memoized_encode([Pretoken(bytes)].into_iter(), |tokens| {
+            first.extend(tokens.iter().map(|token| token.0));
+        });
+        let expected: Vec<u32> = bytes.iter().map(|&byte| byte as u32).collect();
+        assert_eq!(first, expected);
+
+        let key = pack_pretoken_key(bytes).unwrap();
+        let front_idx = pretoken_front_index(pretoken_cache_hash(key));
+        assert!(tokenizer.pretoken_front[front_idx].get(key).is_some());
+        assert!(tokenizer.pretoken_cache.remove(&key).is_some());
+
+        let mut repeated = Vec::new();
+        tokenizer.memoized_encode([Pretoken(bytes)].into_iter(), |tokens| {
+            repeated.extend(tokens.iter().map(|token| token.0));
+        });
+        assert_eq!(repeated, first);
+        assert!(tokenizer.pretoken_cache.is_empty());
+
+        // The zero key is the front-cache sentinel, so an empty pretoken must
+        // still take the authoritative map path.
+        tokenizer.memoized_encode([Pretoken(b"")].into_iter(), |tokens| {
+            assert!(tokens.is_empty());
+        });
+        assert!(tokenizer.pretoken_cache.contains_key(&0));
+    }
+
+    #[test]
+    fn concrete_pretokenizer_dispatch_matches_enum_dispatch() {
+        let schemes = [
+            PretokenizerType::GPT2,
+            PretokenizerType::GPT4,
+            PretokenizerType::Qwen2,
+            PretokenizerType::Qwen35,
+            PretokenizerType::Olmo3,
+            PretokenizerType::DeepSeekV3,
+        ];
+        let input = "Hello, 世界! café 12345\r\ncan't  stop".as_bytes();
+
+        for scheme in schemes {
+            let make_tokenizer = || {
+                let merges = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+                let vocab = (0..=u8::MAX).map(|byte| vec![byte]).collect();
+                Tokenizer::new(merges, vocab, None)
+            };
+
+            let mut reference = make_tokenizer();
+            let mut expected = Vec::new();
+            reference.memoized_encode(scheme.pretokenize(input), |tokens| {
+                expected.extend_from_slice(tokens);
+            });
+
+            let mut concrete = make_tokenizer();
+            concrete.set_pretokenizer_type(scheme);
+            let mut actual = Vec::new();
+            concrete.encode_with_added_tokens(input, |tokens| {
+                actual.extend_from_slice(tokens);
+            });
+            assert_eq!(actual, expected, "dispatch differs for {scheme:?}");
+        }
+    }
 
     #[test]
     fn test_merges_from_vocab() {
