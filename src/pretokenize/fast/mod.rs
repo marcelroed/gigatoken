@@ -119,11 +119,54 @@ pub(crate) unsafe fn decode_non_ascii(bytes: &[u8]) -> char {
     }
 }
 
-/// Decode one non-ASCII scalar from valid UTF-8. `bytes[pos]` must be a UTF-8
-/// leading byte (>= 0xC2) with its full sequence in bounds. Returns the
-/// codepoint and the sequence length in bytes.
+/// Decode one non-ASCII scalar. Requires only `pos < bytes.len()` and
+/// `bytes[pos] >= 0x80`; arbitrary (invalid) bytes are tolerated and
+/// decode deterministically. Returns the codepoint and the number of
+/// bytes consumed.
+///
+/// Invalid input is garbage-in/defined-garbage-out, with two hard
+/// guarantees the walkers rely on:
+///
+/// - Never reads past `bytes.len()`, and the returned length never
+///   overruns it: a multi-byte lead whose sequence is cut off by the
+///   buffer end (a truncated tail) consumes exactly the bytes that
+///   remain and yields [`CP_INVALID`]. (Pre-fix this read up to 3 bytes
+///   past the slice and returned an end past `len` — walker panic on the
+///   Iterator path, out-of-bounds span on the SpanBatch path.)
+/// - The codepoint is always `<= 0x10FFFF`, so the packed class-table
+///   lookups (`unicode::class_of` / `ds_class_of`, indexed unchecked)
+///   stay in bounds: invalid leads 0xF5..=0xFF take the 4-byte branch
+///   and can assemble "codepoints" up to 0x1FFFFF, which are clamped to
+///   [`CP_INVALID`]. (Pre-fix the table lookup read up to ~246 KB past
+///   the table — heap memory whose contents depend on other threads'
+///   allocations, which is what made >65 KB invalid-UTF-8 pretokens
+///   split nondeterministically between the walker paths.)
+///
+/// The clamp target U+10FFFF is unassigned (a noncharacter) — class
+/// `Other` in every scheme's classifier — so truncated or
+/// beyond-Unicode garbage classifies like any other unassigned
+/// codepoint, identically on every path.
 #[inline(always)]
 pub(crate) unsafe fn decode_cp(bytes: &[u8], pos: usize) -> (u32, usize) {
+    if pos + 4 > bytes.len() {
+        // Within 3 bytes of the buffer end: the only region where a
+        // sequence can be truncated. Cold: interior calls (the hot ones)
+        // never take it, and the branch predicts not-taken.
+        return decode_cp_near_end(bytes, pos);
+    }
+    // SAFETY: pos + 4 <= len just checked.
+    unsafe { decode_cp_inbounds(bytes, pos) }
+}
+
+/// [`decode_cp`] without the buffer-end guard, for callers that already
+/// guarantee `pos + 4 <= bytes.len()` structurally (the mask-scanner
+/// batch helpers, whose `scan + 70 <= len` batch guard covers every call
+/// site's worst case) — keeps the tail check out of the batch
+/// classification path. Identical results to [`decode_cp`] on any input
+/// where both are callable, including the [`CP_INVALID`] clamp for
+/// beyond-Unicode garbage from invalid 4-byte leads.
+#[inline(always)]
+pub(crate) unsafe fn decode_cp_inbounds(bytes: &[u8], pos: usize) -> (u32, usize) {
     unsafe {
         let b0 = *bytes.get_unchecked(pos) as u32;
         let b1 = (*bytes.get_unchecked(pos + 1) & 0x3F) as u32;
@@ -135,8 +178,55 @@ pub(crate) unsafe fn decode_cp(bytes: &[u8], pos: usize) -> (u32, usize) {
             return (((b0 & 0x0F) << 12) | (b1 << 6) | b2, 3);
         }
         let b3 = (*bytes.get_unchecked(pos + 3) & 0x3F) as u32;
-        (((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3, 4)
+        (
+            (((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3).min(CP_INVALID),
+            4,
+        )
     }
+}
+
+/// The codepoint reported for byte sequences that cannot be decoded
+/// within bounds (truncated tails) or that assemble past the Unicode
+/// range (invalid 4-byte-lead garbage). U+10FFFF: the largest scalar
+/// value, an unassigned noncharacter, class `Other` in [`unicode::class_of`],
+/// `class_of_marks_join`, and `ds_class_of` alike.
+pub(crate) const CP_INVALID: u32 = 0x10FFFF;
+
+/// [`decode_cp`]'s slow path for `pos + 4 > bytes.len()`: decodes with
+/// per-byte bounds, identical results to the fast path for complete
+/// sequences; a sequence truncated by the buffer end consumes exactly
+/// the remaining bytes and yields [`CP_INVALID`].
+#[cold]
+#[inline(never)]
+fn decode_cp_near_end(bytes: &[u8], pos: usize) -> (u32, usize) {
+    let len = bytes.len();
+    let b0 = bytes[pos] as u32;
+    let need = if b0 < 0xE0 {
+        2
+    } else if b0 < 0xF0 {
+        3
+    } else {
+        4
+    };
+    if pos + need > len {
+        // Truncated tail: consume the rest of the buffer as one
+        // unclassifiable char so every walker path terminates the final
+        // pretoken at `len` the same way.
+        return (CP_INVALID, len - pos);
+    }
+    let b1 = (bytes[pos + 1] & 0x3F) as u32;
+    if need == 2 {
+        return (((b0 & 0x1F) << 6) | b1, 2);
+    }
+    let b2 = (bytes[pos + 2] & 0x3F) as u32;
+    if need == 3 {
+        return (((b0 & 0x0F) << 12) | (b1 << 6) | b2, 3);
+    }
+    let b3 = (bytes[pos + 3] & 0x3F) as u32;
+    (
+        (((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3).min(CP_INVALID),
+        4,
+    )
 }
 
 /// `[\r\n]*`: advance past a run of CR/LF bytes (trailing newlines after a

@@ -2194,3 +2194,422 @@ mod verify_scratch2 {
         }
     }
 }
+
+/// Walker edge-condition tests: truncated multi-byte UTF-8 at the buffer
+/// end (Bug A: `decode_cp` used to read up to 3 bytes past the slice and
+/// return a pretoken end past `len`) and invalid-UTF-8 garbage codepoints
+/// (Bug B: 0xF5..=0xFF leads decoded to cp > 0x10FFFF, and `class_of`'s
+/// unchecked table load then read heap memory past the class table —
+/// nondeterministic under concurrent allocation, causing the Iterator and
+/// two-phase paths to split >65 KB invalid pretokens differently).
+/// Correctness bar: every scheme partitions ARBITRARY bytes contiguously,
+/// in bounds, identically on the Iterator (`next_span`) and two-phase
+/// (`fill_spans_keyed`) paths, deterministically.
+#[cfg(test)]
+mod walker_edge {
+    use super::*;
+    use crate::load_tokenizer::hf::load_hf_bpe;
+
+    fn gpt2_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json")
+    }
+
+    /// Uncached reference encode of one pretoken: byte remap + plain merge
+    /// loop over the merges HashMap (no pair-rank table, no cache, no
+    /// short-merge kernels).
+    fn plain_encode_pretoken(tok: &Tokenizer, pretoken: &[u8], out: &mut Vec<u32>) {
+        let mut symbols: Vec<TokenId> = match tok.byte_remapping.as_ref() {
+            Some(br) => pretoken.iter().map(|&b| br.mapping[b as usize]).collect(),
+            None => pretoken.iter().map(|&b| TokenId::from(b as u32)).collect(),
+        };
+        crate::bpe::bpe_merge_symbols(&tok.merges, &mut symbols);
+        out.extend(symbols.iter().map(|t| t.0));
+    }
+
+    /// Assert a scheme's pretokens are a contiguous, non-empty, in-bounds
+    /// partition of `span` (required for encode correctness; also catches
+    /// walkers running past the buffer on truncated UTF-8).
+    fn check_partition<'a>(
+        span: &'a [u8],
+        it: impl Iterator<Item = Pretoken<'a>>,
+        scheme: &str,
+    ) {
+        let mut off = 0usize;
+        for p in it {
+            assert!(
+                std::ptr::eq(p.0.as_ptr(), span[off..].as_ptr()),
+                "{scheme}: non-contiguous pretoken at byte {off} of {:?}",
+                String::from_utf8_lossy(span)
+            );
+            assert!(!p.0.is_empty(), "{scheme}: empty pretoken at byte {off}");
+            off += p.0.len();
+            assert!(
+                off <= span.len(),
+                "{scheme}: pretoken overruns span end ({off} > {}) on {:?}",
+                span.len(),
+                String::from_utf8_lossy(span)
+            );
+        }
+        assert_eq!(
+            off,
+            span.len(),
+            "{scheme}: pretokens cover {off} of {} bytes of {:?}",
+            span.len(),
+            String::from_utf8_lossy(span)
+        );
+    }
+
+    /// Partition check (Iterator path) plus cached encode (two-phase
+    /// `fill_spans_keyed` path) vs the plain per-pretoken reference over
+    /// the Iterator's pretokens — so the two walker paths are compared
+    /// against each other on every span.
+    fn check_scheme_encode<'a, P>(
+        tok: &mut Tokenizer,
+        span: &'a [u8],
+        make: impl Fn(&'a [u8]) -> P,
+        scheme: &str,
+    ) where
+        P: PretokenSpans<'a>,
+        P: Iterator<Item = Pretoken<'a>>,
+    {
+        check_partition(span, make(span), scheme);
+        let mut got: Vec<u32> = Vec::new();
+        tok.memoized_encode_flat(make(span), &mut got);
+        let mut expected: Vec<u32> = Vec::new();
+        for p in make(span) {
+            plain_encode_pretoken(tok, p.0, &mut expected);
+        }
+        assert!(
+            got == expected,
+            "{scheme}: cached encode mismatch on {:?} (len {}):\n  cached   {:?}\n  expected {:?}",
+            String::from_utf8_lossy(span),
+            span.len(),
+            got,
+            expected
+        );
+    }
+
+    fn check_all_schemes(tok: &mut Tokenizer, span: &[u8]) {
+        check_scheme_encode(tok, span, FastR50kPretokenizer::new, "r50k");
+        check_scheme_encode(tok, span, FastCl100kPretokenizer::new, "cl100k");
+        check_scheme_encode(tok, span, FastQwen2Pretokenizer::new, "qwen2");
+        check_scheme_encode(tok, span, FastQwen35Pretokenizer::new, "qwen3_5");
+        check_scheme_encode(tok, span, FastOlmo3Pretokenizer::new, "olmo3");
+        check_scheme_encode(tok, span, FastDeepSeekV3Pretokenizer::new, "deepseek_v3");
+    }
+
+    /// Truncated multi-byte UTF-8 at the buffer end, every shape: for each
+    /// lead-byte length (2/3/4) every truncation point (1..len-1 available
+    /// continuation bytes missing), plus lone continuation bytes and
+    /// invalid 0xF5..=0xFF leads, behind assorted prefixes that put the
+    /// truncated char after a letter run / digit run / space / whitespace
+    /// run / punctuation / another unicode char. Exactly-sized heap
+    /// allocations so any walker overrun is an observable OOB.
+    #[test]
+    fn walker_truncated_utf8_tail() {
+        let mut tok = load_hf_bpe(gpt2_path()).expect("load GPT-2 tokenizer");
+        // Leads: 2-byte (0xC3), 3-byte (0xE2, and 0xE0 low), 4-byte (0xF0,
+        // 0xF4 high), invalid leads (0xF5, 0xF8, 0xFF), continuation (0x80,
+        // 0xBF), and 0xC0/0xC1 (invalid 2-byte leads).
+        let leads: &[&[u8]] = &[
+            b"\xc3",
+            b"\xe2",
+            b"\xe2\x80",
+            b"\xe0",
+            b"\xe0\xa0",
+            b"\xf0",
+            b"\xf0\x9f",
+            b"\xf0\x9f\x99",
+            b"\xf4",
+            b"\xf4\x8f",
+            b"\xf4\x8f\xbf",
+            b"\xf5",
+            b"\xf8\x88",
+            b"\xff",
+            b"\xff\xff",
+            b"\xff\xff\xff",
+            b"\x80",
+            b"\xbf",
+            b"\xc0",
+            b"\xc1",
+        ];
+        let prefixes: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"hello",
+            b"hello ",
+            b"123",
+            b" ",
+            b"  \n",
+            b"!?",
+            "é".as_bytes(),
+            "好".as_bytes(),
+            b"'s",
+            b"\xff\xff\xff\xff", // complete invalid run before the tail
+        ];
+        for &lead in leads {
+            for &prefix in prefixes {
+                let mut buf = Vec::with_capacity(prefix.len() + lead.len());
+                buf.extend_from_slice(prefix);
+                buf.extend_from_slice(lead);
+                check_all_schemes(&mut tok, &buf);
+                // Public path must not panic and must match the plain
+                // reference over the Iterator's pretokens.
+                let mut cached: Vec<u32> = Vec::new();
+                tok.encode_with_added_tokens_flat(&buf, &mut cached);
+                let mut expected: Vec<u32> = Vec::new();
+                for p in FastR50kPretokenizer::new(&buf) {
+                    plain_encode_pretoken(&tok, p.0, &mut expected);
+                }
+                assert!(
+                    cached == expected,
+                    "public path mismatch on {:?}: cached {:?} expected {:?}",
+                    String::from_utf8_lossy(&buf),
+                    cached,
+                    expected
+                );
+            }
+        }
+    }
+
+    /// Deterministic boundary fuzz: random spans (0-64 bytes; ASCII text,
+    /// raw bytes incl. invalid UTF-8 and truncated tails, valid multi-byte
+    /// UTF-8, whitespace runs) placed at the END of an exactly-sized
+    /// allocation, through every scheme's walker (partition + cached-vs-
+    /// plain encode) and the full public GPT-2 path. Fixed seed, no I/O
+    /// beyond the tokenizer. (Ported from the verify branch; the
+    /// truncated-tail sanitization it needed pre-fix is gone — truncated
+    /// shapes are in scope.)
+    #[test]
+    fn walker_boundary_fuzz_memoized_vs_reference() {
+        let mut tok = load_hf_bpe(gpt2_path()).expect("load GPT-2 tokenizer");
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const CHARS: &[&str] = &["é", "ü", "好", "日", "🙂", "ß", "—", "\u{0301}", "٣", "क"];
+        let iters = if cfg!(debug_assertions) { 2_000 } else { 12_000 };
+        for iter in 0..iters {
+            let len = (rng() % 65) as usize;
+            let pad = (rng() % 17) as usize;
+            let mut buf: Vec<u8> = Vec::with_capacity(pad + len + 8);
+            for _ in 0..pad {
+                buf.push(rng() as u8);
+            }
+            let span_start = buf.len();
+            match rng() % 4 {
+                0 => {
+                    // ASCII text: letters, digits, spaces, punct, contractions
+                    const POOL: &[u8] = b" aetoAETO059'.,!-\n\t\"()s d";
+                    while buf.len() - span_start < len {
+                        buf.push(POOL[(rng() % POOL.len() as u64) as usize]);
+                    }
+                }
+                1 => {
+                    // Raw bytes: full 0..=255, mostly invalid UTF-8,
+                    // truncated tails included.
+                    while buf.len() - span_start < len {
+                        buf.push(rng() as u8);
+                    }
+                }
+                2 => {
+                    // Valid UTF-8 mix: fill to >= len, then trim whole
+                    // chars back to <= len so the span stays valid UTF-8.
+                    while buf.len() - span_start < len {
+                        if rng() % 2 == 0 {
+                            buf.push(b' ' + (rng() % 94) as u8);
+                        } else {
+                            buf.extend_from_slice(
+                                CHARS[(rng() % CHARS.len() as u64) as usize].as_bytes(),
+                            );
+                        }
+                    }
+                    while buf.len() - span_start > len
+                        || std::str::from_utf8(&buf[span_start..]).is_err()
+                    {
+                        buf.pop();
+                    }
+                }
+                _ => {
+                    // Whitespace-heavy
+                    const POOL: &[u8] = b"   \n\n\t\r a5.";
+                    while buf.len() - span_start < len {
+                        buf.push(POOL[(rng() % POOL.len() as u64) as usize]);
+                    }
+                }
+            }
+            buf.truncate(span_start + len.min(buf.len() - span_start));
+            let (head, span) = buf.split_at(span_start);
+            let _ = head;
+            check_all_schemes(&mut tok, span);
+            // Full public path (added-token scan + NFC gate + flat emit).
+            let mut cached: Vec<u32> = Vec::new();
+            let mut expected: Vec<u32> = Vec::new();
+            // GPT-2's only added token is <|endoftext|>, absent from these
+            // spans (13-byte pattern, span <= 64 random bytes — and the
+            // reference below would not model it).
+            for p in FastR50kPretokenizer::new(span) {
+                plain_encode_pretoken(&tok, p.0, &mut expected);
+            }
+            tok.encode_with_added_tokens_flat(span, &mut cached);
+            assert!(
+                cached == expected,
+                "public path mismatch at iter {iter} on {:?}: cached {:?} expected {:?}",
+                String::from_utf8_lossy(span),
+                cached,
+                expected
+            );
+        }
+        eprintln!("boundary fuzz: {iters} spans x 6 schemes ok");
+    }
+
+    /// Pretokens at the exact edge lengths of the key-packing and cache
+    /// machinery (15/16 for the packed u128 key, 65535/65536 and beyond
+    /// for long runs through the walkers), in letter/digit/space/punct/
+    /// multi-byte/invalid fills, each in an exactly-sized allocation.
+    /// (Ported from the verify branch — this was the Bug B flake detector;
+    /// invalid fills are no longer tail-sanitized.)
+    #[test]
+    fn walker_edge_length_pretokens() {
+        let mut tok = load_hf_bpe(gpt2_path()).expect("load GPT-2 tokenizer");
+        let lens: &[usize] = &[
+            1, 2, 7, 8, 14, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 255, 256, 4095, 4096,
+            4097, 65_535, 65_536, 65_537, 70_003,
+        ];
+        let fills: &[&[u8]] = &[
+            b"a",
+            b"5",
+            b" ",
+            b"!",
+            b"\n",
+            "\u{e9}".as_bytes(),   // é (2-byte letter)
+            "\u{597d}".as_bytes(), // 好 (3-byte letter)
+            b"\xff",               // invalid UTF-8
+        ];
+        for &n in lens {
+            for fill in fills {
+                // Repeat fill to >= n bytes, then cut to n only for 1-byte
+                // fills (multi-byte fills keep whole chars).
+                let reps = n / fill.len() + usize::from(n % fill.len() != 0);
+                if reps == 0 {
+                    continue;
+                }
+                let exact = if fill.len() == 1 { n } else { reps * fill.len() };
+                let mut buf: Vec<u8> = Vec::with_capacity(exact);
+                while buf.len() < exact {
+                    buf.extend_from_slice(fill);
+                }
+                buf.truncate(exact);
+                check_all_schemes(&mut tok, &buf);
+                // Space-prefixed variant hits the space-fused starts.
+                let mut buf2: Vec<u8> = Vec::with_capacity(exact + 1);
+                buf2.push(b' ');
+                buf2.extend_from_slice(&buf);
+                check_all_schemes(&mut tok, &buf2);
+                // 0xFF run with a letter tail: the exact shape of the
+                // >65 KB nondeterminism (the last garbage 4-byte decode
+                // straddles into the letters).
+                if fill == b"\xff" && exact >= 4 {
+                    let mut buf3 = buf.clone();
+                    let e = buf3.len();
+                    buf3[e - 3..].copy_from_slice(b"cba");
+                    check_all_schemes(&mut tok, &buf3);
+                }
+            }
+        }
+        eprintln!("edge-length pretokens ok");
+    }
+
+    /// Bug B regression: the two spans that flaked (~1/25 full-suite runs)
+    /// pre-fix — 65534 x 0xFF + "cba", bare and space-prefixed — walked
+    /// repeatedly on both paths while background threads churn the heap.
+    /// Pre-fix, `class_of` read past the class table for the garbage
+    /// codepoints these 0xFF runs decode to, so the boundary near the run
+    /// tail depended on whatever heap memory followed the table; the churn
+    /// recreates the "concurrent test threads" condition deterministically
+    /// enough that the old code fails this test within a few rounds.
+    /// Post-fix every round must produce the identical partition on both
+    /// paths.
+    #[test]
+    fn walker_ff_run_paths_agree_under_heap_churn() {
+        // 16 spare bytes of capacity so the run is AddressSanitizer-clean:
+        // `pack_pretoken_key`'s page-guarded 16-byte load may overread the
+        // final short span within its page (by design — masked out, and
+        // never crosses into an unmapped page), which ASAN's redzones
+        // would otherwise flag on an exactly-sized allocation.
+        // Exactly-sized allocations are covered by the other tests here.
+        let mut a = Vec::with_capacity(65537 + 16);
+        a.resize(65534, 0xFFu8);
+        a.extend_from_slice(b"cba"); // len 65537
+        let mut b = Vec::with_capacity(65538 + 16);
+        b.push(b' ');
+        b.extend_from_slice(&a); // len 65538
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churners: Vec<_> = (0..4)
+            .map(|t| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut keep: Vec<Vec<u8>> = Vec::new();
+                    let mut i = 0usize;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Vary size and content so the pages after any
+                        // fresh allocation keep changing.
+                        let sz = 1 << (12 + (i + t) % 8); // 4 KB .. 512 KB
+                        keep.push(vec![(i as u8) ^ 0x5A; sz]);
+                        if keep.len() > 8 {
+                            keep.clear();
+                        }
+                        i += 1;
+                    }
+                })
+            })
+            .collect();
+        let iter_lens = |span: &[u8]| -> Vec<usize> {
+            FastR50kPretokenizer::new(span).map(|p| p.0.len()).collect()
+        };
+        let two_phase_lens = |span: &[u8]| -> Vec<usize> {
+            let mut batch = SpanBatch::new();
+            let mut p = FastR50kPretokenizer::new(span);
+            let mut lens = Vec::new();
+            loop {
+                let k = p.fill_spans_keyed(&mut batch, &|_| {});
+                for i in 0..k {
+                    lens.push(batch.entries[i].span_len());
+                }
+                if k < PRETOKEN_CHUNK {
+                    return lens;
+                }
+            }
+        };
+        let mut reference: Option<[Vec<usize>; 2]> = None;
+        for round in 0..40 {
+            let got = [
+                {
+                    let (i, t) = (iter_lens(&a), two_phase_lens(&a));
+                    assert_eq!(i, t, "round {round} span A: iterator vs two-phase");
+                    i
+                },
+                {
+                    let (i, t) = (iter_lens(&b), two_phase_lens(&b));
+                    assert_eq!(i, t, "round {round} span B: iterator vs two-phase");
+                    i
+                },
+            ];
+            match &reference {
+                None => reference = Some(got),
+                Some(r) => assert_eq!(
+                    r,
+                    &got,
+                    "round {round}: partition changed between rounds (nondeterminism)"
+                ),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for c in churners {
+            c.join().unwrap();
+        }
+    }
+}

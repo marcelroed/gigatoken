@@ -325,12 +325,14 @@ pub(crate) fn ascii_masks_avx2(bytes: &[u8], scan: usize) -> AsciiMasks {
 /// every call site's worst case).
 #[inline(always)]
 pub(crate) fn nn_at_full(bytes: &[u8], idx: usize) -> bool {
-    use super::{decode_cp, is_ascii_ws};
+    use super::{decode_cp_inbounds, is_ascii_ws};
     let b = bytes[idx];
     if b < 0x80 {
         return !is_ascii_ws(b);
     }
-    let (cp, _) = unsafe { decode_cp(bytes, idx) };
+    // SAFETY: caller guarantees the whole char in bounds (scan + 70
+    // <= len batch guard), so idx + 4 <= len for any lead here.
+    let (cp, _) = unsafe { decode_cp_inbounds(bytes, idx) };
     unicode::class_of(cp) != CharClass::Whitespace
 }
 
@@ -348,7 +350,7 @@ pub(crate) fn char_through(
     pos: usize,
     class: impl Fn(u32) -> CharClass,
 ) -> (CharClass, usize, usize) {
-    use super::{decode_cp, is_ascii_ws, is_digit, is_letter};
+    use super::{decode_cp_inbounds, is_ascii_ws, is_digit, is_letter};
     let b = bytes[pos - 1];
     if b < 0x80 {
         let cls = if is_letter(b) {
@@ -366,7 +368,9 @@ pub(crate) fn char_through(
     while j > 0 && bytes[j] & 0xC0 == 0x80 {
         j -= 1;
     }
-    let (cp, l) = unsafe { decode_cp(bytes, j) };
+    // SAFETY: caller guarantees `pos` is inside a batch with the
+    // scan + 70 <= len lookahead guard and j < pos, so j + 4 <= len.
+    let (cp, l) = unsafe { decode_cp_inbounds(bytes, j) };
     (class(cp), j, j + l)
 }
 
@@ -424,7 +428,7 @@ pub(crate) fn classify_uni_chars<const NUMBERS: bool, const LEADS: bool>(
     mut m: u64,
     class: impl Fn(u32) -> CharClass,
 ) -> UniClasses {
-    use super::decode_cp;
+    use super::decode_cp_inbounds;
     let mut u = UniClasses::default();
     while m != 0 {
         let i = m.trailing_zeros() as usize;
@@ -443,7 +447,9 @@ pub(crate) fn classify_uni_chars<const NUMBERS: bool, const LEADS: bool>(
         };
         let chm = ((1u64 << l) - 1) << i; // in-batch bytes (excess drops)
         let lead = 1u64 << i;
-        let (cp, _) = unsafe { decode_cp(bytes, scan + i) };
+        // SAFETY: scan + 70 <= len (this fn's contract), i <= 63, so
+        // scan + i + 4 <= len even for a 4-byte lead at bit 63.
+        let (cp, _) = unsafe { decode_cp_inbounds(bytes, scan + i) };
         match class(cp) {
             CharClass::Letter => u.l |= chm,
             CharClass::Number => {
