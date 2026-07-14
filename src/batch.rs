@@ -126,40 +126,87 @@ fn encode_chunk(tokenizer: &mut Tokenizer, chunk: &EncodeChunk) -> ChunkTokens {
     }
 }
 
-/// Group documents into parallel chunks of at least `target` cumulative
-/// bytes. A document larger than the target is split into consecutive
-/// Fragment chunks at pretoken-safe boundaries that no added-token
-/// occurrence straddles, so even a single huge document is encoded across
-/// all cores with token-identical output.
+/// Whether LPT chunk sizing is enabled: killed by setting `GIGATOK_NO_LPT`
+/// in the environment (to any value, empty included). Read once per encode
+/// call — never in per-chunk or per-pretoken loops. Both shapes are token-
+/// and order-identical; the switch changes chunk sizing only, and exists
+/// so future measurement can flip it without a rebuild.
+fn lpt_from_env() -> bool {
+    std::env::var_os("GIGATOK_NO_LPT").is_none()
+}
+
+/// Group documents into parallel chunks of descending (LPT-scheduled)
+/// sizes: ~2x-target chunks over the first ~80% of bytes, quarter-target
+/// chunks over the last ~20%. Rayon hands out chunks in index order, so
+/// whichever core draws the last chunk (on asymmetric parts, often an
+/// E-core) strands the others behind a short tail instead of a full-size
+/// one, while the big early chunks amortize per-chunk overhead. A document
+/// larger than the target is split into consecutive Fragment chunks at
+/// pretoken-safe boundaries that no added-token occurrence straddles, so
+/// even a single huge document is encoded across all cores with
+/// token-identical output.
+///
+/// With LPT disabled (GIGATOK_NO_LPT) this restores uniform sizing:
+/// head_bytes = 0 makes every Docs group aim for `target`, and
+/// frag_head = usize::MAX makes every fragment take the primary split
+/// size `target` (the sub-split branch is never entered), which is
+/// exactly the old safe_split_ranges(doc, target) loop. The oversize
+/// threshold (`doc.len() > 2 * target`) is identical in both shapes.
 fn build_doc_chunks<'a>(
     docs: &[&'a [u8]],
+    total: usize,
     target: usize,
     added_tokens: &[&[u8]],
+    lpt: bool,
 ) -> Vec<EncodeChunk<'a>> {
+    let (head_bytes, group_big, frag_big, tail_target) = if lpt {
+        (
+            total - total / 5,
+            2 * target,
+            2 * target,
+            (target / 4).max(MIN_CHUNK_BYTES),
+        )
+    } else {
+        (0, target, target, target)
+    };
     let mut chunks = Vec::new();
     let mut group: Vec<&[u8]> = Vec::new();
+    // Bytes already assigned to chunks: positions below `head_bytes` take
+    // the big target, the rest the small one.
+    let mut emitted = 0usize;
     let mut acc = 0usize;
     for &doc in docs {
         if doc.len() > 2 * target {
             if !group.is_empty() {
                 chunks.push(EncodeChunk::Docs(std::mem::take(&mut group)));
+                emitted += acc;
                 acc = 0;
             }
-            for (k, r) in crate::pretokenize::safe_split_ranges(doc, target, added_tokens)
-                .into_iter()
-                .enumerate()
-            {
-                chunks.push(EncodeChunk::Fragment {
-                    bytes: &doc[r],
-                    first: k == 0,
-                });
-            }
+            push_fragment_chunks(
+                &mut chunks,
+                doc,
+                if lpt {
+                    head_bytes.saturating_sub(emitted)
+                } else {
+                    usize::MAX
+                },
+                frag_big,
+                tail_target,
+                added_tokens,
+            );
+            emitted += doc.len();
             continue;
         }
         group.push(doc);
         acc += doc.len();
-        if acc >= target {
+        let group_target = if emitted < head_bytes {
+            group_big
+        } else {
+            tail_target
+        };
+        if acc >= group_target {
             chunks.push(EncodeChunk::Docs(std::mem::take(&mut group)));
+            emitted += acc;
             acc = 0;
         }
     }
@@ -167,6 +214,41 @@ fn build_doc_chunks<'a>(
         chunks.push(EncodeChunk::Docs(group));
     }
     chunks
+}
+
+/// Split one oversized document into consecutive Fragment chunks with the
+/// descending sizes of `build_doc_chunks`: `big`-sized fragments over the
+/// first `head_len` bytes, `tail_target`-sized fragments after.
+/// Sub-splitting a tail fragment preserves boundary safety: the pretoken
+/// cut check is purely local (3 bytes around the cut), and an added-token
+/// occurrence is orders of magnitude shorter than the >= MIN_CHUNK_BYTES
+/// distance of any sub-cut from its fragment's (already safe) edges.
+fn push_fragment_chunks<'a>(
+    chunks: &mut Vec<EncodeChunk<'a>>,
+    doc: &'a [u8],
+    head_len: usize,
+    big: usize,
+    tail_target: usize,
+    added_tokens: &[&[u8]],
+) {
+    let mut first = true;
+    for r in crate::pretokenize::safe_split_ranges(doc, big, added_tokens) {
+        if r.start < head_len || r.len() <= tail_target {
+            chunks.push(EncodeChunk::Fragment {
+                bytes: &doc[r],
+                first: std::mem::take(&mut first),
+            });
+        } else {
+            for sub in
+                crate::pretokenize::safe_split_ranges(&doc[r.clone()], tail_target, added_tokens)
+            {
+                chunks.push(EncodeChunk::Fragment {
+                    bytes: &doc[r.start + sub.start..r.start + sub.end],
+                    first: std::mem::take(&mut first),
+                });
+            }
+        }
+    }
 }
 
 /// Map items serially when there is at most one (small inputs skip the
@@ -313,9 +395,21 @@ pub fn encode_docs_ragged(
     proto: &Tokenizer,
     docs: &[&[u8]],
 ) -> (Vec<u32>, Vec<i64>) {
+    encode_docs_ragged_with(workers, proto, docs, lpt_from_env())
+}
+
+/// `encode_docs_ragged` with the LPT switch passed explicitly instead of
+/// read from the environment, so tests can cover both shapes in-process
+/// without mutating process env.
+pub(crate) fn encode_docs_ragged_with(
+    workers: &WorkerPool,
+    proto: &Tokenizer,
+    docs: &[&[u8]],
+    lpt: bool,
+) -> (Vec<u32>, Vec<i64>) {
     let total: usize = docs.iter().map(|d| d.len()).sum();
     let added = proto.added_token_contents();
-    let chunks = build_doc_chunks(docs, chunk_target_bytes(total), &added);
+    let chunks = build_doc_chunks(docs, total, chunk_target_bytes(total), &added, lpt);
     let outs = encode_chunks_pooled(workers, proto, &chunks, total);
     assemble_ragged(outs)
 }
@@ -358,6 +452,70 @@ pub(crate) fn sp_encode_docs_ragged(
         }
     });
     assemble_ragged(outs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The parallel chunked path — LPT descending chunk sizes, pooled
+    /// pre-sized workers, collect-then-assemble gather — must be
+    /// token-identical, in the same order, to a serial per-document
+    /// encode, with LPT both on and off (GIGATOK_NO_LPT), passed
+    /// explicitly so no process env is mutated. A byte-level vocab makes
+    /// any misordered or dropped chunk visible in the flat buffer, not
+    /// just in the counts.
+    #[test]
+    fn parallel_ragged_matches_serial() {
+        let merges = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+        let vocab = (0..=u8::MAX).map(|b| vec![b]).collect();
+        let proto = Tokenizer::new(merges, vocab, None);
+
+        // Deterministic pseudo-text with plenty of alnum-space-alpha cut
+        // points for safe_split_ranges.
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut text = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let r = (state >> 33) as usize;
+                    b"abcdefghijklmnopqrstuvwxyz0123456789    "[r % 40]
+                })
+                .collect()
+        };
+        // Mid-size docs that group into Docs chunks, one oversized doc
+        // that splits into Fragment chunks (spanning the head/tail
+        // boundary, so both fragment sizes appear), then small docs so
+        // continuation rows land mid-output.
+        let mut owned: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..30 {
+            owned.push(text(300 << 10));
+        }
+        owned.push(text(12 << 20));
+        for _ in 0..30 {
+            owned.push(text(100 << 10));
+        }
+        let docs: Vec<&[u8]> = owned.iter().map(|d| d.as_slice()).collect();
+
+        let mut ids_ref: Vec<u32> = Vec::new();
+        let mut lens_ref: Vec<i64> = Vec::new();
+        let mut serial = proto.fork();
+        for doc in &docs {
+            encode_into(&mut serial, doc, &mut ids_ref, &mut lens_ref);
+        }
+
+        for lpt in [true, false] {
+            // A fresh pool per shape so each run exercises the pre-sized
+            // fork (slots fork lazily on first use).
+            let workers = WorkerPool::new();
+            let (flat, lens) = encode_docs_ragged_with(&workers, &proto, &docs, lpt);
+            assert_eq!(lens, lens_ref, "lens mismatch (lpt={lpt})");
+            assert_eq!(flat, ids_ref, "ids mismatch (lpt={lpt})");
+        }
+    }
 }
 
 /// encode_files core for the BPE backend. With no separator each file is one
