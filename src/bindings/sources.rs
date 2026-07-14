@@ -109,27 +109,32 @@ pub(crate) fn resolve_files_source(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<Path
 pub(crate) fn encode_files_ragged<'py>(
     py: Python<'py>,
     source: &Bound<'py, PyAny>,
+    parallel: bool,
     encode: impl FnOnce(&[&[u8]], &DocFormat) -> (Vec<u32>, Vec<i64>) + Send,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (paths, format) = resolve_files_source(source)?;
     let (flat, counts) = py.detach(|| -> PyResult<_> {
-        let files = load_files(&paths)?;
+        let files = load_files(&paths, parallel)?;
         let bytes: Vec<&[u8]> = files.iter().map(|f| f.as_bytes()).collect();
         Ok(encode(&bytes, &format))
     })?;
     super::bridge::ragged_to_python(py, flat, counts)
 }
 
-/// Load all files in parallel: mmap when stored uncompressed, decompress
-/// .gz/.zst into memory otherwise (parallel chunking needs random access).
-pub(crate) fn load_files(paths: &[PathBuf]) -> PyResult<Vec<LoadedFile>> {
+/// Load all files: mmap when stored uncompressed, decompress .gz/.zst into
+/// memory otherwise (parallel chunking needs random access). In parallel
+/// with rayon, or serially on the calling thread when `parallel` is false
+/// (the sequential encode paths must never touch the rayon pool).
+pub(crate) fn load_files(paths: &[PathBuf], parallel: bool) -> PyResult<Vec<LoadedFile>> {
     use rayon::prelude::*;
-    paths
-        .par_iter()
-        .map(|p| {
-            load_file(p).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}: {e}", p.display()))
-            })
+    let load = |p: &PathBuf| {
+        load_file(p).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}: {e}", p.display()))
         })
-        .collect()
+    };
+    if parallel {
+        paths.par_iter().map(load).collect()
+    } else {
+        paths.iter().map(load).collect()
+    }
 }

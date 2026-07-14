@@ -7,6 +7,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from gigatoken._load.hf import capture_named_special_tokens, to_tokenizer_json
+from gigatoken._parallel import resolve_parallel
 from gigatoken.gigatoken_rs import BPETokenizer, PadTruncate, SentencePieceTokenizer, load_hf_json
 
 if TYPE_CHECKING:
@@ -165,8 +166,21 @@ class Tokenizer:
     def encode(self, input: str | bytes) -> npt.NDArray[np.uint32]:
         return self._backend.encode(input)
 
-    def encode_batch(self, inputs: list[str] | list[bytes] | ak.Array) -> ak.Array:
-        return self._backend.encode_batch(inputs)
+    def encode_batch(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        *,
+        parallel: bool | None = None,
+    ) -> ak.Array:
+        """Encode a batch of documents; see the backend's encode_batch.
+
+        `parallel=None` (the default) auto-detects: batches encode in
+        parallel on the process-global thread pool, except inside a
+        multiprocessing worker (or forked child), where everything runs on
+        the calling thread so worker processes compose instead of
+        oversubscribing — or, after a fork, deadlocking. Pass True/False to
+        override. Output is identical either way."""
+        return self._backend.encode_batch(inputs, parallel=resolve_parallel(parallel))
 
     def encode_batch_padded(
         self,
@@ -179,10 +193,13 @@ class Tokenizer:
         truncate_left: bool = False,
         prefix: list[int] | None = None,
         suffix: list[int] | None = None,
+        *,
+        parallel: bool | None = None,
     ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.int64]]:
         """encode_batch assembled in Rust into one padded (rows x width)
         uint32 matrix, plus each row's real (unpadded) length; see
-        gigatoken_rs.BPETokenizer.encode_batch_padded for the semantics."""
+        gigatoken_rs.BPETokenizer.encode_batch_padded for the semantics and
+        encode_batch here for `parallel`."""
         options = PadTruncate(
             pad_id,
             max_length=max_length,
@@ -193,13 +210,17 @@ class Tokenizer:
             prefix=prefix or [],
             suffix=suffix or [],
         )
-        return self._backend.encode_batch_padded(inputs, options)
+        return self._backend.encode_batch_padded(inputs, options, parallel=resolve_parallel(parallel))
 
     def encode_files(
         self,
         source: FileSource | str | Path | PathLike[str] | list[str | Path | PathLike[str]],
+        *,
+        parallel: bool | None = None,
     ) -> ak.Array:
-        return self._backend.encode_files(source)
+        """Encode all documents from files; see the backend's encode_files
+        and encode_batch here for `parallel`."""
+        return self._backend.encode_files(source, parallel=resolve_parallel(parallel))
 
     def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes:
         return self._backend.decode(tokens)

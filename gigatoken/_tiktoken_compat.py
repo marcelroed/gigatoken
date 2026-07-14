@@ -96,10 +96,11 @@ class TiktokenCompat:
 
     def encode_ordinary_batch(self, text: list[str], num_threads: int = 8) -> list[list[int]]:
         """`num_threads` is accepted for signature compatibility; the Rust
-        backend manages its own parallelism."""
+        backend manages its own parallelism, except that `num_threads=1`
+        forces single-threaded encoding (see encode_batch)."""
         for t in text:
             self._check_specials(t, allowed_special=(), disallowed_special=())
-        return self._encode_batch(text)
+        return self._encode_batch(text, num_threads)
 
     def encode_batch(
         self,
@@ -110,15 +111,18 @@ class TiktokenCompat:
         disallowed_special: Literal["all"] | Collection[str] = "all",
     ) -> list[list[int]]:
         """`num_threads` is accepted for signature compatibility; the Rust
-        backend manages its own parallelism."""
+        backend manages its own parallelism. `num_threads=1` forces
+        single-threaded encoding; any other value leaves the choice to the
+        backend (parallel, except inside a multiprocessing worker)."""
         for t in text:
             self._check_specials(t, allowed_special, disallowed_special)
-        return self._encode_batch(text)
+        return self._encode_batch(text, num_threads)
 
-    def _encode_batch(self, text: list[str]) -> list[list[int]]:
+    def _encode_batch(self, text: list[str], num_threads: int = 8) -> list[list[int]]:
         import awkward as ak
 
-        return ak.to_list(self._tokenizer.encode_batch(list(text)))
+        parallel = False if num_threads == 1 else None
+        return ak.to_list(self._tokenizer.encode_batch(list(text), parallel=parallel))
 
     def encode_single_token(self, text_or_bytes: str | bytes) -> int:
         piece = text_or_bytes.encode("utf-8") if isinstance(text_or_bytes, str) else text_or_bytes

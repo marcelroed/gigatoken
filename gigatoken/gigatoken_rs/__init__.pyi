@@ -67,11 +67,21 @@ class PadTruncate:
 class BPETokenizer:
     def __new__(cls) -> "BPETokenizer": ...
     def encode(self, input: str | bytes) -> npt.NDArray[np.uint32]: ...
-    def encode_batch(self, inputs: list[str] | list[bytes] | ak.Array) -> ak.Array: ...
+    def encode_batch(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        *,
+        parallel: bool = True,
+    ) -> ak.Array:
+        """parallel=False encodes on the calling thread (identical output),
+        never touching the process-global thread pool — for multiprocessing
+        workers; gigatoken.Tokenizer passes it automatically."""
     def encode_batch_padded(
         self,
         inputs: list[str] | list[bytes] | ak.Array,
         options: PadTruncate,
+        *,
+        parallel: bool = True,
     ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.int64]]:
         """encode_batch as one padded (rows x width) matrix plus each row's
         real (unpadded) length; prefer the keyword-argument wrapper
@@ -79,6 +89,8 @@ class BPETokenizer:
     def encode_files(
         self,
         source: FileSource | str | Path | PathLike[str] | list[str | Path | PathLike[str]],
+        *,
+        parallel: bool = True,
     ) -> ak.Array: ...
     def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes: ...
     @property
@@ -103,11 +115,21 @@ class SentencePieceTokenizer:
     @staticmethod
     def from_hf(path: str | Path) -> "SentencePieceTokenizer": ...
     def encode(self, input: str | bytes) -> npt.NDArray[np.uint32]: ...
-    def encode_batch(self, inputs: list[str] | list[bytes] | ak.Array) -> ak.Array: ...
+    def encode_batch(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        *,
+        parallel: bool = True,
+    ) -> ak.Array:
+        """parallel=False encodes on the calling thread (identical output),
+        never touching the process-global thread pool — for multiprocessing
+        workers; gigatoken.Tokenizer passes it automatically."""
     def encode_batch_padded(
         self,
         inputs: list[str] | list[bytes] | ak.Array,
         options: PadTruncate,
+        *,
+        parallel: bool = True,
     ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.int64]]:
         """encode_batch as one padded (rows x width) matrix plus each row's
         real (unpadded) length; prefer the keyword-argument wrapper
@@ -116,6 +138,8 @@ class SentencePieceTokenizer:
     def encode_files(
         self,
         source: FileSource | str | Path | PathLike[str] | list[str | Path | PathLike[str]],
+        *,
+        parallel: bool = True,
     ) -> ak.Array: ...
     def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes: ...
     @property

@@ -88,10 +88,11 @@ pub fn encode_batch_matrix<'py>(
     py: Python<'py>,
     inputs: &Bound<'py, PyAny>,
     opts: PadTruncate,
+    parallel: bool,
     encode: impl Fn(&[&[u8]]) -> PyResult<(Vec<u32>, Vec<i64>)> + Send + Sync,
 ) -> PyResult<PaddedMatrix<'py>> {
     let (flat, counts) = super::bridge::encode_batch_flat(py, inputs, encode)?;
-    let (data, lengths, width) = py.detach(|| pad_truncate_matrix(&flat, &counts, &opts))?;
+    let (data, lengths, width) = py.detach(|| pad_truncate_matrix(&flat, &counts, &opts, parallel))?;
     let rows = lengths.len();
     let matrix = data.into_pyarray(py).reshape([rows, width])?;
     Ok((matrix, lengths.into_pyarray(py)))
@@ -106,6 +107,7 @@ fn pad_truncate_matrix(
     flat: &[u32],
     counts: &[i64],
     opts: &PadTruncate,
+    parallel: bool,
 ) -> PyResult<(Vec<u32>, Vec<i64>, usize)> {
     use rayon::prelude::*;
     let value_err = |msg: String| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg);
@@ -149,7 +151,7 @@ fn pad_truncate_matrix(
     };
     let mut out = vec![opts.pad_id; counts.len() * width];
     if width > 0 {
-        out.par_chunks_mut(width).enumerate().for_each(|(i, row)| {
+        let fill = |(i, row): (usize, &mut [u32])| {
             let count = counts[i] as usize;
             let kept = count.min(cap);
             let tokens = &flat[offsets[i]..offsets[i] + count];
@@ -163,7 +165,12 @@ fn pad_truncate_matrix(
             row[start..start + opts.prefix.len()].copy_from_slice(&opts.prefix);
             row[start + opts.prefix.len()..start + opts.prefix.len() + kept].copy_from_slice(tokens);
             row[start + len - opts.suffix.len()..start + len].copy_from_slice(&opts.suffix);
-        });
+        };
+        if parallel {
+            out.par_chunks_mut(width).enumerate().for_each(fill);
+        } else {
+            out.chunks_mut(width).enumerate().for_each(fill);
+        }
     }
     Ok((out, lengths, width))
 }

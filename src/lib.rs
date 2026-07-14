@@ -13,7 +13,9 @@ pub use crate::bpe::sentencepiece::EncodeState;
 pub mod load_tokenizer;
 
 use crate::batch::{
-    encode_files_docs, encode_into, sp_encode_docs_ragged, sp_encode_files_docs,
+    encode_docs_ragged_serial, encode_files_docs, encode_files_docs_serial, encode_into,
+    sp_encode_docs_ragged, sp_encode_docs_ragged_serial, sp_encode_files_docs,
+    sp_encode_files_docs_serial,
 };
 use crate::bindings::bridge::{
     EncodeInput, encode_batch_ragged, extract_doc, extract_token_ids, merges_to_pylist,
@@ -38,9 +40,14 @@ struct BPETokenizer {
 }
 
 impl BPETokenizer {
-    /// See `batch::encode_docs_ragged`. Call with the GIL released.
-    fn encode_slices_ragged(&self, docs: &[&[u8]]) -> (Vec<u32>, Vec<i64>) {
-        encode_docs_ragged(&self.workers, &self.tokenizer, docs)
+    /// See `batch::encode_docs_ragged` / `batch::encode_docs_ragged_serial`.
+    /// Call with the GIL released.
+    fn encode_slices_ragged(&self, docs: &[&[u8]], parallel: bool) -> (Vec<u32>, Vec<i64>) {
+        if parallel {
+            encode_docs_ragged(&self.workers, &self.tokenizer, docs)
+        } else {
+            encode_docs_ragged_serial(&self.workers, &self.tokenizer, docs)
+        }
     }
 }
 
@@ -96,12 +103,20 @@ impl BPETokenizer {
     /// split at pretoken-safe boundaries and reassembled with identical
     /// tokens — a single huge document still uses all cores. Chunks are
     /// encoded by pooled workers whose pretoken caches persist across calls.
+    ///
+    /// `parallel=False` encodes everything on the calling thread instead,
+    /// with identical output, never touching the process-global thread pool
+    /// — for calls inside multiprocessing worker processes (the
+    /// gigatoken.Tokenizer wrapper detects those and passes it
+    /// automatically).
+    #[pyo3(signature = (inputs, *, parallel = true))]
     fn encode_batch<'py>(
         &self,
         py: Python<'py>,
         inputs: Bound<'py, PyAny>,
+        parallel: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        encode_batch_ragged(py, &inputs, |docs| Ok(self.encode_slices_ragged(docs)))
+        encode_batch_ragged(py, &inputs, |docs| Ok(self.encode_slices_ragged(docs, parallel)))
     }
 
     /// encode_batch assembled into one padded/truncated (rows x width)
@@ -109,13 +124,17 @@ impl BPETokenizer {
     /// APIs — see src/bindings/padding.rs for the semantics (`options` is a
     /// PadTruncate) and gigatoken.Tokenizer.encode_batch_padded for the
     /// friendly keyword signature.
+    #[pyo3(signature = (inputs, options, *, parallel = true))]
     fn encode_batch_padded<'py>(
         &self,
         py: Python<'py>,
         inputs: Bound<'py, PyAny>,
         options: padding::PadTruncate,
+        parallel: bool,
     ) -> PyResult<padding::PaddedMatrix<'py>> {
-        padding::encode_batch_matrix(py, &inputs, options, |docs| Ok(self.encode_slices_ragged(docs)))
+        padding::encode_batch_matrix(py, &inputs, options, parallel, |docs| {
+            Ok(self.encode_slices_ragged(docs, parallel))
+        })
     }
 
     /// Encode all documents from files in parallel, releasing the GIL.
@@ -130,13 +149,25 @@ impl BPETokenizer {
     /// and reassembled with identical tokens, so it still uses all cores.
     /// Chunks are encoded by pooled workers whose pretoken caches persist
     /// across calls.
+    ///
+    /// `parallel=False` loads and encodes everything on the calling thread
+    /// instead, with identical output, never touching the process-global
+    /// thread pool — for calls inside multiprocessing worker processes (the
+    /// gigatoken.Tokenizer wrapper detects those and passes it
+    /// automatically).
+    #[pyo3(signature = (source, *, parallel = true))]
     fn encode_files<'py>(
         &self,
         py: Python<'py>,
         source: Bound<'py, PyAny>,
+        parallel: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        encode_files_ragged(py, &source, |files, format| {
-            encode_files_docs(&self.workers, &self.tokenizer, files, format)
+        encode_files_ragged(py, &source, parallel, |files, format| {
+            if parallel {
+                encode_files_docs(&self.workers, &self.tokenizer, files, format)
+            } else {
+                encode_files_docs_serial(&self.workers, &self.tokenizer, files, format)
+            }
         })
     }
 
@@ -179,11 +210,15 @@ struct SentencePieceTokenizer {
 }
 
 impl SentencePieceTokenizer {
-    /// See `batch::sp_encode_docs_ragged`; documents must be valid UTF-8.
-    /// Call with the GIL released.
-    fn encode_slices_ragged(&self, docs: &[&[u8]]) -> PyResult<(Vec<u32>, Vec<i64>)> {
+    /// See `batch::sp_encode_docs_ragged` (`_serial` when `parallel` is
+    /// false); documents must be valid UTF-8. Call with the GIL released.
+    fn encode_slices_ragged(&self, docs: &[&[u8]], parallel: bool) -> PyResult<(Vec<u32>, Vec<i64>)> {
         let texts: Vec<&str> = docs.iter().map(|d| utf8_doc(d)).collect::<PyResult<_>>()?;
-        Ok(sp_encode_docs_ragged(&self.tokenizer, &texts))
+        Ok(if parallel {
+            sp_encode_docs_ragged(&self.tokenizer, &texts)
+        } else {
+            sp_encode_docs_ragged_serial(&self.tokenizer, &texts)
+        })
     }
 }
 
@@ -198,25 +233,32 @@ impl SentencePieceTokenizer {
     }
 
     /// Encode a batch of documents in parallel, releasing the GIL. Accepts
-    /// the same inputs and returns the same awkward.Array shape as
-    /// BPETokenizer.encode_batch. Documents must be valid UTF-8.
+    /// the same inputs, returns the same awkward.Array shape, and honors the
+    /// same `parallel` keyword as BPETokenizer.encode_batch. Documents must
+    /// be valid UTF-8.
+    #[pyo3(signature = (inputs, *, parallel = true))]
     fn encode_batch<'py>(
         &self,
         py: Python<'py>,
         inputs: Bound<'py, PyAny>,
+        parallel: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        encode_batch_ragged(py, &inputs, |docs| self.encode_slices_ragged(docs))
+        encode_batch_ragged(py, &inputs, |docs| self.encode_slices_ragged(docs, parallel))
     }
 
     /// See BPETokenizer.encode_batch_padded: the same padded-matrix batch
     /// encode, for the SentencePiece backend.
+    #[pyo3(signature = (inputs, options, *, parallel = true))]
     fn encode_batch_padded<'py>(
         &self,
         py: Python<'py>,
         inputs: Bound<'py, PyAny>,
         options: padding::PadTruncate,
+        parallel: bool,
     ) -> PyResult<padding::PaddedMatrix<'py>> {
-        padding::encode_batch_matrix(py, &inputs, options, |docs| self.encode_slices_ragged(docs))
+        padding::encode_batch_matrix(py, &inputs, options, parallel, |docs| {
+            self.encode_slices_ragged(docs, parallel)
+        })
     }
 
     /// Encode a single document (str or UTF-8 bytes), with a pretoken cache
@@ -240,16 +282,22 @@ impl SentencePieceTokenizer {
     }
 
     /// Encode all documents from files in parallel. Accepts the same
-    /// sources and applies the same chunking policy as
-    /// BPETokenizer.encode_files, and likewise returns an awkward.Array
-    /// with one row of token ids per document.
+    /// sources, applies the same chunking policy, and honors the same
+    /// `parallel` keyword as BPETokenizer.encode_files, and likewise
+    /// returns an awkward.Array with one row of token ids per document.
+    #[pyo3(signature = (source, *, parallel = true))]
     fn encode_files<'py>(
         &self,
         py: Python<'py>,
         source: Bound<'py, PyAny>,
+        parallel: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        encode_files_ragged(py, &source, |files, format| {
-            sp_encode_files_docs(&self.tokenizer, files, format)
+        encode_files_ragged(py, &source, parallel, |files, format| {
+            if parallel {
+                sp_encode_files_docs(&self.tokenizer, files, format)
+            } else {
+                sp_encode_files_docs_serial(&self.tokenizer, files, format)
+            }
         })
     }
 

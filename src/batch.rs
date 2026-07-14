@@ -637,6 +637,10 @@ fn gather_flat(chunks: Vec<ChunkTokens>) -> Vec<u32> {
 /// construction: no mutator is exposed after the pyclass is built.
 pub struct WorkerPool {
     slots: OnceLock<Vec<Mutex<Option<Tokenizer>>>>,
+    /// Worker for the sequential (`parallel=false`) encode paths, kept
+    /// separate from `slots` so a sequential call never sizes or touches
+    /// the rayon pool (even `rayon::current_num_threads()` would build it).
+    serial: Mutex<Option<Tokenizer>>,
 }
 
 impl Default for WorkerPool {
@@ -649,6 +653,7 @@ impl WorkerPool {
     pub fn new() -> Self {
         Self {
             slots: OnceLock::new(),
+            serial: Mutex::new(None),
         }
     }
 
@@ -692,6 +697,27 @@ impl WorkerPool {
             std::thread::yield_now();
         }
     }
+
+    /// `with_worker` for the sequential paths: run `f` with the dedicated
+    /// serial worker (forked lazily, retained so its pretoken cache stays
+    /// warm across calls), without initializing the rayon-sized slots. The
+    /// same unmutated-prototype invariant applies. Blocks if another thread
+    /// is in a sequential encode on the same pool.
+    fn with_serial_worker<R>(
+        &self,
+        proto: &Tokenizer,
+        expected_bytes: usize,
+        f: impl FnOnce(&mut Tokenizer) -> R,
+    ) -> R {
+        let mut guard = self.serial.lock().unwrap_or_else(|poisoned| {
+            // A worker panicked mid-encode; its cache may be inconsistent,
+            // so rebuild it from the prototype.
+            let mut guard = poisoned.into_inner();
+            *guard = None;
+            guard
+        });
+        f(guard.get_or_insert_with(|| proto.fork_sized(expected_bytes)))
+    }
 }
 
 /// Shared core of encode_batch / encode_files for pre-resolved document
@@ -725,6 +751,30 @@ pub(crate) fn encode_docs_ragged_with(
     let added = proto.added_token_contents();
     let chunks = build_doc_chunks(docs, total, chunk_target_bytes(total), &added, lpt);
     encode_chunks_gathered(workers, proto, &chunks, total)
+}
+
+/// Sequential `encode_docs_ragged`: encode every document in order on the
+/// calling thread with the pool's dedicated serial worker. Never touches
+/// rayon — required when the caller is a forked child of a process whose
+/// global rayon pool was already built (the pool's threads do not survive
+/// the fork, so injecting work into it would wait forever), and what the
+/// Python bindings' `parallel=false` promises. Token- and order-identical
+/// to the parallel path (which `parallel_ragged_matches_serial` checks
+/// against exactly this shape of serial loop).
+pub fn encode_docs_ragged_serial(
+    workers: &WorkerPool,
+    proto: &Tokenizer,
+    docs: &[&[u8]],
+) -> (Vec<u32>, Vec<i64>) {
+    let total: usize = docs.iter().map(|d| d.len()).sum();
+    workers.with_serial_worker(proto, total, |tok| {
+        let mut ids = Vec::with_capacity(total / 4 + 16);
+        let mut lens = Vec::with_capacity(docs.len());
+        for doc in docs {
+            encode_into(tok, doc, &mut ids, &mut lens);
+        }
+        (ids, lens)
+    })
 }
 
 /// SentencePiece analog of `encode_docs_ragged`: group whole documents into
@@ -767,6 +817,23 @@ pub(crate) fn sp_encode_docs_ragged(
     assemble_ragged(outs)
 }
 
+/// Sequential `sp_encode_docs_ragged`: one Encoder (so one pretoken cache)
+/// over all documents, on the calling thread, never touching rayon. Token-
+/// and order-identical to the parallel path, which encodes the same
+/// documents in the same order with per-chunk Encoders.
+pub(crate) fn sp_encode_docs_ragged_serial(
+    tokenizer: &bpe::SentencePieceBPE,
+    texts: &[&str],
+) -> (Vec<u32>, Vec<i64>) {
+    let mut encoder = tokenizer.encoder();
+    let mut ids: Vec<u32> = Vec::new();
+    let mut lens: Vec<i64> = Vec::with_capacity(texts.len());
+    for &text in texts {
+        sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
+    }
+    (ids, lens)
+}
+
 /// encode_files core for the BPE backend. With no separator each file is one
 /// document (small files are grouped, huge ones split at pretoken-safe
 /// boundaries); otherwise each file is cut into byte regions at document
@@ -794,6 +861,27 @@ pub(crate) fn encode_files_docs(
         })
         .collect();
     encode_chunks_gathered(workers, proto, &chunks, total)
+}
+
+/// Sequential `encode_files_docs`: extract and encode every document in
+/// file order on the calling thread, never touching rayon. Document
+/// iteration matches the parallel path's chunk regions (`for_each_doc`
+/// over the same format), so the output is token- and order-identical.
+pub(crate) fn encode_files_docs_serial(
+    workers: &WorkerPool,
+    proto: &Tokenizer,
+    files: &[&[u8]],
+    format: &DocFormat,
+) -> (Vec<u32>, Vec<i64>) {
+    let total: usize = files.iter().map(|f| f.len()).sum();
+    workers.with_serial_worker(proto, total, |tok| {
+        let mut ids = Vec::with_capacity(total / 4 + 16);
+        let mut lens = Vec::new();
+        for &bytes in files {
+            for_each_doc(bytes, format, |doc| encode_into(tok, doc, &mut ids, &mut lens));
+        }
+        (ids, lens)
+    })
 }
 
 /// encode_files core for the SentencePiece backend: cut files into byte
@@ -831,6 +919,25 @@ pub(crate) fn sp_encode_files_docs(
         }
     });
     assemble_ragged(outs)
+}
+
+/// Sequential `sp_encode_files_docs`: one Encoder over every file's
+/// documents in order, on the calling thread, never touching rayon.
+pub(crate) fn sp_encode_files_docs_serial(
+    tokenizer: &bpe::SentencePieceBPE,
+    files: &[&[u8]],
+    format: &DocFormat,
+) -> (Vec<u32>, Vec<i64>) {
+    let mut encoder = tokenizer.encoder();
+    let mut ids: Vec<u32> = Vec::new();
+    let mut lens: Vec<i64> = Vec::new();
+    for &bytes in files {
+        for_each_doc(bytes, format, |doc| {
+            let text = unsafe { std::str::from_utf8_unchecked(doc) };
+            sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
+        });
+    }
+    (ids, lens)
 }
 
 #[cfg(test)]
@@ -895,6 +1002,13 @@ mod tests {
             assert_eq!(lens, lens_ref, "lens mismatch (lpt={lpt})");
             assert_eq!(flat, ids_ref, "ids mismatch (lpt={lpt})");
         }
+
+        // The sequential entry point (bindings' parallel=false) must match
+        // too — it runs the reference loop through the pool's serial worker.
+        let workers = WorkerPool::new();
+        let (flat, lens) = encode_docs_ragged_serial(&workers, &proto, &docs);
+        assert_eq!(lens, lens_ref, "lens mismatch (serial)");
+        assert_eq!(flat, ids_ref, "ids mismatch (serial)");
     }
 
     /// Parallel-vs-serial at scale on a REAL tokenizer: ~1 GB of OWT as a
