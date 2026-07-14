@@ -9,6 +9,7 @@ use crate::bpe;
 use crate::input::DocumentIter;
 use crate::input::file_source::{DocFormat, chunk_ranges};
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
 
 /// Parallel chunks must hold at least this many bytes: a chunk this size
@@ -267,6 +268,15 @@ pub(crate) fn map_maybe_par<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R +
 /// for its share of `total_bytes` (capacity hints only — see
 /// `Tokenizer::fork_sized`; workers already forked on an earlier call keep
 /// their warm caches).
+///
+/// Chunks are handed out in strict index order through an atomic counter
+/// (one pulling task per rayon thread), not `par_iter`: recursive range
+/// splitting lets a thread steal a subrange of early big chunks and still
+/// be *starting* a 2×-target chunk after everyone else has reached the
+/// small tail, which strands 15 threads behind one ~90 ms straggler
+/// (measured ~64 ms of a 1.46 s 10 GB window). In-order handout makes the
+/// LPT descending-size order of `build_doc_chunks` a guarantee, bounding
+/// the tail at roughly one small chunk.
 pub(crate) fn encode_chunks_pooled(
     workers: &WorkerPool,
     proto: &Tokenizer,
@@ -274,9 +284,29 @@ pub(crate) fn encode_chunks_pooled(
     total_bytes: usize,
 ) -> Vec<ChunkTokens> {
     let share = total_bytes / rayon::current_num_threads().max(1);
-    map_maybe_par(chunks, |c| {
-        workers.with_worker(proto, share, |tok| encode_chunk(tok, c))
-    })
+    let encode = |c: &EncodeChunk| workers.with_worker(proto, share, |tok| encode_chunk(tok, c));
+    if chunks.len() <= 1 {
+        return chunks.iter().map(encode).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let outs: Vec<OnceLock<ChunkTokens>> = (0..chunks.len()).map(|_| OnceLock::new()).collect();
+    let tasks = rayon::current_num_threads().min(chunks.len());
+    rayon::scope(|s| {
+        for _ in 0..tasks {
+            s.spawn(|_| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(chunk) = chunks.get(i) else { break };
+                    // Each index is claimed exactly once, so `set` cannot
+                    // already be filled.
+                    let _ = outs[i].set(encode(chunk));
+                }
+            });
+        }
+    });
+    outs.into_iter()
+        .map(|slot| slot.into_inner().expect("every claimed chunk was encoded"))
+        .collect()
 }
 
 /// Merge per-chunk outputs into one flat id buffer and per-document row
@@ -320,9 +350,16 @@ pub(crate) fn assemble_ragged(chunks: Vec<ChunkTokens>) -> (Vec<u32>, Vec<i64>) 
         slices.push(head);
         rest = tail;
     }
+    // Consume each chunk in its copy task so its id buffer is freed right
+    // there, on the worker, overlapped with the other copies. The chunk
+    // buffers total as much memory as `flat` itself; dropping them after
+    // the parallel copy put ~110 ms of single-threaded munmap on the
+    // critical path of a 10 GB encode. `with_max_len(1)` keeps the
+    // munmap-heavy items stealable one by one.
     slices
         .into_par_iter()
-        .zip(chunks.par_iter())
+        .zip(chunks.into_par_iter())
+        .with_max_len(1)
         .for_each(|(dst, chunk)| dst.copy_from_slice(&chunk.ids));
     (flat, counts)
 }
