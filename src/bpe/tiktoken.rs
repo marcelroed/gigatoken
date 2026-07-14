@@ -148,7 +148,7 @@ impl Tokenizer {
         let pair_ranks =
             PairRankTable::build(&merges, byte_remapping.as_ref(), vocab.len()).map(Arc::new);
         let mut token_arena = Vec::new();
-        let pretoken_cache = Self::seeded_pretoken_cache(&vocab, &mut token_arena);
+        let pretoken_cache = Self::seeded_pretoken_cache(&vocab, &mut token_arena, 0);
         Tokenizer {
             merges: Arc::new(merges),
             pair_ranks,
@@ -174,15 +174,21 @@ impl Tokenizer {
     /// vocab word. Iterating IDs descending and keeping the first insert
     /// per key resolves duplicate byte strings to the highest ID — the same
     /// entry `vocab_inv` (built ascending, later inserts overwrite) returns.
+    ///
+    /// `min_slots` additionally floors the table size for a worker with a
+    /// known workload (see [`Self::fork_sized`]); the table is built once
+    /// at the max of the seed requirement and that floor, so seeding never
+    /// grows it mid-way.
     fn seeded_pretoken_cache(
         vocab: &[Arc<[u8]>],
         token_arena: &mut Vec<TokenId>,
+        min_slots: usize,
     ) -> ShortPretokenCache {
         let n_short = vocab
             .iter()
             .filter(|bytes| (1..=15).contains(&bytes.len()))
             .count();
-        let mut cache = ShortPretokenCache::with_at_least(n_short);
+        let mut cache = ShortPretokenCache::with_at_least(n_short, min_slots);
         for id in (0..vocab.len() as u32).rev() {
             let bytes = &vocab[id as usize];
             if !(1..=15).contains(&bytes.len()) {
@@ -242,7 +248,7 @@ impl Tokenizer {
         let pair_ranks =
             PairRankTable::build(&merges, byte_remapping.as_ref(), vocab.len()).map(Arc::new);
         let mut token_arena = Vec::new();
-        let pretoken_cache = Self::seeded_pretoken_cache(&vocab, &mut token_arena);
+        let pretoken_cache = Self::seeded_pretoken_cache(&vocab, &mut token_arena, 0);
         Ok(Tokenizer {
             merges: Arc::new(merges),
             pair_ranks,
@@ -265,8 +271,33 @@ impl Tokenizer {
     /// freshly seeded cache (no encoded pretokens beyond the vocab seed).
     /// Useful for per-thread encoding in parallel.
     pub fn fork(&self) -> Self {
-        let mut token_arena = Vec::new();
-        let pretoken_cache = Self::seeded_pretoken_cache(&self.vocab, &mut token_arena);
+        self.fork_sized(0)
+    }
+
+    /// [`Self::fork`] with the caches pre-sized for a worker expected to
+    /// encode roughly `expected_bytes` of input. On a cold parallel run a
+    /// default-sized worker rehashes its pretoken table through 6-7
+    /// doublings — random scatter writes into a fresh zeroed allocation
+    /// each time, on every worker at once; sizing from the input share
+    /// pays for the table exactly once. The estimates are capacity hints
+    /// only: every structure still grows past them as needed, and the
+    /// clamps keep tiny inputs at the default size. The short-table size
+    /// is a floor passed through the vocab seeding, so the seed
+    /// requirement and the workload estimate resolve to one table
+    /// construction (whichever is larger).
+    pub(crate) fn fork_sized(&self, expected_bytes: usize) -> Self {
+        // ~1 distinct short pretoken per ~256 input bytes covers OWT-like
+        // text at 3/4 load (Heaps' law: distinct pretokens grow ~ n^0.55,
+        // so a share sees proportionally more distinct pretokens than the
+        // whole); clamp at 2^22 slots (128 MB) per worker.
+        let cache_slots = (expected_bytes / 256)
+            .clamp(1 << 16, 1 << 22)
+            .next_power_of_two();
+        let arena_cap = (expected_bytes / 256).min(1 << 24);
+        let long_cap = (expected_bytes / 8192).min(1 << 20);
+        let mut token_arena = Vec::with_capacity(arena_cap);
+        let pretoken_cache =
+            Self::seeded_pretoken_cache(&self.vocab, &mut token_arena, cache_slots);
         Tokenizer {
             merges: Arc::clone(&self.merges),
             pair_ranks: self.pair_ranks.clone(),
@@ -275,7 +306,10 @@ impl Tokenizer {
             byte_remapping: self.byte_remapping.clone(),
             token_arena,
             pretoken_cache,
-            pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+            pretoken_cache_long: HashMap::with_capacity_and_hasher(
+                long_cap,
+                rustc_hash::FxBuildHasher {},
+            ),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
             pretokenizer_type: self.pretokenizer_type,

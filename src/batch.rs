@@ -181,14 +181,19 @@ pub(crate) fn map_maybe_par<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R +
 }
 
 /// Encode all chunks with pooled workers — in parallel when there is more
-/// than one chunk, serially otherwise.
+/// than one chunk, serially otherwise. Each worker's caches are pre-sized
+/// for its share of `total_bytes` (capacity hints only — see
+/// `Tokenizer::fork_sized`; workers already forked on an earlier call keep
+/// their warm caches).
 pub(crate) fn encode_chunks_pooled(
     workers: &WorkerPool,
     proto: &Tokenizer,
     chunks: &[EncodeChunk],
+    total_bytes: usize,
 ) -> Vec<ChunkTokens> {
+    let share = total_bytes / rayon::current_num_threads().max(1);
     map_maybe_par(chunks, |c| {
-        workers.with_worker(proto, |tok| encode_chunk(tok, c))
+        workers.with_worker(proto, share, |tok| encode_chunk(tok, c))
     })
 }
 
@@ -261,11 +266,17 @@ impl WorkerPool {
         }
     }
 
-    /// Run `f` with exclusive access to a pooled worker. Rayon never runs
+    /// Run `f` with exclusive access to a pooled worker, forking one sized
+    /// for `expected_bytes` of input if the slot is empty. Rayon never runs
     /// more tasks concurrently than it has threads, and there is one slot
     /// per thread, so a free slot always exists; the yield loop only spins
     /// when non-rayon threads encode at the same time.
-    fn with_worker<R>(&self, proto: &Tokenizer, f: impl FnOnce(&mut Tokenizer) -> R) -> R {
+    fn with_worker<R>(
+        &self,
+        proto: &Tokenizer,
+        expected_bytes: usize,
+        f: impl FnOnce(&mut Tokenizer) -> R,
+    ) -> R {
         let slots = self.slots.get_or_init(|| {
             (0..rayon::current_num_threads())
                 .map(|_| Mutex::new(None))
@@ -275,14 +286,14 @@ impl WorkerPool {
             for slot in slots {
                 match slot.try_lock() {
                     Ok(mut guard) => {
-                        return f(guard.get_or_insert_with(|| proto.fork()));
+                        return f(guard.get_or_insert_with(|| proto.fork_sized(expected_bytes)));
                     }
                     Err(TryLockError::Poisoned(poisoned)) => {
                         // A worker panicked mid-encode; its cache may be
                         // inconsistent, so rebuild it from the prototype.
                         let mut guard = poisoned.into_inner();
                         *guard = None;
-                        return f(guard.get_or_insert_with(|| proto.fork()));
+                        return f(guard.get_or_insert_with(|| proto.fork_sized(expected_bytes)));
                     }
                     Err(TryLockError::WouldBlock) => {}
                 }
@@ -305,7 +316,7 @@ pub fn encode_docs_ragged(
     let total: usize = docs.iter().map(|d| d.len()).sum();
     let added = proto.added_token_contents();
     let chunks = build_doc_chunks(docs, chunk_target_bytes(total), &added);
-    let outs = encode_chunks_pooled(workers, proto, &chunks);
+    let outs = encode_chunks_pooled(workers, proto, &chunks, total);
     assemble_ragged(outs)
 }
 
@@ -375,7 +386,7 @@ pub(crate) fn encode_files_docs(
                 })
         })
         .collect();
-    let outs = encode_chunks_pooled(workers, proto, &chunks);
+    let outs = encode_chunks_pooled(workers, proto, &chunks, total);
     assemble_ragged(outs)
 }
 

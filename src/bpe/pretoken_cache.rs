@@ -131,10 +131,16 @@ impl ShortPretokenCache {
 
     /// A table sized to hold at least `n` entries without growing (same
     /// 3/4-load threshold as [`Self::insert`], same 2^16 floor as
-    /// [`Self::new`]). The vocab-seeding path inserts ~50k entries up
-    /// front; pre-sizing avoids rehashing them mid-seed.
-    pub(crate) fn with_at_least(n: usize) -> Self {
-        let mut cap = 1usize << 16;
+    /// [`Self::new`]), starting from at least `min_slots` slots. The
+    /// vocab-seeding path inserts ~50k entries up front; sizing for them
+    /// avoids rehashing mid-seed. `min_slots` lets a parallel worker start
+    /// at the final capacity expected for its share of the input (see
+    /// `Tokenizer::fork_sized`), skipping the doubling-rehash churn of a
+    /// cold run — a starting point only, the table still grows past it at
+    /// 3/4 load. Either way the table is constructed exactly once, at the
+    /// max of the two requirements.
+    pub(crate) fn with_at_least(n: usize, min_slots: usize) -> Self {
+        let mut cap = min_slots.max(1 << 16).next_power_of_two();
         while (n + 1) * 4 > cap * 3 {
             cap *= 2;
         }
