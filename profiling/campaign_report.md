@@ -444,3 +444,84 @@ did the final §1 numbers get measured.
 | `opt/fix-seeding` | merged (`8723407`) | identity fix; hot probe/emit asm instruction-identical |
 | `opt/fix-walker-edge` | merged (`8a012b3`) | correctness fix; valid-UTF-8 path bit-identical |
 | review fixes | `1ffff3c` on mainline | hot-path asm bit-identical |
+| `opt/split-table` | rejected post-R5 (kept, `288fa8c`) | −22% MT / −32% ST; see §10 |
+
+## 10. Postscript: split-table experiment — rejected
+
+One more cache-footprint idea was built and measured after round 5:
+`opt/split-table` (`288fa8c`) splits the short-pretoken cache into a
+16-byte-entry "tiny" table for ≤ 7-byte pretokens — which carry 81.7% of
+probe volume — alongside the existing wide table, halving the table bytes
+touched by the common case.
+
+The implementation was correct: all differentials passed, including the
+200 MB qwen3_5 and 1 GB GPT-2 public-path suites. The performance was
+decisively not. Interleaved A/B against mainline measured:
+
+- **MT 6639 vs 8521 MB/s mean (−22%)**
+- **ST 698 vs 1024 MB/s (−32%)**
+
+Two costs outweigh the footprint halving on M4: the dual-probe ALU
+overhead (~10–14 extra ops per pretoken to route and probe two tables),
+and a **+0.71 pp slow-path rate** from tiny-table values that need 3+
+tokens spilling out of the 16-byte entry. This is consistent with §5's
+story — on this core the probe path was never footprint-bound, so paying
+issue-bandwidth to shrink it loses.
+
+Open question the rejection leaves behind: on the 255-thread EPYC target,
+aggregate table bytes across workers matter far more than on a
+16-thread M4, so the footprint argument may still hold there. The M4
+numbers make it a low-priority retry; any retry should start from
+`opt/split-table` rather than reimplementing.
+
+## 11. Final fresh-eyes review
+
+After the mt5/fix merges, a fresh review agent audited the three newest
+change sets — the mt5 `Committer`, fix-seeding, and fix-walker-edge — plus
+the two hand-resolved merges, against the `4772682` blobs
+(`scratchpad/review/final_fixes.md`). Verdict: **no critical or major
+correctness bugs**; the full hunt list (Committer gaplessness, panic
+safety, memory ordering, overflow fallback; seed-equals-miss purity and
+fork exactness; walker guard arithmetic and truncated-tail semantics
+across all six schemes) verified sound.
+
+Minor findings fixed on mainline in `dd28809`:
+
+- **Committer post-move pointer re-derivation** — the reservation's base
+  pointer was captured before the Vec moved three times, a
+  strict-aliasing (Stacked-Borrows move-retag) hazard; fine under today's
+  semantics but now closed outright.
+- **`SyncPtr::at` marked `unsafe fn`** — it performed pointer `add` under
+  a caller contract while presenting a safe signature.
+
+Remaining minors were accepted and documented rather than fixed:
+`set_added_tokens` can strand superseded arena slices across repeated
+mutation (bounded, loader-phase, at most a few hundred KB on realistic
+tokenizers), and `gather_fallbacks_match`'s "mid-flight overflow after a
+committed prefix" case is timing-probable rather than guaranteed (the
+identity assertion holds on both escape paths regardless).
+
+## 12. Test-suite consolidation
+
+Five rounds of agent branches accreted overlapping test modules into
+`tiktoken.rs`/`batch.rs`; `a13c125` consolidated them (−456 lines) with a
+full branch-diff audit confirming nothing from `opt/verify-heavy` was
+lost:
+
+- Duplicated fuzz/edge tests dropped in favor of the walker_edge ports,
+  which are strictly stronger (no truncated-UTF-8 tail sanitization —
+  that bug is fixed — plus the 0xFF+letter-tail shape).
+- Stale `#[ignore]` known-bug repros removed: both bugs are fixed and
+  covered by passing, non-ignored regression tests; the assert-free
+  diagnostic scratch module used to hunt the 0xFF-run flake deleted.
+- Heavy OWT differentials renamed into size tiers (`..._50m`, `..._200m`,
+  `..._1g`) with their run commands documented, so the cheap/expensive
+  split is explicit.
+
+## 13. Campaign ledger
+
+**30 Fable subagents** end to end: 1 profiling setup, 5 brainstorm/
+proposal, 11 implementation, 2 merge/bisect, 6 review, 1 heavy
+verification, 2 fix, 1 test consolidation, 1 report — plus this addendum
+agent and an x86-port-prep agent running concurrently on `opt/x86-port`
+(in flight at the time of writing; not counted above).
