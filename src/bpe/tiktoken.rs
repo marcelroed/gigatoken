@@ -157,7 +157,14 @@ impl Tokenizer {
         let pair_ranks =
             PairRankTable::build(&merges, byte_remapping.as_ref(), vocab.len()).map(Arc::new);
         let mut token_arena = Vec::new();
-        let pretoken_cache = Self::seeded_pretoken_cache(&vocab, &mut token_arena, 0);
+        let pretoken_cache = Self::seeded_pretoken_cache(
+            &vocab,
+            byte_remapping.as_ref(),
+            pair_ranks.as_deref(),
+            &merges,
+            &mut token_arena,
+            0,
+        );
         Tokenizer {
             merges: Arc::new(merges),
             pair_ranks,
@@ -176,20 +183,38 @@ impl Tokenizer {
         }
     }
 
-    /// A short-pretoken cache pre-seeded with every vocab entry of 1..=15
-    /// bytes as its own single-token encoding. Any short pretoken that is a
-    /// whole vocab word then hits the cache outright, so the miss path can
-    /// skip the reverse-vocab probe: a short miss is guaranteed not to be a
-    /// vocab word. Iterating IDs descending and keeping the first insert
-    /// per key resolves duplicate byte strings to the highest ID — the same
-    /// entry `vocab_inv` (built ascending, later inserts overwrite) returns.
+    /// A short-pretoken cache pre-seeded with the BPE encoding of every
+    /// vocab entry of 1..=15 bytes: precomputed miss results, computed by
+    /// the same [`Self::merge_short`] the miss path runs, so a seeded
+    /// value is bit-identical to what a cold miss on those bytes would
+    /// have produced and cached. Any short pretoken that is a whole vocab
+    /// word then hits the cache outright, so the miss path never sees one.
+    ///
+    /// The seed value must be the MERGE RESULT, not the entry's own ID:
+    /// BPE encode semantics (HF `tokenizers` without `ignore_merges`, this
+    /// repo's merge loop, and the pre-cache baseline 0e27c71) produce a
+    /// whole-word token only when the merge rules can derive it, and
+    /// vocabs may contain merge-UNREACHABLE entries — qwen3_5 has ~200
+    /// (multi-char CJK phrases, " Jap\u{f3}n", …) that must encode as
+    /// their merge decomposition. Seeding `bytes -> [own id]` was a
+    /// measured divergence from HF (see
+    /// `verify_vocab_seeded_cache_matches_merge_decomposition`). For
+    /// merge-reachable entries — all of gpt2/olmo3/qwen2/deepseek_v3 —
+    /// the merge result is the single own ID, as before. Duplicate byte
+    /// strings encode identically (the merge sees only bytes), so the
+    /// insert-if-absent dedup is purely a work-skip.
     ///
     /// `min_slots` additionally floors the table size for a worker with a
     /// known workload (see [`Self::fork_sized`]); the table is built once
     /// at the max of the seed requirement and that floor, so seeding never
-    /// grows it mid-way.
+    /// grows it mid-way. Values of 5+ tokens (only possible for
+    /// merge-unreachable entries) spill into `token_arena` like any other
+    /// miss.
     fn seeded_pretoken_cache(
         vocab: &[Arc<[u8]>],
+        byte_remapping: Option<&ByteRemapping>,
+        pair_ranks: Option<&PairRankTable>,
+        merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
         token_arena: &mut Vec<TokenId>,
         min_slots: usize,
     ) -> ShortPretokenCache {
@@ -198,6 +223,7 @@ impl Tokenizer {
             .filter(|bytes| (1..=15).contains(&bytes.len()))
             .count();
         let mut cache = ShortPretokenCache::with_at_least(n_short, min_slots);
+        let mut buf = [TokenId(0); SHORT_MERGE_MAX];
         for id in (0..vocab.len() as u32).rev() {
             let bytes = &vocab[id as usize];
             if !(1..=15).contains(&bytes.len()) {
@@ -206,11 +232,55 @@ impl Tokenizer {
             let key = pack_pretoken_key(bytes).expect("length checked <= 15");
             let h = pretoken_key_hash(key);
             if cache.get(key, h).is_none() {
-                let (val, ext) = Self::pack_val(&[TokenId(id)], token_arena);
+                let n = Self::merge_short(byte_remapping, pair_ranks, merges, bytes, &mut buf);
+                let (val, ext) = Self::pack_val(&buf[..n], token_arena);
                 cache.insert(key, h, val, ext);
             }
         }
         cache
+    }
+
+    /// BPE-encode one short pretoken (1..=15 bytes) into `buf`, returning
+    /// its token count: byte remapping, then the short merge loop. This is
+    /// exactly the computation [`Self::encode_pretoken_miss`] performs for
+    /// short keys — shared with [`Self::seeded_pretoken_cache`] so the
+    /// vocab seed can never disagree with a cold miss.
+    #[inline]
+    fn merge_short(
+        byte_remapping: Option<&ByteRemapping>,
+        pair_ranks: Option<&PairRankTable>,
+        merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
+        bytes: &[u8],
+        buf: &mut [TokenId; SHORT_MERGE_MAX],
+    ) -> usize {
+        let n = bytes.len();
+        debug_assert!((1..SHORT_MERGE_MAX).contains(&n));
+        match byte_remapping {
+            Some(br) => {
+                for (dst, &b) in buf[..n].iter_mut().zip(bytes) {
+                    *dst = br.mapping[b as usize];
+                }
+            }
+            None => {
+                for (dst, &b) in buf[..n].iter_mut().zip(bytes) {
+                    *dst = TokenId(b as u32);
+                }
+            }
+        }
+        if n < 2 {
+            return n;
+        }
+        match pair_ranks {
+            #[cfg(target_arch = "aarch64")]
+            Some(table) => bpe_merge_symbols_short_neon(table, buf, n),
+            #[cfg(not(target_arch = "aarch64"))]
+            Some(table) => bpe_merge_symbols_short_scalar(|a, b| table.rank(a, b), buf, n),
+            None => bpe_merge_symbols_short_scalar(
+                |a, b| merges.get(&(a, b)).map_or(u32::MAX, |m| m.0),
+                buf,
+                n,
+            ),
+        }
     }
 
     /// Pack a cache value: inline when possible, else spilled to the arena.
@@ -257,7 +327,14 @@ impl Tokenizer {
         let pair_ranks =
             PairRankTable::build(&merges, byte_remapping.as_ref(), vocab.len()).map(Arc::new);
         let mut token_arena = Vec::new();
-        let pretoken_cache = Self::seeded_pretoken_cache(&vocab, &mut token_arena, 0);
+        let pretoken_cache = Self::seeded_pretoken_cache(
+            &vocab,
+            byte_remapping.as_ref(),
+            pair_ranks.as_deref(),
+            &merges,
+            &mut token_arena,
+            0,
+        );
         Ok(Tokenizer {
             merges: Arc::new(merges),
             pair_ranks,
@@ -315,23 +392,24 @@ impl Tokenizer {
         let arena_cap = (expected_bytes / 256).min(1 << 24);
         let long_cap = (expected_bytes / 8192).min(1 << 20);
         let mut token_arena = Vec::with_capacity(arena_cap);
-        let mut pretoken_cache =
-            Self::seeded_pretoken_cache(&self.vocab, &mut token_arena, cache_slots);
+        let mut pretoken_cache = Self::seeded_pretoken_cache(
+            &self.vocab,
+            self.byte_remapping.as_ref(),
+            self.pair_ranks.as_deref(),
+            &self.merges,
+            &mut token_arena,
+            cache_slots,
+        );
         // Re-apply the added-token seed overwrites (see
-        // [`Self::add_special_token`]): the descending vocab seed above
-        // resolves a duplicated byte string to its HIGHEST vocab ID, but
-        // the parent's cache holds `vocab_inv`'s resolution for every
-        // short added-token content (seed-time equivalence plus the
+        // [`Self::add_special_token`]): the vocab seed above holds the
+        // MERGE encoding of every short byte string, but the parent's
+        // cache holds `[id]` for every short added-token content (the
         // `add_special_token` overwrite). Without this, a fork could emit
-        // a different ID than its parent for the same short pretoken.
+        // different IDs than its parent for the same short pretoken.
         for (content, _) in &self.added_tokens {
             if !(1..=15).contains(&content.len()) {
                 continue;
             }
-            // Query with `Q = Arc<[u8]>` (not `[u8]`): the miss path's
-            // hot `vocab_inv.get::<[u8]>` monomorphization must stay
-            // single-caller so it keeps inlining into
-            // `encode_pretoken_miss` (verified by asm diff).
             let Some(&id) = self.vocab_inv.get(content) else {
                 continue;
             };
@@ -401,7 +479,48 @@ impl Tokenizer {
                 .build(added_tokens.iter().map(|(c, _)| c.as_ref()))
                 .expect("added-token automaton construction cannot fail")
         });
-        self.added_tokens = added_tokens;
+        let outgoing = std::mem::replace(&mut self.added_tokens, added_tokens);
+        // Cache-seed sync invariant (see [`Self::seeded_pretoken_cache`]
+        // and [`Self::fork_sized`]): the short cache's seed-level state is
+        // always "vocab seed, then one `[vocab_inv[content]]` overwrite
+        // per CURRENT added-token content that resolves in `vocab_inv`" —
+        // a pure function of `(vocab, added_tokens)`, which is exactly
+        // what a fork's reseed + re-apply reconstructs, so parent and
+        // forked workers always agree on every short pretoken. Restore
+        // the plain seed value for the outgoing set first (only contents
+        // that resolve in `vocab_inv` were ever overwritten, so this
+        // replaces existing entries and never inserts), then apply the
+        // incoming overwrites.
+        for (content, _) in &outgoing {
+            if !(1..=15).contains(&content.len()) || self.vocab_inv.get(content).is_none() {
+                continue;
+            }
+            let key = pack_pretoken_key(content).expect("length checked <= 15");
+            let h = pretoken_key_hash(key);
+            let mut buf = [TokenId(0); SHORT_MERGE_MAX];
+            let n = Self::merge_short(
+                self.byte_remapping.as_ref(),
+                self.pair_ranks.as_deref(),
+                &self.merges,
+                content,
+                &mut buf,
+            );
+            let (val, ext) = Self::pack_val(&buf[..n], &mut self.token_arena);
+            self.pretoken_cache.replace(key, h, val, ext);
+        }
+        for i in 0..self.added_tokens.len() {
+            let (content, _) = &self.added_tokens[i];
+            if !(1..=15).contains(&content.len()) {
+                continue;
+            }
+            let Some(&id) = self.vocab_inv.get(content) else {
+                continue;
+            };
+            let key = pack_pretoken_key(content).expect("length checked <= 15");
+            let h = pretoken_key_hash(key);
+            let (val, ext) = Self::pack_val(&[id], &mut self.token_arena);
+            self.pretoken_cache.replace(key, h, val, ext);
+        }
     }
 
     /// Register one additional added token, extending the decode vocab when
@@ -424,24 +543,15 @@ impl Tokenizer {
         }
         if vocab[idx].is_empty() {
             vocab[idx] = content.clone().into();
+            // If `content` duplicates an already-present vocab byte
+            // string, `vocab_inv` switches to the new ID (unconditional
+            // overwrite). The short-cache overwrite that keeps a matching
+            // pretoken resolving to `vocab_inv`'s answer happens in
+            // `set_added_tokens` below, which re-derives every added-token
+            // cache overwrite from the updated `vocab_inv` — the same
+            // computation a fork's reseed + re-apply performs (see
+            // [`Self::fork_sized`]), so parent and forked workers agree.
             Arc::make_mut(&mut self.vocab_inv).insert(vocab[idx].clone(), id);
-            // Keep the vocab seed in sync (see `seeded_pretoken_cache`): a
-            // short pretoken matching this content must resolve to `id`
-            // without the miss path's reverse-vocab probe. OVERWRITE any
-            // existing entry, mirroring the unconditional `vocab_inv`
-            // overwrite above — if `content` duplicates an already-seeded
-            // vocab byte string, the cache must switch to the new ID just
-            // like `vocab_inv` does (and like the pre-seeding cold-cache
-            // `vocab_inv` probe would have). Forks re-apply this overwrite
-            // after their vocab reseed (see [`Self::fork_sized`]), so
-            // parent and forked workers agree.
-            if (1..=15).contains(&content.len())
-                && let Some(key) = pack_pretoken_key(&content)
-            {
-                let h = pretoken_key_hash(key);
-                let (val, ext) = Self::pack_val(&[id], &mut self.token_arena);
-                self.pretoken_cache.replace(key, h, val, ext);
-            }
         }
         let mut added: Vec<(Vec<u8>, TokenId)> = self
             .added_tokens
@@ -847,67 +957,48 @@ impl Tokenizer {
     ) {
         if key != 0 {
             // Short pretoken (≤ 15 bytes, the overwhelming majority of
-            // misses). The cache is pre-seeded with every short vocab entry
-            // (see `seeded_pretoken_cache`), so a miss here is never a whole
-            // vocab word — no reverse-vocab probe, straight to byte symbols
-            // and the merge loop, in a stack buffer instead of the `Vec`
-            // scratch.
-            let n = bytes.len();
+            // misses): straight to byte symbols and the merge loop
+            // (`merge_short`, shared with the vocab seed), in a stack
+            // buffer instead of the `Vec` scratch. The cache is pre-seeded
+            // with the merge result of every short vocab entry (see
+            // `seeded_pretoken_cache`), so a miss here is never a whole
+            // vocab word — but nothing depends on that: the merge is the
+            // correct encoding for any bytes.
             let mut buf = [TokenId(0); SHORT_MERGE_MAX];
-            match self.byte_remapping.as_ref() {
-                Some(br) => {
-                    for (dst, &b) in buf[..n].iter_mut().zip(bytes) {
-                        *dst = br.mapping[b as usize];
-                    }
-                }
-                None => {
-                    for (dst, &b) in buf[..n].iter_mut().zip(bytes) {
-                        *dst = TokenId(b as u32);
-                    }
-                }
-            }
-            let n = if n >= 2 {
-                match self.pair_ranks.as_deref() {
-                    #[cfg(target_arch = "aarch64")]
-                    Some(table) => bpe_merge_symbols_short_neon(table, &mut buf, n),
-                    #[cfg(not(target_arch = "aarch64"))]
-                    Some(table) => {
-                        bpe_merge_symbols_short_scalar(|a, b| table.rank(a, b), &mut buf, n)
-                    }
-                    None => bpe_merge_symbols_short_scalar(
-                        |a, b| self.merges.get(&(a, b)).map_or(u32::MAX, |m| m.0),
-                        &mut buf,
-                        n,
-                    ),
-                }
-            } else {
-                n
-            };
+            let n = Self::merge_short(
+                self.byte_remapping.as_ref(),
+                self.pair_ranks.as_deref(),
+                &self.merges,
+                bytes,
+                &mut buf,
+            );
             let symbols = &buf[..n];
             let (val, ext) = Self::pack_val(symbols, &mut self.token_arena);
             self.pretoken_cache.insert_at(slot, key, h, val, ext);
             out.extend_from_slice(token_ids_as_u32s(symbols));
         } else {
-            // Long pretoken (> 15 bytes, rare). A pretoken that is a
-            // complete vocab entry skips the merge loop entirely via one
-            // reverse-vocab probe (short keys get this from the vocab seed;
-            // long ones still need the probe).
+            // Long pretoken (> 15 bytes, rare): remap and run the merge
+            // loop. Deliberately NO whole-pretoken reverse-vocab
+            // (`vocab_inv`) shortcut here — a vocab entry is not
+            // guaranteed to be derivable from its own merges (qwen3_5 has
+            // ~50 entries > 15 bytes, multi-char CJK phrases, that HF
+            // `tokenizers` without `ignore_merges` encodes as their merge
+            // decomposition, never as the single ID), so any such
+            // shortcut diverges from HF and from the pre-cache baseline.
+            // The same rule holds for short keys via the seeded merge
+            // results above. Do not reintroduce it.
             let symbols = &mut self.symbol_scratch;
             symbols.clear();
-            if let Some(&tid) = self.vocab_inv.get(bytes) {
-                symbols.push(tid);
-            } else {
-                match self.byte_remapping.as_ref() {
-                    Some(br) => symbols.extend(bytes.iter().map(|&b| br.mapping[b as usize])),
-                    None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
+            match self.byte_remapping.as_ref() {
+                Some(br) => symbols.extend(bytes.iter().map(|&b| br.mapping[b as usize])),
+                None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
+            }
+            match self.pair_ranks.as_deref() {
+                Some(table) => {
+                    bpe_merge_symbols_table_with_scratch(table, symbols, &mut self.merge_scratch)
                 }
-                match self.pair_ranks.as_deref() {
-                    Some(table) => {
-                        bpe_merge_symbols_table_with_scratch(table, symbols, &mut self.merge_scratch)
-                    }
-                    None => {
-                        bpe_merge_symbols_with_scratch(&self.merges, symbols, &mut self.merge_scratch)
-                    }
+                None => {
+                    bpe_merge_symbols_with_scratch(&self.merges, symbols, &mut self.merge_scratch)
                 }
             }
             let len = symbols.len() as u32;
@@ -1065,7 +1156,10 @@ mod tests {
 
     /// GPT-2 must take the PairRankTable fast path, with the table agreeing
     /// with the merges map, and the vocab seed must serve every short vocab
-    /// word as its own ID (what the removed reverse-vocab probe returned).
+    /// word as its own ID: every base GPT-2 entry is merge-reachable, so
+    /// its merge decomposition IS the single own ID, and the one
+    /// unreachable entry (<|endoftext|>, an added token) gets the
+    /// `set_added_tokens` `[id]` overwrite.
     #[test]
     fn gpt2_pair_rank_table_and_vocab_seed() {
         use crate::load_tokenizer::hf::load_hf_bpe;
@@ -1104,8 +1198,9 @@ mod tests {
                 .get(key, pretoken_key_hash(key))
                 .expect("short vocab entry must be seeded");
             // Every real vocab ID is < 2^24, so the seed is inline: 1 token,
-            // the entry's own ID (duplicates resolve to the highest ID, but
-            // GPT-2 has none).
+            // the entry's own ID (GPT-2 has no duplicate byte strings and,
+            // added-token overwrites included, no entry whose cached value
+            // differs from its own ID).
             assert_eq!(val, 1 | ((id as u64) << 8), "vocab entry {id}");
             assert_eq!(ext, 0, "vocab entry {id}");
             seeded += 1;
@@ -1487,11 +1582,12 @@ mod verify_heavy {
         let input = load_owt(200_000_000);
         assert!(input.len() > 190_000_000, "corpus too small: {}", input.len());
         let mut ran = 0usize;
-        // qwen3_5 LAST: it fails on the KNOWN vocab-seed bug (see
-        // verify_vocab_seeded_cache_overrides_merges_known_bug) — its vocab
-        // has 201 merge-unreachable entries that the seeded cache returns
-        // as single tokens, diverging from HF. Keep it in the list so the
-        // failure stays visible until fixed, after the clean tokenizers.
+        // qwen3_5 is the load-bearing tokenizer here: its vocab has ~200
+        // merge-unreachable entries (CJK phrases, " Jap\u{f3}n", …) that
+        // the raw-ID vocab seed used to return as single tokens, diverging
+        // from HF (see verify_vocab_seeded_cache_matches_merge_decomposition);
+        // the seed now stores merge decompositions. Kept last so the clean
+        // tokenizers report first on a regression.
         for name in ["olmo3", "qwen2", "deepseek_v3", "qwen3_5"] {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("data/{name}_tokenizer.json"));
@@ -1828,28 +1924,24 @@ mod verify_heavy {
 }
 
 
-/// KNOWN BUG repro (optimization-introduced, commit d39bca2 "vocab-seeded
-/// cache"): `seeded_pretoken_cache` seeds EVERY short (<= 15 byte) vocab
-/// entry as pretoken -> [own id], but BPE encode semantics (HF
-/// `tokenizers` without `ignore_merges`, and this repo's own merge loop)
-/// only produce a vocab entry that the merge rules can derive. qwen3_5's
-/// vocab has 201 merge-unreachable entries (mostly multi-char CJK phrases,
-/// plus e.g. " Jap\u{f3}n"); when one appears as a whole pretoken the
-/// cached pipeline returns the single seeded id while HF returns the merge
-/// split. Verified against HF `tokenizers`: encode(" Jap\u{f3}n") on
-/// data/qwen3_5_tokenizer.json gives [604, 385, 3064] ("ĠJ", "ap", "Ã³n");
-/// gigatoken 1ffff3c gives [209344] (" Jap\u{f3}n"). The pre-optimization
-/// baseline (0e27c71) had no cache seeding and matched HF. The gpt2,
-/// olmo3, qwen2, and deepseek_v3 vocabs have zero unreachable entries, so
-/// only qwen3_5-style vocabs are affected. Asserts the CORRECT (HF)
-/// behavior, so it FAILS until fixed; un-ignore with the fix.
+/// Regression test for the vocab-seeded cache (commit d39bca2 originally
+/// seeded EVERY short vocab entry as pretoken -> [own id]): BPE encode
+/// semantics (HF `tokenizers` without `ignore_merges`, this repo's merge
+/// loop, and the pre-cache baseline 0e27c71) produce a whole-vocab-word
+/// token only when the merge rules can derive it. qwen3_5's vocab has
+/// ~200 merge-unreachable entries (mostly multi-char CJK phrases, plus
+/// e.g. " Jap\u{f3}n"); when one appears as a whole pretoken the pipeline
+/// must return the merge decomposition, exactly as if it had missed —
+/// the seed is precomputed misses (`merge_short`), never the raw ID.
+/// Ground truth verified against HF `tokenizers`: encode(" Jap\u{f3}n")
+/// on data/qwen3_5_tokenizer.json gives [604, 385, 3064] ("ĠJ", "ap",
+/// "Ã³n"); the raw-ID seed returned [209344] (" Jap\u{f3}n").
 #[cfg(test)]
 mod verify_known_bugs {
     use crate::load_tokenizer::hf::load_hf_bpe;
 
     #[test]
-    #[ignore = "KNOWN BUG: vocab-seeded cache overrides merge-unreachable entries (d39bca2); fails as of 1ffff3c"]
-    fn verify_vocab_seeded_cache_overrides_merges_known_bug() {
+    fn verify_vocab_seeded_cache_matches_merge_decomposition() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("data/qwen3_5_tokenizer.json");
         let mut tok = load_hf_bpe(&path).expect("load qwen3_5");
@@ -1862,6 +1954,24 @@ mod verify_known_bugs {
             cached,
             vec![604, 385, 3064],
             "seeded cache returned the merge-unreachable whole-vocab entry"
+        );
+
+        // Same rule on the long (> 15 byte) miss path, which used to take
+        // a whole-pretoken vocab_inv shortcut: a merge-unreachable long
+        // vocab entry must also encode as its decomposition. qwen3_5 id
+        // 107517 is a 30-byte CJK phrase HF splits in 3.
+        let long_entry = tok
+            .vocab_entries()
+            .find(|&(id, _)| id == 107517)
+            .map(|(_, b)| b.to_vec())
+            .expect("qwen3_5 vocab entry 107517");
+        assert!(long_entry.len() > 15, "expected a long entry");
+        let mut cached_long: Vec<u32> = Vec::new();
+        tok.encode_with_added_tokens_flat(&long_entry, &mut cached_long);
+        assert_ne!(
+            cached_long,
+            vec![107517],
+            "long miss path returned the merge-unreachable whole-vocab entry"
         );
     }
 }
