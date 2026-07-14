@@ -153,6 +153,14 @@ fn unpack_val_lanes(val: u64, ext: u64) -> [u32; 4] {
 /// [`Tokenizer::fork_sized`] (after a fork's fresh reseed) apply the
 /// overwrites through this one body, so parent and forked workers always
 /// agree on every short pretoken.
+/// One piece of the added-token pipeline walk (see
+/// [`Tokenizer::for_each_piece`]): a between-occurrences text segment to
+/// pretokenize and encode, or an added token's ID to emit verbatim.
+enum Piece<'a> {
+    Segment(&'a [u8]),
+    Added(TokenId),
+}
+
 fn apply_added_token_overwrites(
     added_tokens: &[(Arc<[u8]>, TokenId)],
     vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
@@ -602,12 +610,14 @@ impl Tokenizer {
         Some((from + m.start(), from + m.end(), id))
     }
 
-    /// Encode raw text: split out added-token occurrences (emitted as their
-    /// single token ID), pretokenize the segments between them with this
-    /// tokenizer's pretokenization scheme, and BPE-encode each pretoken.
-    /// This mirrors the full HuggingFace `tokenizers` encode pipeline.
-    pub fn encode_with_added_tokens(&mut self, bytes: &[u8], mut f: impl FnMut(&[TokenId])) {
-        let pretokenizer_type = self.pretokenizer_type;
+    /// Shared piece walk of the added-token pipeline: split out added-token
+    /// occurrences and hand each piece — the (possibly NFC-normalized)
+    /// segment between occurrences, or the added token's ID — to `f` in
+    /// input order. Scheme dispatch costs one enum match per 256-pretoken
+    /// chunk fill (see [`PretokenizerType::pretokenize`] and
+    /// `FastPretokenizerDispatch::fill_spans_keyed`), which delegates to
+    /// the same out-of-line concrete fills a hardcoded pretokenizer uses.
+    fn for_each_piece(&mut self, bytes: &[u8], mut f: impl FnMut(&mut Self, Piece<'_>)) {
         let normalize_nfc = self.normalize_nfc;
         let mut nfc_buf = String::new();
         let mut pos = 0;
@@ -621,29 +631,10 @@ impl Tokenizer {
             } else {
                 &bytes[pos..seg_end]
             };
-            match pretokenizer_type {
-                PretokenizerType::GPT2 => {
-                    self.memoized_encode(FastR50kPretokenizer::new(segment), &mut f)
-                }
-                PretokenizerType::GPT4 => {
-                    self.memoized_encode(FastCl100kPretokenizer::new(segment), &mut f)
-                }
-                PretokenizerType::Qwen2 => {
-                    self.memoized_encode(FastQwen2Pretokenizer::new(segment), &mut f)
-                }
-                PretokenizerType::Qwen35 => {
-                    self.memoized_encode(FastQwen35Pretokenizer::new(segment), &mut f)
-                }
-                PretokenizerType::Olmo3 => {
-                    self.memoized_encode(FastOlmo3Pretokenizer::new(segment), &mut f)
-                }
-                PretokenizerType::DeepSeekV3 => {
-                    self.memoized_encode(FastDeepSeekV3Pretokenizer::new(segment), &mut f)
-                }
-            }
+            f(self, Piece::Segment(segment));
             match added {
                 Some((end, id)) => {
-                    f(&[id]);
+                    f(self, Piece::Added(id));
                     pos = end;
                 }
                 None => break,
@@ -651,53 +642,28 @@ impl Tokenizer {
         }
     }
 
+    /// Encode raw text: split out added-token occurrences (emitted as their
+    /// single token ID), pretokenize the segments between them with this
+    /// tokenizer's pretokenization scheme, and BPE-encode each pretoken.
+    /// This mirrors the full HuggingFace `tokenizers` encode pipeline.
+    pub fn encode_with_added_tokens(&mut self, bytes: &[u8], mut f: impl FnMut(&[TokenId])) {
+        let pt = self.pretokenizer_type;
+        self.for_each_piece(bytes, |this, piece| match piece {
+            Piece::Segment(segment) => this.memoized_encode(pt.pretokenize(segment), &mut f),
+            Piece::Added(id) => f(&[id]),
+        });
+    }
+
     /// Flat variant of [`Self::encode_with_added_tokens`]: the identical
     /// token stream appended to `out` as raw u32 ids, routed through
     /// [`Self::memoized_encode_flat`] so segment tokens land directly in
     /// the caller's buffer (the batch engine's per-chunk id buffer).
     pub fn encode_with_added_tokens_flat(&mut self, bytes: &[u8], out: &mut Vec<u32>) {
-        let pretokenizer_type = self.pretokenizer_type;
-        let normalize_nfc = self.normalize_nfc;
-        let mut nfc_buf = String::new();
-        let mut pos = 0;
-        while pos < bytes.len() {
-            let (seg_end, added) = match self.find_added_token(bytes, pos) {
-                Some((start, end, id)) => (start, Some((end, id))),
-                None => (bytes.len(), None),
-            };
-            let segment = if normalize_nfc {
-                nfc_segment(&bytes[pos..seg_end], &mut nfc_buf)
-            } else {
-                &bytes[pos..seg_end]
-            };
-            match pretokenizer_type {
-                PretokenizerType::GPT2 => {
-                    self.memoized_encode_flat(FastR50kPretokenizer::new(segment), out)
-                }
-                PretokenizerType::GPT4 => {
-                    self.memoized_encode_flat(FastCl100kPretokenizer::new(segment), out)
-                }
-                PretokenizerType::Qwen2 => {
-                    self.memoized_encode_flat(FastQwen2Pretokenizer::new(segment), out)
-                }
-                PretokenizerType::Qwen35 => {
-                    self.memoized_encode_flat(FastQwen35Pretokenizer::new(segment), out)
-                }
-                PretokenizerType::Olmo3 => {
-                    self.memoized_encode_flat(FastOlmo3Pretokenizer::new(segment), out)
-                }
-                PretokenizerType::DeepSeekV3 => {
-                    self.memoized_encode_flat(FastDeepSeekV3Pretokenizer::new(segment), out)
-                }
-            }
-            match added {
-                Some((end, id)) => {
-                    out.push(id.0);
-                    pos = end;
-                }
-                None => break,
-            }
-        }
+        let pt = self.pretokenizer_type;
+        self.for_each_piece(bytes, |this, piece| match piece {
+            Piece::Segment(segment) => this.memoized_encode_flat(pt.pretokenize(segment), out),
+            Piece::Added(id) => out.push(id.0),
+        });
     }
 
     /// For each pretoken in the input iterator, looks up the string in the
@@ -1243,8 +1209,11 @@ mod tests {
         assert!(tokenizer.pretoken_cache_long.contains_key(&b""[..]));
     }
 
+    /// With no added tokens configured, `encode_with_added_tokens`'s piece
+    /// walk reduces to one whole-input segment — its output must equal a
+    /// direct `memoized_encode` of the same scheme's pretokens.
     #[test]
-    fn concrete_pretokenizer_dispatch_matches_enum_dispatch() {
+    fn encode_with_added_tokens_matches_memoized_encode_all_schemes() {
         let schemes = [
             PretokenizerType::GPT2,
             PretokenizerType::GPT4,

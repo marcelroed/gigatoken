@@ -134,9 +134,10 @@ pub(crate) fn pack_pretoken_key(bytes: &[u8]) -> Option<u128> {
 /// picked at compile time; on x86_64 it is picked per process by
 /// [`crc_hash_selected`], an immutable pure function of the CPU — this
 /// entry point branches on that bit (cheap at the cold/slow sites that
-/// use it), and the hot fill loops instead embed one arm per
-/// monomorphization, dispatched once per fill on the same bit (see
-/// [`fill_span_hash`]), so the same key always hashes the same way. All
+/// use it, including the test-only [`fill_spans_keyed_with`]), and the
+/// two hot fill loops instead embed one arm per monomorphization,
+/// dispatched once per fill on the same bit (see [`fill_span_hash`]), so
+/// the same key always hashes the same way. All
 /// arms map key 0 to hash 0, which the fill loops' long-pretoken route
 /// stores.
 #[inline(always)]
@@ -405,43 +406,15 @@ pub unsafe trait PretokenSpans<'a> {
 /// into a single out-of-line loop (see the trait docs for why that fusion
 /// matters). Sources that walk one backing slice use
 /// [`fill_spans_keyed_with_buf`] instead.
+///
+/// No production caller walks this path — the concrete pretokenizers and
+/// the dispatch enum all fill through [`fill_spans_keyed_with_buf`] or
+/// `fast::fill_spans_two_phase` — so unlike those two, it takes no
+/// CRC-monomorphized wrapper: [`pretoken_key_hash`]'s per-span dispatch
+/// branch (same process-immutable [`crc_hash_selected`] bit, so hash
+/// values agree with every other site) is irrelevant off the hot path.
 #[inline(always)]
 pub(crate) fn fill_spans_keyed_with<'a>(
-    next: impl FnMut() -> Option<&'a [u8]>,
-    batch: &mut SpanBatch<'a>,
-    prefetch: &impl Fn(u64),
-) -> usize {
-    // Hash-arm dispatch, once per fill (≤ [`PRETOKEN_CHUNK`] spans), on
-    // the process-immutable [`crc_hash_selected`] bit — see
-    // [`fill_span_hash`] for why this keeps every hash site consistent.
-    #[cfg(target_arch = "x86_64")]
-    if crc_hash_selected() {
-        // SAFETY: `crc_hash_selected` verified SSE4.2 support.
-        return unsafe { fill_spans_keyed_with_crc(next, batch, prefetch) };
-    }
-    fill_spans_keyed_with_impl::<false>(next, batch, prefetch)
-}
-
-/// The SSE4.2 (CRC-hash) monomorphization of [`fill_spans_keyed_with`].
-///
-/// # Safety
-///
-/// The CPU must support SSE4.2 ([`crc_hash_selected`] must have returned
-/// true).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse4.2")]
-unsafe fn fill_spans_keyed_with_crc<'a>(
-    next: impl FnMut() -> Option<&'a [u8]>,
-    batch: &mut SpanBatch<'a>,
-    prefetch: &impl Fn(u64),
-) -> usize {
-    fill_spans_keyed_with_impl::<true>(next, batch, prefetch)
-}
-
-/// [`fill_spans_keyed_with`]'s loop body, monomorphized on the hash arm
-/// (`X86_CRC` — see [`fill_span_hash`]'s reachability contract).
-#[inline(always)]
-fn fill_spans_keyed_with_impl<'a, const X86_CRC: bool>(
     mut next: impl FnMut() -> Option<&'a [u8]>,
     batch: &mut SpanBatch<'a>,
     prefetch: &impl Fn(u64),
@@ -450,7 +423,7 @@ fn fill_spans_keyed_with_impl<'a, const X86_CRC: bool>(
     while n < PRETOKEN_CHUNK {
         let Some(span) = next() else { break };
         let (key, h) = match pack_pretoken_key(span) {
-            Some(key) => (key, fill_span_hash::<X86_CRC>(key)),
+            Some(key) => (key, pretoken_key_hash(key)),
             None => (0, 0),
         };
         prefetch(h);

@@ -2,6 +2,26 @@ pub(crate) mod pretoken_cache;
 pub mod sentencepiece;
 pub mod tiktoken;
 
+/// Ask the kernel for 2 MiB pages over `[ptr, ptr + bytes)` before first
+/// touch. Huge pages cut the fault count of faulting in a multi-GB buffer
+/// ~500x, and Zen drops software prefetches that miss the TLB, so both the
+/// pretoken-cache table and the batch gather's copies want the coverage.
+/// `MADV_HUGEPAGE` only hints page sizing; no-op off Linux (and where THP
+/// is unavailable). Lives here (not `batch`) so the bin target's module
+/// tree, which includes `bpe` but not `batch`, sees one copy too.
+pub(crate) fn madvise_hugepage(ptr: *mut u8, bytes: usize) {
+    #[cfg(target_os = "linux")]
+    if bytes > 0 {
+        // SAFETY: callers pass a range within one live allocation, and the
+        // hint does not read or write the memory.
+        unsafe {
+            libc::madvise(ptr as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (ptr, bytes);
+}
+
 use crate::token::TokenId;
 use eyre::{Result, anyhow};
 use std::collections::HashMap;

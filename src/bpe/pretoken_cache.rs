@@ -68,12 +68,9 @@ impl Slots {
         let Some(ptr) = NonNull::new(raw as *mut Entry) else {
             handle_alloc_error(layout)
         };
-        #[cfg(target_os = "linux")]
-        // SAFETY: the range is exactly this fresh allocation, 2 MiB-aligned;
-        // MADV_HUGEPAGE only hints page sizing and cannot invalidate it.
-        unsafe {
-            libc::madvise(raw as *mut libc::c_void, layout.size(), libc::MADV_HUGEPAGE);
-        }
+        // The fresh allocation is 2 MiB-aligned (see `layout`), so the
+        // hint can take effect immediately.
+        super::madvise_hugepage(raw, layout.size());
         Self { ptr, cap }
     }
 
@@ -111,6 +108,42 @@ impl Drop for Slots {
 // SAFETY: Slots owns its allocation exclusively, like Box<[Entry]>.
 unsafe impl Send for Slots {}
 unsafe impl Sync for Slots {}
+
+/// Request the line holding `p` into L1 (`L1 = true`) or L2 only — the
+/// shared ladder behind [`ShortPretokenCache::prefetch_l2`] and
+/// [`ProbeView::prefetch`]. No-op on arches without a prefetch hint.
+#[inline(always)]
+fn prefetch_line<const L1: bool>(p: *const Entry) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetch has no memory effects; any address is allowed.
+    unsafe {
+        use core::arch::x86_64::{_MM_HINT_T0, _MM_HINT_T1, _mm_prefetch};
+        if L1 {
+            _mm_prefetch(p as *const i8, _MM_HINT_T0);
+        } else {
+            _mm_prefetch(p as *const i8, _MM_HINT_T1);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: prefetch has no memory effects; any address is allowed.
+    unsafe {
+        if L1 {
+            core::arch::asm!(
+                "prfm pldl1keep, [{p}]",
+                p = in(reg) p,
+                options(nostack, preserves_flags, readonly)
+            );
+        } else {
+            core::arch::asm!(
+                "prfm pldl2keep, [{p}]",
+                p = in(reg) p,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
 
 pub(crate) struct ShortPretokenCache {
     slots: Slots,
@@ -156,23 +189,7 @@ impl ShortPretokenCache {
     /// way a chunk's worth of L1 prefetches would.
     #[inline(always)]
     pub(crate) fn prefetch_l2(&self, h: u64) {
-        let p = self.pair_ptr(h);
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: prefetch has no memory effects; any address is allowed.
-        unsafe {
-            core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T1);
-        }
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: prefetch has no memory effects; any address is allowed.
-        unsafe {
-            core::arch::asm!(
-                "prfm pldl2keep, [{p}]",
-                p = in(reg) p,
-                options(nostack, preserves_flags, readonly)
-            );
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let _ = p;
+        prefetch_line::<false>(self.pair_ptr(h));
     }
 
     /// A raw, `Copy` snapshot of the probe parameters for the emit loop's
@@ -345,23 +362,7 @@ impl ProbeView {
     /// into L2 by [`ShortPretokenCache::prefetch_l2`] a chunk earlier).
     #[inline(always)]
     pub(crate) fn prefetch(&self, h: u64) {
-        let p = self.pair_ptr(h);
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: prefetch has no memory effects; any address is allowed.
-        unsafe {
-            core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
-        }
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: prefetch has no memory effects; any address is allowed.
-        unsafe {
-            core::arch::asm!(
-                "prfm pldl1keep, [{p}]",
-                p = in(reg) p,
-                options(nostack, preserves_flags, readonly)
-            );
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let _ = p;
+        prefetch_line::<true>(self.pair_ptr(h));
     }
 
     /// Branchless probe of `key`'s home pair: both compares fold into one

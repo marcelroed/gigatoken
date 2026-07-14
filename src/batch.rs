@@ -6,9 +6,11 @@
 
 use crate::Tokenizer;
 use crate::bpe;
+use crate::bpe::madvise_hugepage;
 use crate::input::DocumentIter;
 use crate::input::file_source::{DocFormat, chunk_ranges};
 use std::ops::Range;
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
 
@@ -286,24 +288,6 @@ fn row_counts(chunks: &[ChunkTokens]) -> Vec<i64> {
     counts
 }
 
-/// Ask the kernel for 2 MiB pages over `[ptr, ptr + bytes)` before first
-/// touch. Huge pages cut the fault count of faulting in a multi-GB buffer
-/// ~500x, and Zen drops software prefetches that miss the TLB, so the
-/// encode-side copies want the coverage too. `MADV_HUGEPAGE` only hints
-/// page sizing; no-op off Linux (and where THP is unavailable).
-pub(crate) fn madvise_hugepage(ptr: *mut u8, bytes: usize) {
-    #[cfg(target_os = "linux")]
-    if bytes > 0 {
-        // SAFETY: callers pass a range within one live allocation, and the
-        // hint does not read or write the memory.
-        unsafe {
-            libc::madvise(ptr as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = (ptr, bytes);
-}
-
 /// Free spent chunk buffers off the caller's critical path. They total as
 /// much memory as the gathered result, and tearing them down is munmap page
 /// teardown under the address-space write lock: inline frees convoy the
@@ -345,11 +329,12 @@ fn defer_drop(chunks: Vec<ChunkTokens>) {
 /// (composition-exclusion pathologies) — `advance` stops committing and
 /// `finish` returns None rather than write past the reservation.
 struct Committer {
-    /// Owns the reservation; untouched until `finish`.
-    flat: Vec<u32>,
-    /// `flat.as_mut_ptr()`, captured once so workers can write through a
-    /// pointer with mutable provenance while `flat` itself sits unmoved.
-    base: *mut u32,
+    /// Owns the reservation; the Vec struct itself is read or written only
+    /// in `finish`. `UnsafeCell` so each `advance` derives the destination
+    /// pointer fresh under the cursor lock: no pointer is captured across
+    /// the struct's construction-time moves (a move retags the Vec's
+    /// unique pointer under strict aliasing models).
+    flat: UnsafeCell<Vec<u32>>,
     /// Reserved capacity in tokens; commits never write at or past it.
     cap: usize,
     cursor: Mutex<CommitCursor>,
@@ -364,12 +349,11 @@ struct CommitCursor {
     overflowed: bool,
 }
 
-// SAFETY: `base` points into `flat`'s heap allocation, which is never
-// reallocated or moved while shared (nothing pushes to `flat`; the Vec
-// moves only in `finish`, after all shared use has ended, and moving the
-// Vec struct does not move its buffer). Writes through `base` happen only
-// while holding `cursor` (disjoint, in-bounds ranges) or in `finish`'s
-// exclusive post-join phases.
+// SAFETY: the heap buffer behind `flat` is never reallocated while shared
+// (nothing pushes to the Vec; it is resized only in `finish`, after all
+// shared use has ended). During the shared phase the cell is used solely
+// to derive the buffer pointer under the `cursor` lock, and every write
+// through it lands in a disjoint, in-bounds range.
 unsafe impl Send for Committer {}
 unsafe impl Sync for Committer {}
 
@@ -386,12 +370,10 @@ impl Committer {
         if cap == 0 || flat.try_reserve_exact(cap).is_err() {
             return None;
         }
-        let base = flat.as_mut_ptr();
         // The commits fault this reservation in while the encode runs.
-        madvise_hugepage(base as *mut u8, cap * std::mem::size_of::<u32>());
+        madvise_hugepage(flat.as_mut_ptr() as *mut u8, cap * std::mem::size_of::<u32>());
         Some(Self {
-            flat,
-            base,
+            flat: UnsafeCell::new(flat),
             cap,
             cursor: Mutex::new(CommitCursor {
                 next: 0,
@@ -410,6 +392,10 @@ impl Committer {
         let Ok(mut cur) = self.cursor.try_lock() else {
             return;
         };
+        // SAFETY: the cursor lock is held; the Vec struct is not mutated
+        // during the shared phase (see the `flat` field doc), so deriving
+        // the buffer pointer only reads it.
+        let base = unsafe { (*self.flat.get()).as_mut_ptr() };
         for _ in 0..Self::MAX_DRAIN {
             if cur.overflowed {
                 return;
@@ -426,7 +412,7 @@ impl Committer {
             // is within the reservation (checked above) and disjoint from
             // every earlier commit (offset is monotone).
             unsafe {
-                std::ptr::copy_nonoverlapping(chunk.ids.as_ptr(), self.base.add(cur.offset), len);
+                std::ptr::copy_nonoverlapping(chunk.ids.as_ptr(), base.add(cur.offset), len);
             }
             cur.offset += len;
             cur.next += 1;
@@ -453,12 +439,8 @@ impl Committer {
             }
         }
 
-        let Committer {
-            mut flat,
-            base: _,
-            cap,
-            cursor,
-        } = self;
+        let Committer { flat, cap, cursor } = self;
+        let mut flat = flat.into_inner();
         let cur = cursor
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -473,11 +455,9 @@ impl Committer {
             offset += chunk.ids.len();
         }
         debug_assert_eq!(offset, total);
-        // Re-derive the destination pointer from the Vec AFTER it moved out
-        // of `self`: the pre-move `base` is only valid for the shared phase
-        // (while the Committer sat unmoved); a move retags the Vec's unique
-        // pointer under strict aliasing models, so post-move writes and the
-        // `set_len` below must go through a pointer derived post-move.
+        // Derived AFTER the Vec moved out of the cell: a move retags the
+        // Vec's unique pointer under strict aliasing models, so the suffix
+        // writes and the `set_len` below go through a post-move pointer.
         let base = SyncPtr(flat.as_mut_ptr());
         // `with_max_len(1)` keeps the multi-MB copies stealable one by one.
         rest.par_iter()
