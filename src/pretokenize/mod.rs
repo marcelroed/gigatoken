@@ -61,10 +61,12 @@ pub const PRETOKEN_CHUNK: usize = 256;
 /// `n → key → store` chain; per-half variable shifts are single 1-cycle
 /// ops, so the halves cost two independent 3-deep chains and no load port.
 /// The length tag (`n << 120`) touches only the high half and is OR'd in
-/// by the caller.
+/// by the caller. `const`: the phase-B emission loop's `PACK_MASK_TABLE`
+/// (see `fast::mask`) is built from this at compile time, so the ALU and
+/// table forms cannot drift apart.
 #[inline(always)]
-pub(crate) fn pack_mask_halves(n: usize) -> (u64, u64) {
-    debug_assert!((1..=15).contains(&n));
+pub(crate) const fn pack_mask_halves(n: usize) -> (u64, u64) {
+    debug_assert!(n >= 1 && n <= 15);
     let s = (n * 8) as u32;
     let lo = if n < 8 { u64::MAX >> (64u32.wrapping_sub(s) & 63) } else { u64::MAX };
     let hi = if n > 8 { u64::MAX >> (128u32.wrapping_sub(s) & 63) } else { 0 };
@@ -247,6 +249,9 @@ pub(crate) fn fill_span_hash<const X86_CRC: bool>(key: u128) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         if X86_CRC {
+            // Reachability contract: only the sse4.2-gated fill wrappers
+            // instantiate `X86_CRC = true`, so the selection bit must hold.
+            debug_assert!(crc_hash_selected());
             // SAFETY: the `true` instantiation is only reachable from the
             // sse4.2-gated fill wrappers (see the contract above), so the
             // CPU has SSE4.2.
@@ -281,13 +286,14 @@ pub(crate) fn fill_span_hash<const X86_CRC: bool>(key: u128) -> u64 {
 ///   `pretoken_key_hash(0) == 0` is what the old layout recorded anyway.
 ///   Prefetching `meta` as if it were a hash touches an arbitrary
 ///   (masked, in-bounds) table line — harmless, long pretokens are rare.
+///
 /// Fields are `pub(crate)`: only the in-crate fill loops may write entries
 /// (safe external writes of an arbitrary `ptr`/`key` would let safe code
 /// drive [`SpanBatch::span`]'s `from_raw_parts` with garbage — see the
 /// [`PretokenSpans`] safety contract).
 #[derive(Clone, Copy)]
 #[repr(C, align(32))]
-pub struct BatchEntry {
+pub(crate) struct BatchEntry {
     pub(crate) key: u128,
     pub(crate) ptr: *const u8,
     pub(crate) meta: u64,
@@ -298,7 +304,7 @@ const _: () = assert!(std::mem::size_of::<BatchEntry>() == 32);
 impl BatchEntry {
     /// Span length, independent of the short/long route.
     #[inline(always)]
-    pub fn span_len(&self) -> usize {
+    pub(crate) fn span_len(&self) -> usize {
         if self.key != 0 { (self.key >> 120) as usize } else { self.meta as usize }
     }
 }
@@ -308,7 +314,7 @@ impl BatchEntry {
 /// per-pretoken `add + cmp + csel` in the hottest loop). Slack entries
 /// are never written by a fill; prefetching a stale or zero `meta`
 /// requests an arbitrary masked (in-bounds) table line — harmless.
-pub const SPAN_BATCH_SLACK: usize = 16;
+pub(crate) const SPAN_BATCH_SLACK: usize = 16;
 
 /// One chunk of pretoken spans with their packed cache keys (0 = longer
 /// than 15 bytes, routed to the slice-keyed fallback map) and key hashes,
@@ -559,7 +565,8 @@ fn fill_spans_keyed_with_buf_impl<'a, const X86_CRC: bool>(
 /// pretokenizers implement the trait directly over their walker state
 /// instead (see `fast::fill_spans_keyed_mask`): routing them through
 /// `Iterator::next` left the (large, `#[inline(always)]`) `next_span`
-/// un-inlined behind a real call, costing ~23% of warm encode time.
+/// un-inlined behind a real call — measured cost in
+/// `fast::fill_spans_keyed_mask`'s docs.
 pub struct SpanIter<I>(pub I);
 
 // SAFETY: delegates to `fill_spans_keyed_with`, which writes exactly the
@@ -1031,6 +1038,28 @@ mod span_source_tests {
         }
     }
 
+    /// [`check_source`] for every mask-scanner scheme on `b`.
+    fn check_all_mask_schemes(b: &[u8]) {
+        check_source(FastR50kPretokenizer::new(b), FastR50kPretokenizer::new(b), "r50k");
+        check_source(
+            FastCl100kPretokenizer::new(b),
+            FastCl100kPretokenizer::new(b),
+            "cl100k",
+        );
+        check_source(FastQwen2Pretokenizer::new(b), FastQwen2Pretokenizer::new(b), "qwen2");
+        check_source(
+            FastQwen35Pretokenizer::new(b),
+            FastQwen35Pretokenizer::new(b),
+            "qwen3_5",
+        );
+        check_source(FastOlmo3Pretokenizer::new(b), FastOlmo3Pretokenizer::new(b), "olmo3");
+        check_source(
+            FastDeepSeekV3Pretokenizer::new(b),
+            FastDeepSeekV3Pretokenizer::new(b),
+            "deepseek_v3",
+        );
+    }
+
     /// Every scheme's chunked `fill_spans_keyed` must reproduce its
     /// iterator's spans exactly, with keys/hashes derived per the shared
     /// helpers, one prefetch per span — including chunk-boundary and
@@ -1059,24 +1088,7 @@ mod span_source_tests {
                 buf.extend_from_slice(pieces[(rng() % pieces.len() as u64) as usize].as_bytes());
             }
             let b: &[u8] = &buf;
-            check_source(FastR50kPretokenizer::new(b), FastR50kPretokenizer::new(b), "r50k");
-            check_source(
-                FastCl100kPretokenizer::new(b),
-                FastCl100kPretokenizer::new(b),
-                "cl100k",
-            );
-            check_source(FastQwen2Pretokenizer::new(b), FastQwen2Pretokenizer::new(b), "qwen2");
-            check_source(
-                FastQwen35Pretokenizer::new(b),
-                FastQwen35Pretokenizer::new(b),
-                "qwen3_5",
-            );
-            check_source(FastOlmo3Pretokenizer::new(b), FastOlmo3Pretokenizer::new(b), "olmo3");
-            check_source(
-                FastDeepSeekV3Pretokenizer::new(b),
-                FastDeepSeekV3Pretokenizer::new(b),
-                "deepseek_v3",
-            );
+            check_all_mask_schemes(b);
             check_source(
                 SpanIter(PretokenizerIter::new(b)),
                 PretokenizerIter::new(b),
@@ -1130,25 +1142,7 @@ mod span_source_tests {
         v.extend_from_slice(b" end");
         cases.push(v);
         for case in &cases {
-            let b: &[u8] = case;
-            check_source(FastR50kPretokenizer::new(b), FastR50kPretokenizer::new(b), "r50k");
-            check_source(
-                FastCl100kPretokenizer::new(b),
-                FastCl100kPretokenizer::new(b),
-                "cl100k",
-            );
-            check_source(FastQwen2Pretokenizer::new(b), FastQwen2Pretokenizer::new(b), "qwen2");
-            check_source(
-                FastQwen35Pretokenizer::new(b),
-                FastQwen35Pretokenizer::new(b),
-                "qwen3_5",
-            );
-            check_source(FastOlmo3Pretokenizer::new(b), FastOlmo3Pretokenizer::new(b), "olmo3");
-            check_source(
-                FastDeepSeekV3Pretokenizer::new(b),
-                FastDeepSeekV3Pretokenizer::new(b),
-                "deepseek_v3",
-            );
+            check_all_mask_schemes(case);
         }
     }
 }

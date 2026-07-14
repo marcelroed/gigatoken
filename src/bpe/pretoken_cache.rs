@@ -1,6 +1,6 @@
-//! Open-addressing cache for short (≤ 15 byte) pretoken encodings, replacing
-//! the `HashMap<u128, (u32, u32)>` it grew out of. Three properties of the
-//! encode loop drive the design (measured on 1 GB OWT, Zen 2):
+//! Open-addressing cache for short (≤ 15 byte) pretoken encodings. Three
+//! properties of the encode loop drive the design (measured on 1 GB OWT,
+//! Zen 2):
 //!
 //! - The table holds ~1.3M unique pretokens (~99.4% hit rate), far beyond
 //!   L2/L3, so a lookup in the Zipf tail is a random DRAM access. hashbrown
@@ -120,18 +120,14 @@ pub(crate) struct ShortPretokenCache {
 }
 
 impl ShortPretokenCache {
-    pub(crate) fn new() -> Self {
-        Self::with_pow2_capacity(1 << 16)
-    }
-
     fn with_pow2_capacity(cap: usize) -> Self {
         debug_assert!(cap.is_power_of_two() && cap >= 2);
         Self { slots: Slots::new_zeroed(cap), mask: cap - 1, len: 0 }
     }
 
     /// A table sized to hold at least `n` entries without growing (same
-    /// 3/4-load threshold as [`Self::insert`], same 2^16 floor as
-    /// [`Self::new`]), starting from at least `min_slots` slots. The
+    /// 3/4-load threshold as [`Self::insert`], with a 2^16-slot
+    /// floor), starting from at least `min_slots` slots. The
     /// vocab-seeding path inserts ~50k entries up front; sizing for them
     /// avoids rehashing mid-seed. `min_slots` lets a parallel worker start
     /// at the final capacity expected for its share of the input (see
@@ -191,35 +187,14 @@ impl ShortPretokenCache {
 
     /// Look up `key`, walking pairs from its home bucket. Inserts fill the
     /// first empty slot of the walk, so any pair holding an empty slot
-    /// terminates it.
-    pub(crate) fn get(&self, key: u128, h: u64) -> Option<(u64, u64)> {
-        debug_assert_ne!(key, EMPTY_KEY);
-        let mut idx = (h as usize) & self.mask & !1;
-        loop {
-            // SAFETY: idx is masked and even, so idx + 1 <= mask.
-            let e0 = unsafe { self.slots.get(idx) };
-            let e1 = unsafe { self.slots.get(idx + 1) };
-            if e0.key == key {
-                return Some((e0.val, e0.ext));
-            }
-            if e1.key == key {
-                return Some((e1.val, e1.ext));
-            }
-            if e0.key == EMPTY_KEY || e1.key == EMPTY_KEY {
-                return None;
-            }
-            idx = (idx + 2) & self.mask;
-        }
-    }
-
-    /// [`Self::get`] for the encode miss path: a miss also reports where
-    /// the key belongs — the first empty slot of the walk, which is
-    /// exactly what [`Self::first_empty`] would find (every pair before
-    /// the terminating one was full), discovered by loads the lookup
-    /// performs anyway. [`Self::insert_at`] then skips re-walking the
-    /// chain. The slot stays valid until the next insert or grow: lookups
-    /// never mutate, and the miss path computes the entry's value without
-    /// touching the table.
+    /// terminates it. A miss (`Err`) also reports where the key belongs —
+    /// the first empty slot of the walk, which is exactly what
+    /// [`Self::first_empty`] would find (every pair before the
+    /// terminating one was full), discovered by loads the lookup performs
+    /// anyway. [`Self::insert_at`] then skips re-walking the chain. The
+    /// slot stays valid until the next insert or grow: lookups never
+    /// mutate, and the encode miss path computes the entry's value
+    /// without touching the table.
     pub(crate) fn get_or_slot(&self, key: u128, h: u64) -> Result<(u64, u64), usize> {
         debug_assert_ne!(key, EMPTY_KEY);
         let mut idx = (h as usize) & self.mask & !1;
@@ -261,7 +236,7 @@ impl ShortPretokenCache {
     }
 
     /// Insert a key known to be absent (the encode loop only inserts after
-    /// a [`Self::get`] miss).
+    /// a [`Self::get_or_slot`] miss).
     pub(crate) fn insert(&mut self, key: u128, h: u64, val: u64, ext: u64) {
         debug_assert_ne!(key, EMPTY_KEY);
         if (self.len + 1) * 4 > self.slots.cap * 3 {
@@ -394,7 +369,7 @@ impl ProbeView {
     /// `!found` the returned value lanes are another entry's (the emit
     /// loop's predicate discards them); keys displaced past their pair and
     /// genuine misses both come back `!found` — the slow path disambiguates
-    /// via [`ShortPretokenCache::get`]. Callers must not pass `key == 0`
+    /// via [`ShortPretokenCache::get_or_slot`]. Callers must not pass `key == 0`
     /// expecting a miss: empty slots compare equal to it (the emit
     /// predicate carries its own `key != 0` term).
     ///
@@ -439,17 +414,12 @@ impl ProbeView {
         };
         #[cfg(target_arch = "x86_64")]
         let (val, ext) = {
-            // Same value-select discipline as the aarch64 csel pair: LLVM
-            // re-canonicalizes every pure-Rust spelling here too. The mask
-            // arithmetic below compiles (znver2 and x86-64-v3 alike) to a
-            // cmov of the slot ADDRESS feeding a dependent load
-            // (`cmove %r9, %rax; mov (%rax), ...`) plus a computed-index
-            // load for `ext` (`setne; shl $5; mov 16(%r9,%r8), ...`) —
-            // exactly the extra L1 latency on the probe's critical path
-            // this function exists to avoid. The asm pins register-value
-            // `cmovne`s over the four unconditionally loaded words. cmov
-            // is baseline x86-64: no feature gate. Default options declare
-            // the flags clobber that `test` needs.
+            // LLVM canonicalizes every pure-Rust spelling into an
+            // address-cmov feeding a dependent load — the extra L1 latency
+            // this function exists to avoid; the asm pins register-value
+            // `cmovne`s over the four unconditionally loaded words instead.
+            // cmov is baseline x86-64 (no feature gate); evidence in
+            // profiling/x86_port_plan.md §1.1.
             let (mut val, mut ext) = (e1.val, e1.ext);
             // SAFETY: register-only test + conditional moves; no memory
             // access, no stack use.
@@ -505,7 +475,6 @@ mod tests {
         assert_eq!(cache.len(), keys.len());
         for (i, &key) in keys.iter().enumerate() {
             let h = pretoken_key_hash(key);
-            assert_eq!(cache.get(key, h), Some((i as u64, !(i as u64))), "key {i}");
             assert_eq!(cache.get_or_slot(key, h), Ok((i as u64, !(i as u64))), "key {i}");
         }
     }

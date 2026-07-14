@@ -262,16 +262,6 @@ pub fn bpe_merge_symbols_with_scratch<S: std::hash::BuildHasher>(
     );
 }
 
-/// [`bpe_merge_symbols_with_scratch`] with pair ranks served by a
-/// [`PairRankTable`] instead of the hashbrown map.
-pub(crate) fn bpe_merge_symbols_table_with_scratch(
-    table: &PairRankTable,
-    symbols: &mut Vec<TokenId>,
-    scratch: &mut MergeScratch,
-) {
-    bpe_merge_symbols_by_rank(&|a, b| table.rank(a, b), symbols, scratch);
-}
-
 /// Shared merge loop, generic over the pair-rank lookup: `get_rank` returns
 /// the merged token's ID (== merge priority for tiktoken-style vocabs) or
 /// `u32::MAX` when the pair does not merge.
@@ -279,7 +269,7 @@ pub(crate) fn bpe_merge_symbols_table_with_scratch(
 // pretokens on OWT), and inlining its bulk into the encode loop costs
 // more in I-cache and register pressure there than a call costs here.
 #[inline(never)]
-fn bpe_merge_symbols_by_rank(
+pub(crate) fn bpe_merge_symbols_by_rank(
     get_rank: &impl Fn(TokenId, TokenId) -> u32,
     symbols: &mut Vec<TokenId>,
     scratch: &mut MergeScratch,
@@ -395,6 +385,13 @@ const SMALL_MERGE_MAX: usize = 32;
 /// few stack-resident `u32`s beats a `BinaryHeap`'s sift traffic at these
 /// sizes, and merge priority (lowest merged ID, then lowest position) is
 /// identical to the heap version's ordering.
+///
+/// One of three deliberately separate small-merge cores with disjoint
+/// domains: this Vec-based one handles 16..=32 symbols via
+/// `bpe_merge_symbols_by_rank` (the long-pretoken miss path); pretokens of
+/// <= 15 symbols go straight to `bpe_merge_symbols_short_scalar` /
+/// `bpe_merge_symbols_short_neon`. Unifying them was measured as a
+/// regression risk to the tuned short-miss path.
 fn bpe_merge_symbols_small(
     get_rank: &impl Fn(TokenId, TokenId) -> u32,
     symbols: &mut Vec<TokenId>,
@@ -465,9 +462,14 @@ pub(crate) const SHORT_MERGE_MAX: usize = 16;
 
 /// [`bpe_merge_symbols_small`] over a caller-owned stack array instead of
 /// the `Vec` scratch (no bounds/capacity code, no extend memmove) — the
-/// short-pretoken miss path's merge. Returns the merged length. Portable
-/// scalar scan; the aarch64 miss path uses [`bpe_merge_symbols_short_neon`]
-/// when a [`PairRankTable`] is available.
+/// short-pretoken miss path's merge. Returns the merged length.
+///
+/// The non-aarch64 core of the short-miss domain (<= 15 symbols, called
+/// from the tiktoken encode loop); aarch64 uses
+/// [`bpe_merge_symbols_short_neon`] when a [`PairRankTable`] is available.
+/// Kept separate from the Vec-based [`bpe_merge_symbols_small`] (16..=32
+/// symbols): the domains are disjoint and unification was measured as a
+/// regression risk to this tuned miss path.
 pub(crate) fn bpe_merge_symbols_short_scalar(
     get_rank: impl Fn(TokenId, TokenId) -> u32,
     symbols: &mut [TokenId; SHORT_MERGE_MAX],
@@ -543,6 +545,12 @@ pub(crate) fn bpe_merge_symbols_short_scalar(
 /// live lane index is `< n` (pairs start below `n` and merges only clear
 /// lanes), so when `n <= 8` the scan reads just the first two vectors —
 /// the width branch is hoisted out of the loop and fixed per call.
+///
+/// The aarch64 core of the short-miss domain (<= 15 symbols, called from
+/// the tiktoken encode loop); other arches use
+/// [`bpe_merge_symbols_short_scalar`], and 16..=32-symbol sequences take
+/// the Vec-based [`bpe_merge_symbols_small`] — the three are deliberately
+/// not unified (disjoint domains; see `bpe_merge_symbols_short_scalar`).
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn bpe_merge_symbols_short_neon(
     table: &PairRankTable,

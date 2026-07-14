@@ -1,7 +1,7 @@
 use crate::bpe::pretoken_cache::ShortPretokenCache;
 use crate::bpe::{
-    ByteRemapping, MergeScratch, PairRankTable, SHORT_MERGE_MAX, bpe_merge_symbols_short_scalar,
-    bpe_merge_symbols_table_with_scratch, bpe_merge_symbols_with_scratch, simple_bpe_merge,
+    ByteRemapping, MergeScratch, PairRankTable, SHORT_MERGE_MAX, bpe_merge_symbols_by_rank,
+    bpe_merge_symbols_short_scalar, bpe_merge_symbols_with_scratch, simple_bpe_merge,
 };
 #[cfg(target_arch = "aarch64")]
 use crate::bpe::bpe_merge_symbols_short_neon;
@@ -142,13 +142,57 @@ fn unpack_val_lanes(val: u64, ext: u64) -> [u32; 4] {
     ]
 }
 
+/// Overwrite the short-cache entry of every added-token content of 1..=15
+/// bytes that resolves in `vocab_inv` with that single ID, so a matching
+/// pretoken encodes as the added token rather than its merge decomposition.
+///
+/// This function IS the cache-seed sync invariant: the short cache's
+/// seed-level state is always "vocab seed, then these overwrites" — a pure
+/// function of `(vocab, added_tokens)` — because both
+/// [`Tokenizer::set_added_tokens`] (on the parent) and
+/// [`Tokenizer::fork_sized`] (after a fork's fresh reseed) apply the
+/// overwrites through this one body, so parent and forked workers always
+/// agree on every short pretoken.
+fn apply_added_token_overwrites(
+    added_tokens: &[(Arc<[u8]>, TokenId)],
+    vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
+    pretoken_cache: &mut ShortPretokenCache,
+    token_arena: &mut Vec<TokenId>,
+) {
+    for (content, _) in added_tokens {
+        if !(1..=15).contains(&content.len()) {
+            continue;
+        }
+        let Some(&id) = vocab_inv.get(content) else {
+            continue;
+        };
+        let key = pack_pretoken_key(content).expect("length checked <= 15");
+        let h = pretoken_key_hash(key);
+        let (val, ext) = Tokenizer::pack_val(&[id], token_arena);
+        pretoken_cache.replace(key, h, val, ext);
+    }
+}
+
 impl Tokenizer {
     pub fn new(
         merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
         vocab: Vec<Vec<u8>>,
         byte_remapping: Option<ByteRemapping>,
     ) -> Self {
-        let vocab = vocab.into_iter().map(Into::into).collect::<Vec<Arc<_>>>();
+        let vocab = vocab.into_iter().map(Into::into).collect();
+        Self::from_tables(merges, vocab, byte_remapping)
+    }
+
+    /// Shared construction tail ([`Self::new`] and [`Self::from_ranks`]):
+    /// derive `vocab_inv` and the pair-rank table from the finished
+    /// merges/vocab, seed the pretoken cache, and assemble the tokenizer
+    /// with default pipeline settings (GPT-2 pretokenization, no added
+    /// tokens, no NFC).
+    fn from_tables(
+        merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
+        vocab: Vec<Arc<[u8]>>,
+        byte_remapping: Option<ByteRemapping>,
+    ) -> Self {
         let vocab_inv: HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher> = vocab
             .iter()
             .cloned()
@@ -224,14 +268,16 @@ impl Tokenizer {
             .count();
         let mut cache = ShortPretokenCache::with_at_least(n_short, min_slots);
         let mut buf = [TokenId(0); SHORT_MERGE_MAX];
-        for id in (0..vocab.len() as u32).rev() {
-            let bytes = &vocab[id as usize];
+        for bytes in vocab {
             if !(1..=15).contains(&bytes.len()) {
                 continue;
             }
             let key = pack_pretoken_key(bytes).expect("length checked <= 15");
             let h = pretoken_key_hash(key);
-            if cache.get(key, h).is_none() {
+            // Duplicate byte strings seed the same value (see the doc
+            // above), so insertion order is irrelevant and the
+            // insert-if-absent check only skips redundant merges.
+            if cache.get_or_slot(key, h).is_err() {
                 let n = Self::merge_short(byte_remapping, pair_ranks, merges, bytes, &mut buf);
                 let (val, ext) = Self::pack_val(&buf[..n], token_arena);
                 cache.insert(key, h, val, ext);
@@ -324,33 +370,7 @@ impl Tokenizer {
         }
 
         let byte_remapping = ByteRemapping::from_byte_vocab(&vocab)?;
-        let pair_ranks =
-            PairRankTable::build(&merges, byte_remapping.as_ref(), vocab.len()).map(Arc::new);
-        let mut token_arena = Vec::new();
-        let pretoken_cache = Self::seeded_pretoken_cache(
-            &vocab,
-            byte_remapping.as_ref(),
-            pair_ranks.as_deref(),
-            &merges,
-            &mut token_arena,
-            0,
-        );
-        Ok(Tokenizer {
-            merges: Arc::new(merges),
-            pair_ranks,
-            byte_remapping,
-            vocab: Arc::new(vocab),
-            vocab_inv: Arc::new(vocab_inv),
-            token_arena,
-            pretoken_cache,
-            pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
-            merge_scratch: MergeScratch::default(),
-            symbol_scratch: Vec::new(),
-            pretokenizer_type: PretokenizerType::GPT2,
-            added_tokens: Vec::new(),
-            added_matcher: None,
-            normalize_nfc: false,
-        })
+        Ok(Self::from_tables(merges, vocab, byte_remapping))
     }
 
     /// Create a new tokenizer sharing the same model data but with a
@@ -374,17 +394,13 @@ impl Tokenizer {
     pub(crate) fn fork_sized(&self, expected_bytes: usize) -> Self {
         // Distinct short pretokens follow Heaps' law: ~1.3M at 1 GB and
         // ~5.5M at 10 GB of OWT-like text gives distinct(n) ≈ 3.45·n^0.62.
-        // The previous linear rule (1 per 256 bytes) covered a share but
-        // ~2x oversized it — a 10 GB/16-way worker got a 2^22-slot (128 MB)
-        // table for ~1M entries, and the 16 concurrent 128 MB memsets of
-        // the zeroed tables were most of a measured ~32 ms fork+seed ramp.
         // Size for the Heaps estimate at the table's 3/4 growth load with
         // 1.4x headroom (self-paced chunk handout lets a fast core encode
         // more than its even share; the margin holds a >2x-oversubscribed
         // worker under the growth threshold before the table would resize).
         // Still a capacity hint: the table grows past it at 3/4 load on
         // corpora more diverse than the OWT calibration. Clamped to 2^22
-        // slots (128 MB) per worker as before.
+        // slots (128 MB) per worker.
         let distinct = 3.45 * (expected_bytes as f64).powf(0.62);
         let cache_slots = ((distinct * (4.0 / 3.0) * 1.4) as usize)
             .clamp(1 << 16, 1 << 22)
@@ -400,24 +416,16 @@ impl Tokenizer {
             &mut token_arena,
             cache_slots,
         );
-        // Re-apply the added-token seed overwrites (see
-        // [`Self::add_special_token`]): the vocab seed above holds the
-        // MERGE encoding of every short byte string, but the parent's
-        // cache holds `[id]` for every short added-token content (the
-        // `add_special_token` overwrite). Without this, a fork could emit
-        // different IDs than its parent for the same short pretoken.
-        for (content, _) in &self.added_tokens {
-            if !(1..=15).contains(&content.len()) {
-                continue;
-            }
-            let Some(&id) = self.vocab_inv.get(content) else {
-                continue;
-            };
-            let key = pack_pretoken_key(content).expect("length checked <= 15");
-            let h = pretoken_key_hash(key);
-            let (val, ext) = Self::pack_val(&[id], &mut token_arena);
-            pretoken_cache.replace(key, h, val, ext);
-        }
+        // The vocab seed above holds the MERGE encoding of every short byte
+        // string; re-apply the added-token `[id]` overwrites so the fork's
+        // cache matches the parent's seed-level state (the shared function
+        // is the sync invariant — see `apply_added_token_overwrites`).
+        apply_added_token_overwrites(
+            &self.added_tokens,
+            &self.vocab_inv,
+            &mut pretoken_cache,
+            &mut token_arena,
+        );
         Tokenizer {
             merges: Arc::clone(&self.merges),
             pair_ranks: self.pair_ranks.clone(),
@@ -480,17 +488,11 @@ impl Tokenizer {
                 .expect("added-token automaton construction cannot fail")
         });
         let outgoing = std::mem::replace(&mut self.added_tokens, added_tokens);
-        // Cache-seed sync invariant (see [`Self::seeded_pretoken_cache`]
-        // and [`Self::fork_sized`]): the short cache's seed-level state is
-        // always "vocab seed, then one `[vocab_inv[content]]` overwrite
-        // per CURRENT added-token content that resolves in `vocab_inv`" —
-        // a pure function of `(vocab, added_tokens)`, which is exactly
-        // what a fork's reseed + re-apply reconstructs, so parent and
-        // forked workers always agree on every short pretoken. Restore
-        // the plain seed value for the outgoing set first (only contents
-        // that resolve in `vocab_inv` were ever overwritten, so this
-        // replaces existing entries and never inserts), then apply the
-        // incoming overwrites.
+        // Restore the plain seed value for the outgoing set first (only
+        // contents that resolve in `vocab_inv` were ever overwritten, so
+        // this replaces existing entries and never inserts), then apply
+        // the incoming overwrites through the shared sync-invariant body
+        // (see `apply_added_token_overwrites`).
         for (content, _) in &outgoing {
             if !(1..=15).contains(&content.len()) || self.vocab_inv.get(content).is_none() {
                 continue;
@@ -508,19 +510,12 @@ impl Tokenizer {
             let (val, ext) = Self::pack_val(&buf[..n], &mut self.token_arena);
             self.pretoken_cache.replace(key, h, val, ext);
         }
-        for i in 0..self.added_tokens.len() {
-            let (content, _) = &self.added_tokens[i];
-            if !(1..=15).contains(&content.len()) {
-                continue;
-            }
-            let Some(&id) = self.vocab_inv.get(content) else {
-                continue;
-            };
-            let key = pack_pretoken_key(content).expect("length checked <= 15");
-            let h = pretoken_key_hash(key);
-            let (val, ext) = Self::pack_val(&[id], &mut self.token_arena);
-            self.pretoken_cache.replace(key, h, val, ext);
-        }
+        apply_added_token_overwrites(
+            &self.added_tokens,
+            &self.vocab_inv,
+            &mut self.pretoken_cache,
+            &mut self.token_arena,
+        );
     }
 
     /// Register one additional added token, extending the decode vocab when
@@ -830,12 +825,11 @@ impl Tokenizer {
         for i in 0..n {
             // Unclamped prefetch distance: the batch carries D slack
             // entries past a full chunk, so `i + D` always indexes into
-            // the array and the clamp's per-pretoken add+cmp+csel (and
-            // before that, an `i + D < n` compare+branch worth 3.7% of
-            // encode) disappears — the load is one fixed-offset ldr off
-            // the walking entry pointer. Tail iterations prefetch stale
-            // or zero `meta`, and long entries a length, not a hash —
-            // either way a masked, in-bounds table line: harmless.
+            // the array and no per-pretoken bounds clamp is needed — the
+            // load is one fixed-offset ldr off the walking entry pointer.
+            // Tail iterations prefetch stale or zero `meta`, and long
+            // entries a length, not a hash — either way a masked,
+            // in-bounds table line: harmless.
             table.prefetch(batch.entries[i + D].meta);
             // One 32-byte entry: key + meta land in a single cache line
             // (the parallel-array layout walked three load streams here).
@@ -995,7 +989,7 @@ impl Tokenizer {
             }
             match self.pair_ranks.as_deref() {
                 Some(table) => {
-                    bpe_merge_symbols_table_with_scratch(table, symbols, &mut self.merge_scratch)
+                    bpe_merge_symbols_by_rank(&|a, b| table.rank(a, b), symbols, &mut self.merge_scratch)
                 }
                 None => {
                     bpe_merge_symbols_with_scratch(&self.merges, symbols, &mut self.merge_scratch)
@@ -1039,6 +1033,56 @@ impl Debug for Tokenizer {
             .field("pair_ranks", &self.pair_ranks.is_some())
             .field("byte_remapping", &self.byte_remapping.is_some())
             .finish()
+    }
+}
+
+/// Helpers shared by the test modules below.
+#[cfg(test)]
+mod test_util {
+    use super::*;
+
+    pub(super) fn gpt2_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json")
+    }
+
+    /// Uncached reference encode of one pretoken: byte remap + plain merge
+    /// loop over the merges HashMap (no pair-rank table, no cache, no
+    /// short-merge kernels).
+    pub(super) fn plain_encode_pretoken(tok: &Tokenizer, pretoken: &[u8], out: &mut Vec<u32>) {
+        let mut symbols: Vec<TokenId> = match tok.byte_remapping.as_ref() {
+            Some(br) => pretoken.iter().map(|&b| br.mapping[b as usize]).collect(),
+            None => pretoken.iter().map(|&b| TokenId::from(b as u32)).collect(),
+        };
+        crate::bpe::bpe_merge_symbols(&tok.merges, &mut symbols);
+        out.extend(symbols.iter().map(|t| t.0));
+    }
+
+    /// Pretoken lengths through the two-phase walker path
+    /// (`fill_spans_keyed`), for comparison against the Iterator path.
+    pub(super) fn two_phase_lens<'a>(mut p: impl PretokenSpans<'a>) -> Vec<usize> {
+        let mut batch = SpanBatch::new();
+        let mut lens = Vec::new();
+        loop {
+            let n = p.fill_spans_keyed(&mut batch, &|_| {});
+            for i in 0..n {
+                lens.push(batch.entries[i].span_len());
+            }
+            if n < PRETOKEN_CHUNK {
+                return lens;
+            }
+        }
+    }
+
+    /// xorshift64: deterministic, dependency-free RNG for test inputs.
+    pub(super) struct XorShift64(pub u64);
+
+    impl XorShift64 {
+        pub(super) fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
     }
 }
 
@@ -1087,8 +1131,8 @@ mod tests {
         );
 
         // Case 2 (mirror): added ID fills an empty placeholder BELOW the
-        // duplicate's ID; the fork's descending reseed alone would pick
-        // the higher ID, diverging from vocab_inv and the parent.
+        // duplicate's ID; the fork's reseed alone would pick the higher
+        // ID (the merge result), diverging from vocab_inv and the parent.
         let mut merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher> =
             HashMap::with_hasher(rustc_hash::FxBuildHasher {});
         merges.insert((TokenId(104), TokenId(105)), TokenId(257)); // 'h' 'i' -> "hi"
@@ -1113,9 +1157,7 @@ mod tests {
     fn gpt2_pair_rank_table_and_vocab_seed() {
         use crate::load_tokenizer::hf::load_hf_bpe;
         use crate::pretokenize::{pack_pretoken_key, pretoken_key_hash};
-        let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("data/gpt2_tokenizer.json");
-        let tokenizer = load_hf_bpe(&tokenizer_path).expect("load GPT-2 tokenizer");
+        let tokenizer = load_hf_bpe(super::test_util::gpt2_path()).expect("load GPT-2 tokenizer");
 
         let table = tokenizer
             .pair_ranks
@@ -1144,7 +1186,7 @@ mod tests {
             let key = pack_pretoken_key(bytes).unwrap();
             let (val, ext) = tokenizer
                 .pretoken_cache
-                .get(key, pretoken_key_hash(key))
+                .get_or_slot(key, pretoken_key_hash(key))
                 .expect("short vocab entry must be seeded");
             // Every real vocab ID is < 2^24, so the seed is inline: 1 token,
             // the entry's own ID (GPT-2 has no duplicate byte strings and,
@@ -1181,7 +1223,7 @@ mod tests {
         // arena, but the cache entry serves it either way.
         let key = pack_pretoken_key(bytes).unwrap();
         let h = pretoken_key_hash(key);
-        assert!(tokenizer.pretoken_cache.get(key, h).is_some());
+        assert!(tokenizer.pretoken_cache.get_or_slot(key, h).is_ok());
 
         let mut repeated = Vec::new();
         tokenizer.memoized_encode(SpanIter([Pretoken(bytes)].into_iter()), |tokens| {
@@ -1309,18 +1351,15 @@ mod tests {
 /// `encode_with_added_tokens_flat`: packed keys, open-addressing short
 /// table, two-phase span walkers, branchless emit) against an UNCACHED
 /// reference (per-pretoken plain `bpe_merge_symbols` over the merges
-/// HashMap). One fast test probes `pack_pretoken_key` at every page
-/// offset. Boundary fuzz and walker edge cases live in `walker_edge`
-/// below.
+/// HashMap). Two fast tests probe `pack_pretoken_key` at every page
+/// offset and pin the vocab-seed merge-decomposition rule. Boundary fuzz
+/// and walker edge cases live in `walker_edge` below.
 #[cfg(test)]
 mod verify_heavy {
+    use super::test_util::{XorShift64, gpt2_path, plain_encode_pretoken};
     use super::*;
     use crate::load_tokenizer::hf::load_hf_bpe;
     use std::io::Read;
-
-    fn gpt2_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json")
-    }
 
     fn load_owt(max_bytes: usize) -> Vec<u8> {
         let path = std::env::home_dir().unwrap().join("data/owt_train.txt");
@@ -1340,18 +1379,6 @@ mod verify_heavy {
             Some(off) => &input[..at + off + 1],
             None => input,
         }
-    }
-
-    /// Uncached reference encode of one pretoken: byte remap + plain merge
-    /// loop over the merges HashMap (no pair-rank table, no cache, no
-    /// short-merge kernels).
-    fn plain_encode_pretoken(tok: &Tokenizer, pretoken: &[u8], out: &mut Vec<u32>) {
-        let mut symbols: Vec<TokenId> = match tok.byte_remapping.as_ref() {
-            Some(br) => pretoken.iter().map(|&b| br.mapping[b as usize]).collect(),
-            None => pretoken.iter().map(|&b| TokenId::from(b as u32)).collect(),
-        };
-        crate::bpe::bpe_merge_symbols(&tok.merges, &mut symbols);
-        out.extend(symbols.iter().map(|t| t.0));
     }
 
     /// Token-for-token comparison of the full cached public path
@@ -1392,7 +1419,7 @@ mod verify_heavy {
                         input.len(),
                         pretoken.0.len(),
                         String::from_utf8_lossy(pretoken.0),
-                        &scratch,
+                        scratch,
                         &cached[idx.min(cached.len())..(idx + scratch.len() + 4).min(cached.len())],
                         String::from_utf8_lossy(&input[ctx_start..ctx_end]),
                     );
@@ -1611,63 +1638,18 @@ mod verify_heavy {
         assert!(ran >= 3, "only {ran} tokenizers loaded — expected at least olmo3/qwen2/deepseek_v3");
     }
 
-    /// `pack_pretoken_key`'s unaligned-16-byte fast path vs the naive lane
-    /// copy at EVERY page offset (both branches of the page-boundary guard),
-    /// all lengths 0..=15.
-    #[test]
-    fn verify_pack_pretoken_key_all_page_offsets() {
-        use crate::pretokenize::pack_pretoken_key;
-        let mut buf = vec![0u8; 12288];
-        let mut state = 0x0123_4567_89AB_CDEFu64;
-        for b in buf.iter_mut() {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *b = state as u8;
-            if *b == 0 {
-                *b = 1; // avoid zero lanes masking length-tag mistakes
-            }
-        }
-        for start in 0..buf.len() - 16 {
-            for n in 0..=15usize {
-                let span = &buf[start..start + n];
-                let key = pack_pretoken_key(span);
-                let mut lanes = [0u8; 16];
-                lanes[..n].copy_from_slice(span);
-                let naive = if n == 0 {
-                    0u128
-                } else {
-                    u128::from_le_bytes(lanes) | ((n as u128) << 120)
-                };
-                assert_eq!(
-                    key,
-                    Some(naive),
-                    "pack_pretoken_key mismatch at buf offset {start} (page offset {}), len {n}",
-                    (buf[start..].as_ptr() as usize) & 4095
-                );
-            }
-        }
-        // Length > 15 routes to the long map.
-        assert_eq!(pack_pretoken_key(&buf[..16]), None);
-    }
-}
-
-/// Regression test for the vocab-seeded cache (commit d39bca2 originally
-/// seeded EVERY short vocab entry as pretoken -> [own id]): BPE encode
-/// semantics (HF `tokenizers` without `ignore_merges`, this repo's merge
-/// loop, and the pre-cache baseline 0e27c71) produce a whole-vocab-word
-/// token only when the merge rules can derive it. qwen3_5's vocab has
-/// ~200 merge-unreachable entries (mostly multi-char CJK phrases, plus
-/// e.g. " Jap\u{f3}n"); when one appears as a whole pretoken the pipeline
-/// must return the merge decomposition, exactly as if it had missed —
-/// the seed is precomputed misses (`merge_short`), never the raw ID.
-/// Ground truth verified against HF `tokenizers`: encode(" Jap\u{f3}n")
-/// on data/qwen3_5_tokenizer.json gives [604, 385, 3064] ("ĠJ", "ap",
-/// "Ã³n"); the raw-ID seed returned [209344] (" Jap\u{f3}n").
-#[cfg(test)]
-mod vocab_seed_regression {
-    use crate::load_tokenizer::hf::load_hf_bpe;
-
+    /// Regression test for the vocab-seeded cache (commit d39bca2 originally
+    /// seeded EVERY short vocab entry as pretoken -> [own id]): BPE encode
+    /// semantics (HF `tokenizers` without `ignore_merges`, this repo's merge
+    /// loop, and the pre-cache baseline 0e27c71) produce a whole-vocab-word
+    /// token only when the merge rules can derive it. qwen3_5's vocab has
+    /// ~200 merge-unreachable entries (mostly multi-char CJK phrases, plus
+    /// e.g. " Jap\u{f3}n"); when one appears as a whole pretoken the pipeline
+    /// must return the merge decomposition, exactly as if it had missed —
+    /// the seed is precomputed misses (`merge_short`), never the raw ID.
+    /// Ground truth verified against HF `tokenizers`: encode(" Jap\u{f3}n")
+    /// on data/qwen3_5_tokenizer.json gives [604, 385, 3064] ("ĠJ", "ap",
+    /// "Ã³n"); the raw-ID seed returned [209344] (" Jap\u{f3}n").
     #[test]
     fn verify_vocab_seeded_cache_matches_merge_decomposition() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1702,6 +1684,43 @@ mod vocab_seed_regression {
             "long miss path returned the merge-unreachable whole-vocab entry"
         );
     }
+
+    /// `pack_pretoken_key`'s unaligned-16-byte fast path vs the naive lane
+    /// copy at EVERY page offset (both branches of the page-boundary guard),
+    /// all lengths 0..=15.
+    #[test]
+    fn verify_pack_pretoken_key_all_page_offsets() {
+        use crate::pretokenize::pack_pretoken_key;
+        let mut buf = vec![0u8; 12288];
+        let mut rng = XorShift64(0x0123_4567_89AB_CDEF);
+        for b in buf.iter_mut() {
+            *b = rng.next_u64() as u8;
+            if *b == 0 {
+                *b = 1; // avoid zero lanes masking length-tag mistakes
+            }
+        }
+        for start in 0..buf.len() - 16 {
+            for n in 0..=15usize {
+                let span = &buf[start..start + n];
+                let key = pack_pretoken_key(span);
+                let mut lanes = [0u8; 16];
+                lanes[..n].copy_from_slice(span);
+                let naive = if n == 0 {
+                    0u128
+                } else {
+                    u128::from_le_bytes(lanes) | ((n as u128) << 120)
+                };
+                assert_eq!(
+                    key,
+                    Some(naive),
+                    "pack_pretoken_key mismatch at buf offset {start} (page offset {}), len {n}",
+                    (buf[start..].as_ptr() as usize) & 4095
+                );
+            }
+        }
+        // Length > 15 routes to the long map.
+        assert_eq!(pack_pretoken_key(&buf[..16]), None);
+    }
 }
 
 /// Alignment-invariance sweep: the walkers' output must not depend on the
@@ -1711,29 +1730,13 @@ mod vocab_seed_regression {
 /// framing in the SIMD batch walkers.)
 #[cfg(test)]
 mod verify_alignment {
+    use super::test_util::{XorShift64, gpt2_path, two_phase_lens};
     use super::*;
     use crate::load_tokenizer::hf::load_hf_bpe;
 
-    fn pretoken_lens<'a, P: PretokenSpans<'a>>(mut p: P) -> Vec<usize> {
-        let mut batch = SpanBatch::new();
-        let mut lens = Vec::new();
-        loop {
-            let n = p.fill_spans_keyed(&mut batch, &|_| {});
-            for i in 0..n {
-                lens.push(batch.entries[i].span_len());
-            }
-            if n < PRETOKEN_CHUNK {
-                return lens;
-            }
-        }
-    }
-
     #[test]
     fn verify_walker_alignment_invariance() {
-        let mut tok = load_hf_bpe(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json"),
-        )
-        .expect("load GPT-2 tokenizer");
+        let mut tok = load_hf_bpe(gpt2_path()).expect("load GPT-2 tokenizer");
         // Inputs chosen to stress batch-edge machinery: long runs of one
         // class, class flips near multiples of 64, multi-byte chars
         // straddling batch edges, contractions, digit groups.
@@ -1747,22 +1750,18 @@ mod verify_alignment {
                 inputs.push(v);
             }
         }
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        let mut rng = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = XorShift64(0x9E37_79B9_7F4A_7C15);
         const PIECES: &[&str] = &[
             " the", " a", "word", "05", "  ", "\n", "'s", "n't", ",", " \u{e9}t\u{e9}",
             "\u{597d}\u{597d}", " 123", "...", "\t", " I'm", "\u{2014}", "e", " ",
         ];
         for _ in 0..200 {
-            let target = 80 + (rng() % 400) as usize;
+            let target = 80 + (rng.next_u64() % 400) as usize;
             let mut v = Vec::new();
             while v.len() < target {
-                v.extend_from_slice(PIECES[(rng() % PIECES.len() as u64) as usize].as_bytes());
+                v.extend_from_slice(
+                    PIECES[(rng.next_u64() % PIECES.len() as u64) as usize].as_bytes(),
+                );
             }
             inputs.push(v);
         }
@@ -1776,7 +1775,7 @@ mod verify_alignment {
                 let mut buf = vec![0u8; off + input.len() + 64];
                 buf[off..off + input.len()].copy_from_slice(input);
                 let span = &buf[off..off + input.len()];
-                let lens = pretoken_lens(FastR50kPretokenizer::new(span));
+                let lens = two_phase_lens(FastR50kPretokenizer::new(span));
                 let mut ids: Vec<u32> = Vec::new();
                 tok.memoized_encode_flat(FastR50kPretokenizer::new(span), &mut ids);
                 match (&ref_lens, &ref_ids) {
@@ -1816,24 +1815,9 @@ mod verify_alignment {
 /// (`fill_spans_keyed`) paths, deterministically.
 #[cfg(test)]
 mod walker_edge {
+    use super::test_util::{XorShift64, gpt2_path, plain_encode_pretoken, two_phase_lens};
     use super::*;
     use crate::load_tokenizer::hf::load_hf_bpe;
-
-    fn gpt2_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json")
-    }
-
-    /// Uncached reference encode of one pretoken: byte remap + plain merge
-    /// loop over the merges HashMap (no pair-rank table, no cache, no
-    /// short-merge kernels).
-    fn plain_encode_pretoken(tok: &Tokenizer, pretoken: &[u8], out: &mut Vec<u32>) {
-        let mut symbols: Vec<TokenId> = match tok.byte_remapping.as_ref() {
-            Some(br) => pretoken.iter().map(|&b| br.mapping[b as usize]).collect(),
-            None => pretoken.iter().map(|&b| TokenId::from(b as u32)).collect(),
-        };
-        crate::bpe::bpe_merge_symbols(&tok.merges, &mut symbols);
-        out.extend(symbols.iter().map(|t| t.0));
-    }
 
     /// Assert a scheme's pretokens are a contiguous, non-empty, in-bounds
     /// partition of `span` (required for encode correctness; also catches
@@ -1986,53 +1970,45 @@ mod walker_edge {
     /// UTF-8, whitespace runs) placed at the END of an exactly-sized
     /// allocation, through every scheme's walker (partition + cached-vs-
     /// plain encode) and the full public GPT-2 path. Fixed seed, no I/O
-    /// beyond the tokenizer. (Ported from the verify branch; the
-    /// truncated-tail sanitization it needed pre-fix is gone — truncated
-    /// shapes are in scope.)
+    /// beyond the tokenizer.
     #[test]
     fn walker_boundary_fuzz_memoized_vs_reference() {
         let mut tok = load_hf_bpe(gpt2_path()).expect("load GPT-2 tokenizer");
-        let mut state = 0x243F_6A88_85A3_08D3u64;
-        let mut rng = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = XorShift64(0x243F_6A88_85A3_08D3);
         const CHARS: &[&str] = &["é", "ü", "好", "日", "🙂", "ß", "—", "\u{0301}", "٣", "क"];
         let iters = if cfg!(debug_assertions) { 2_000 } else { 12_000 };
         for iter in 0..iters {
-            let len = (rng() % 65) as usize;
-            let pad = (rng() % 17) as usize;
+            let len = (rng.next_u64() % 65) as usize;
+            let pad = (rng.next_u64() % 17) as usize;
             let mut buf: Vec<u8> = Vec::with_capacity(pad + len + 8);
             for _ in 0..pad {
-                buf.push(rng() as u8);
+                buf.push(rng.next_u64() as u8);
             }
             let span_start = buf.len();
-            match rng() % 4 {
+            match rng.next_u64() % 4 {
                 0 => {
                     // ASCII text: letters, digits, spaces, punct, contractions
                     const POOL: &[u8] = b" aetoAETO059'.,!-\n\t\"()s d";
                     while buf.len() - span_start < len {
-                        buf.push(POOL[(rng() % POOL.len() as u64) as usize]);
+                        buf.push(POOL[(rng.next_u64() % POOL.len() as u64) as usize]);
                     }
                 }
                 1 => {
                     // Raw bytes: full 0..=255, mostly invalid UTF-8,
                     // truncated tails included.
                     while buf.len() - span_start < len {
-                        buf.push(rng() as u8);
+                        buf.push(rng.next_u64() as u8);
                     }
                 }
                 2 => {
                     // Valid UTF-8 mix: fill to >= len, then trim whole
                     // chars back to <= len so the span stays valid UTF-8.
                     while buf.len() - span_start < len {
-                        if rng() % 2 == 0 {
-                            buf.push(b' ' + (rng() % 94) as u8);
+                        if rng.next_u64().is_multiple_of(2) {
+                            buf.push(b' ' + (rng.next_u64() % 94) as u8);
                         } else {
                             buf.extend_from_slice(
-                                CHARS[(rng() % CHARS.len() as u64) as usize].as_bytes(),
+                                CHARS[(rng.next_u64() % CHARS.len() as u64) as usize].as_bytes(),
                             );
                         }
                     }
@@ -2046,7 +2022,7 @@ mod walker_edge {
                     // Whitespace-heavy
                     const POOL: &[u8] = b"   \n\n\t\r a5.";
                     while buf.len() - span_start < len {
-                        buf.push(POOL[(rng() % POOL.len() as u64) as usize]);
+                        buf.push(POOL[(rng.next_u64() % POOL.len() as u64) as usize]);
                     }
                 }
             }
@@ -2079,8 +2055,6 @@ mod walker_edge {
     /// machinery (15/16 for the packed u128 key, 65535/65536 and beyond
     /// for long runs through the walkers), in letter/digit/space/punct/
     /// multi-byte/invalid fills, each in an exactly-sized allocation.
-    /// (Ported from the verify branch — this was the Bug B flake detector;
-    /// invalid fills are no longer tail-sanitized.)
     #[test]
     fn walker_edge_length_pretokens() {
         let mut tok = load_hf_bpe(gpt2_path()).expect("load GPT-2 tokenizer");
@@ -2179,30 +2153,16 @@ mod walker_edge {
         let iter_lens = |span: &[u8]| -> Vec<usize> {
             FastR50kPretokenizer::new(span).map(|p| p.0.len()).collect()
         };
-        let two_phase_lens = |span: &[u8]| -> Vec<usize> {
-            let mut batch = SpanBatch::new();
-            let mut p = FastR50kPretokenizer::new(span);
-            let mut lens = Vec::new();
-            loop {
-                let k = p.fill_spans_keyed(&mut batch, &|_| {});
-                for i in 0..k {
-                    lens.push(batch.entries[i].span_len());
-                }
-                if k < PRETOKEN_CHUNK {
-                    return lens;
-                }
-            }
-        };
         let mut reference: Option<[Vec<usize>; 2]> = None;
         for round in 0..40 {
             let got = [
                 {
-                    let (i, t) = (iter_lens(&a), two_phase_lens(&a));
+                    let (i, t) = (iter_lens(&a), two_phase_lens(FastR50kPretokenizer::new(&a)));
                     assert_eq!(i, t, "round {round} span A: iterator vs two-phase");
                     i
                 },
                 {
-                    let (i, t) = (iter_lens(&b), two_phase_lens(&b));
+                    let (i, t) = (iter_lens(&b), two_phase_lens(FastR50kPretokenizer::new(&b)));
                     assert_eq!(i, t, "round {round} span B: iterator vs two-phase");
                     i
                 },

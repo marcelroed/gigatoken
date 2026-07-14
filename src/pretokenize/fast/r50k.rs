@@ -205,7 +205,11 @@ fn ascii_batch_algebra(
     let nb64 = bytes[scan + 64]; // in bounds: scan + 70 <= len
     if nb64 < 0x80 {
         split_ok |= (u64::from(!is_ascii_ws(nb64)) << 63) & wsa;
-    } else if wsa >> 63 != 0 && mask::nn_at_full(bytes, scan + 64) {
+    } else if wsa >> 63 != 0
+        // SAFETY: this classifier's scan + 70 <= len batch guard puts the
+        // decode at scan + 64 in bounds (needs scan + 68 <= len).
+        && unsafe { mask::nn_at_full(bytes, scan + 64) }
+    {
         split_ok |= 1 << 63;
     }
     let pwsb = (wsa << 1) | pws;
@@ -298,7 +302,9 @@ fn extended_masks(
     } else if bytes[scan - 1] < 0x80 {
         carries_at(bytes, scan)
     } else {
-        let (cls, _lead, end) = mask::char_through(bytes, scan, unicode::class_of);
+        // SAFETY: scan > 0 on this branch, and the classifier's
+        // scan + 70 <= len batch guard covers pos + 3 <= len.
+        let (cls, _lead, end) = unsafe { mask::char_through(bytes, scan, unicode::class_of) };
         let chm = if end > scan { (1u64 << (end - scan)) - 1 } else { 0 };
         claim.cont = chm;
         match cls {
@@ -325,8 +331,11 @@ fn extended_masks(
         }
     };
 
-    let uni =
-        mask::classify_uni_chars::<true, false>(bytes, scan, hi64 & !claim.cont, unicode::class_of);
+    // SAFETY: this classifier's scan + 70 <= len batch guard is exactly
+    // `classify_uni_chars`' contract.
+    let uni = unsafe {
+        mask::classify_uni_chars::<true, false>(bytes, scan, hi64 & !claim.cont, unicode::class_of)
+    };
 
     // Effective per-byte classes: every byte of a classified char carries
     // the char's class, so the same algebra as the pure-ASCII path
@@ -359,7 +368,9 @@ fn extended_masks(
     } else {
         let edge = edge_mb | ((1 << 63) & wsa);
         if edge != 0 {
-            if mask::nn_at_full(bytes, scan + 64) {
+            // SAFETY: this classifier's scan + 70 <= len batch guard puts
+            // the decode at scan + 64 in bounds (needs scan + 68 <= len).
+            if unsafe { mask::nn_at_full(bytes, scan + 64) } {
                 split_ok |= edge;
             } else {
                 split_ok &= !edge;
@@ -403,7 +414,8 @@ fn extended_masks(
 /// `scan - 1` (`scan > 0`), multi-byte aware via [`mask::char_through`].
 /// `ps` (the ` ?` absorb) is ASCII 0x20 only. The ASCII case (almost
 /// every call) is branchless — a class if-chain here is a per-batch
-/// mispredict on natural text.
+/// mispredict on natural text. Callers are the batch classifiers, whose
+/// `scan + 70 <= len` guard covers the walk-back decode.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
 fn carries_at(bytes: &[u8], scan: usize) -> (u64, u64, u64, u64, u64) {
@@ -413,7 +425,9 @@ fn carries_at(bytes: &[u8], scan: usize) -> (u64, u64, u64, u64, u64) {
         let bit = |c: bool| u64::from(c);
         return (bit(l), bit(d), bit(b == b' '), bit(w), bit(!l && !d && !w));
     }
-    match mask::char_through(bytes, scan, unicode::class_of).0 {
+    // SAFETY: scan > 0 (this fn's caller contract), and the calling batch
+    // classifier's scan + 70 <= len guard covers pos + 3 <= len.
+    match unsafe { mask::char_through(bytes, scan, unicode::class_of) }.0 {
         CharClass::Letter => (1, 0, 0, 0, 0),
         CharClass::Number => (0, 1, 0, 0, 0),
         CharClass::Whitespace => (0, 0, 0, 1, 0),

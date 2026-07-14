@@ -320,18 +320,23 @@ pub(crate) fn ascii_masks_avx2(bytes: &[u8], scan: usize) -> AsciiMasks {
 // -----------------------------------------------------------------------
 
 /// Is the char starting at `idx` NOT whitespace (`\S` for a `(?!\S)`
-/// lookahead)? Full answer via the packed table; the caller guarantees
-/// the whole char is in bounds (a `scan + 70 <= len` batch guard covers
-/// every call site's worst case).
+/// lookahead)? Full answer via the packed table.
+///
+/// # Safety
+///
+/// `idx < bytes.len()`, and when `bytes[idx]` is non-ASCII,
+/// `idx + 4 <= bytes.len()` (the guardless [`decode_cp_inbounds`] read).
+/// The batch classifiers' `scan + 70 <= len` guard covers every call
+/// site's worst case (`idx = scan + 64`).
 #[inline(always)]
-pub(crate) fn nn_at_full(bytes: &[u8], idx: usize) -> bool {
+pub(crate) unsafe fn nn_at_full(bytes: &[u8], idx: usize) -> bool {
     use super::{decode_cp_inbounds, is_ascii_ws};
     let b = bytes[idx];
     if b < 0x80 {
         return !is_ascii_ws(b);
     }
-    // SAFETY: caller guarantees the whole char in bounds (scan + 70
-    // <= len batch guard), so idx + 4 <= len for any lead here.
+    // SAFETY: caller guarantees idx + 4 <= len for a non-ASCII byte here
+    // (this fn's contract).
     let (cp, _) = unsafe { decode_cp_inbounds(bytes, idx) };
     unicode::class_of(cp) != CharClass::Whitespace
 }
@@ -344,8 +349,16 @@ pub(crate) fn nn_at_full(bytes: &[u8], idx: usize) -> bool {
 /// compute true boundary carries instead of deferring to a bad zone.
 /// `class`: the scheme's codepoint classifier (`unicode::class_of`, or a
 /// mark-folding view like `unicode::class_of_marks_join`).
+///
+/// # Safety
+///
+/// `pos > 0`, and when `bytes[pos - 1]` is non-ASCII,
+/// `pos + 3 <= bytes.len()`: the walk-back lead `j` satisfies
+/// `j <= pos - 1`, so the guardless [`decode_cp_inbounds`] read needs
+/// `j + 4 <= pos + 3` in-bounds bytes. The batch classifiers' `scan + 70
+/// <= len` guard covers every call site (`pos <= scan + 64`).
 #[inline(always)]
-pub(crate) fn char_through(
+pub(crate) unsafe fn char_through(
     bytes: &[u8],
     pos: usize,
     class: impl Fn(u32) -> CharClass,
@@ -368,8 +381,8 @@ pub(crate) fn char_through(
     while j > 0 && bytes[j] & 0xC0 == 0x80 {
         j -= 1;
     }
-    // SAFETY: caller guarantees `pos` is inside a batch with the
-    // scan + 70 <= len lookahead guard and j < pos, so j + 4 <= len.
+    // SAFETY: j < pos and pos + 3 <= len (this fn's contract), so
+    // j + 4 <= len.
     let (cp, l) = unsafe { decode_cp_inbounds(bytes, j) };
     (class(cp), j, j + l)
 }
@@ -409,9 +422,8 @@ pub(crate) struct UniClasses {
 
 /// Classify every unicode char whose lead bit is in `m` (typically
 /// `hi & !claimed-straddle-in-bytes`) for `bytes[scan..scan+64]`.
-/// Requires `scan + 70 <= len` (lookahead for a 4-byte char led at bit
-/// 63). A char spilling off the batch end is classified via that
-/// lookahead; only its in-batch bytes get class bits, and the next
+/// A char spilling off the batch end is classified via the lookahead
+/// bytes; only its in-batch bytes get class bits, and the next
 /// batch's `char_through` walk-back covers the remainder. `NUMBERS`:
 /// false for schemes whose digit grouping is char-counted (`\p{N}{1,3}`
 /// byte masks can't express multi-byte chars), true otherwise.
@@ -421,8 +433,14 @@ pub(crate) struct UniClasses {
 /// The loop stays branchy on purpose: a branchless csel-selected
 /// decode/classify body measured 0.986x (predicted branches beat data
 /// chains, log step 13/17).
+///
+/// # Safety
+///
+/// `scan + 70 <= bytes.len()` (the batch classifiers' lookahead guard):
+/// a lead bit at position 63 puts the guardless [`decode_cp_inbounds`]
+/// read at `scan + 63`, which may touch through `scan + 67`.
 #[inline(always)]
-pub(crate) fn classify_uni_chars<const NUMBERS: bool, const LEADS: bool>(
+pub(crate) unsafe fn classify_uni_chars<const NUMBERS: bool, const LEADS: bool>(
     bytes: &[u8],
     scan: usize,
     mut m: u64,
@@ -447,8 +465,8 @@ pub(crate) fn classify_uni_chars<const NUMBERS: bool, const LEADS: bool>(
         };
         let chm = ((1u64 << l) - 1) << i; // in-batch bytes (excess drops)
         let lead = 1u64 << i;
-        // SAFETY: scan + 70 <= len (this fn's contract), i <= 63, so
-        // scan + i + 4 <= len even for a 4-byte lead at bit 63.
+        // SAFETY: scan + 70 <= len (this fn's # Safety contract), i <= 63,
+        // so scan + i + 4 <= len even for a 4-byte lead at bit 63.
         let (cp, _) = unsafe { decode_cp_inbounds(bytes, scan + i) };
         match class(cp) {
             CharClass::Letter => u.l |= chm,
@@ -765,23 +783,23 @@ unsafe fn flatten_bits(m: u64, rel: u16, out: *mut u16) -> usize {
     (incl >> 56) as usize
 }
 
-/// `pack_mask_halves(m)` for each clamped length `m` in 1..=15 (entry 0
-/// unused), as one 16-byte row so the phase-B emission loop loads both
-/// halves with a single `ldp`. That loop is issue-width-bound (~34
-/// instructions/span before, at 4 stores + 2 loads it is nowhere near
-/// the load/store port limits), so trading the 7-op per-half shift/select
-/// chain for 1 always-L1-hot load (256 B, 4 lines) is a straight
-/// instruction-count cut. The ALU form stays in `pack_mask_halves` for
-/// the latency-chained per-span paths, where a dependent load on the
-/// `n -> key -> store` chain measured 2.43% of process.
+/// [`pack_mask_halves`](crate::pretokenize::pack_mask_halves) — the single
+/// source of the mask math — evaluated for each clamped length `m` in
+/// 1..=15 (entry 0 unused), as one 16-byte row so the phase-B emission
+/// loop loads both halves with a single `ldp`. That loop is
+/// issue-width-bound (~34 instructions/span before, at 4 stores + 2 loads
+/// it is nowhere near the load/store port limits), so trading the 7-op
+/// per-half shift/select chain for 1 always-L1-hot load (256 B, 4 lines)
+/// is a straight instruction-count cut. The ALU form stays in
+/// `pack_mask_halves` for the latency-chained per-span paths — see its
+/// docs for the measured cost of a dependent load on those chains.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 static PACK_MASK_TABLE: [[u64; 2]; 16] = {
     let mut t = [[0u64; 2]; 16];
     let mut n = 1;
     while n <= 15 {
-        let s = (n * 8) as u32;
-        t[n][0] = if n < 8 { u64::MAX >> (64 - s) } else { u64::MAX };
-        t[n][1] = if n > 8 { u64::MAX >> (128 - s) } else { 0 };
+        let (lo, hi) = crate::pretokenize::pack_mask_halves(n);
+        t[n] = [lo, hi];
         n += 1;
     }
     t
@@ -1043,9 +1061,9 @@ impl MaskState {
             // hoisted check proves every 16-byte key load in-bounds of the
             // input slice; only a fill reaching within 16 bytes of EOF
             // routes through the careful per-span pack.
-            let m = nb.min(needed);
-            let last_end = unsafe { *bufp.add(m - 1) } as usize;
-            let entries = &mut batch.entries[n..n + m];
+            let emit_n = nb.min(needed);
+            let last_end = unsafe { *bufp.add(emit_n - 1) } as usize;
+            let entries = &mut batch.entries[n..n + emit_n];
             let base_ptr = unsafe { bytes.as_ptr().add(fill_base) };
             // `prev`/`end` in usize: the u16 boundary domain forced two
             // `& 0xffff` masks and a duplicated 15-compare per span (the
@@ -1106,7 +1124,7 @@ impl MaskState {
                     e.meta = meta;
                 }
             }
-            n += m;
+            n += emit_n;
             pending = fill_base + prev;
             if exhausted {
                 debug_assert_eq!(pending, len);

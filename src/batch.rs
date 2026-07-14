@@ -20,8 +20,8 @@ use std::sync::{Mutex, OnceLock, TryLockError};
 const MIN_CHUNK_BYTES: usize = 1 << 20;
 
 /// Results at least this large get their per-chunk buffers freed on a
-/// background task after `assemble_ragged` returns (see the comment at the
-/// deferral site); smaller ones drop inline.
+/// background task after the gather returns (see `defer_drop`); smaller
+/// ones drop inline.
 const DEFERRED_DROP_MIN_BYTES: usize = 32 << 20;
 
 /// Target bytes per parallel chunk: ~16 chunks per thread for work-stealing
@@ -286,20 +286,54 @@ fn row_counts(chunks: &[ChunkTokens]) -> Vec<i64> {
     counts
 }
 
+/// Ask the kernel for 2 MiB pages over `[ptr, ptr + bytes)` before first
+/// touch. Huge pages cut the fault count of faulting in a multi-GB buffer
+/// ~500x, and Zen drops software prefetches that miss the TLB, so the
+/// encode-side copies want the coverage too. `MADV_HUGEPAGE` only hints
+/// page sizing; no-op off Linux (and where THP is unavailable).
+pub(crate) fn madvise_hugepage(ptr: *mut u8, bytes: usize) {
+    #[cfg(target_os = "linux")]
+    if bytes > 0 {
+        // SAFETY: callers pass a range within one live allocation, and the
+        // hint does not read or write the memory.
+        unsafe {
+            libc::madvise(ptr as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (ptr, bytes);
+}
+
+/// Free spent chunk buffers off the caller's critical path. They total as
+/// much memory as the gathered result, and tearing them down is munmap page
+/// teardown under the address-space write lock: inline frees convoy the
+/// gather copy's first-touch faults (read lock) behind each munmap (write
+/// lock), and a serial free after the copy keeps the munmaps inside the
+/// timed window. A detached background task pays the same teardown CPU
+/// after the caller has returned, overlapped with whatever runs next, and
+/// occupies at most one pool thread. Small results
+/// (< `DEFERRED_DROP_MIN_BYTES` of tokens) just drop inline: their teardown
+/// is microseconds and not worth holding the memory past return.
+fn defer_drop(chunks: Vec<ChunkTokens>) {
+    let total: usize = chunks.iter().map(|c| c.ids.len()).sum();
+    if total * std::mem::size_of::<u32>() >= DEFERRED_DROP_MIN_BYTES {
+        rayon::spawn(move || drop(chunks));
+    }
+}
+
 /// The in-flight state of the overlapped gather: a flat id buffer reserved
 /// at an upper bound BEFORE chunk sizes are known, plus a cursor over the
 /// longest fully-encoded prefix of the chunk sequence.
 ///
-/// The first-touch faults + memcpy of the final gather cost ~170 ms of a
-/// 1.23 s 10 GB window when run as a separate phase after the encode — and
-/// more than half of its ~2.1 s of CPU was kernel fault-path contention
-/// from 16 threads faulting the flat buffer at once. Chunk completion is
-/// near-sequential (strict in-order handout, descending LPT sizes), so a
-/// worker that finishes a chunk can commit the ready prefix — offsets are
-/// exact, they are sums of *completed* chunk sizes — while the tail still
-/// encodes. The copy work then hides inside the encode phase at ~1 thread
-/// at a time (no fault convoy), leaving only a small residual drain after
-/// the last chunk.
+/// Run as a separate phase after the encode, the final gather's first-touch
+/// faults + memcpy are a serial tail, most of whose CPU is kernel
+/// fault-path contention from every thread faulting the flat buffer at
+/// once. Chunk completion is near-sequential (strict in-order handout,
+/// descending LPT sizes), so a worker that finishes a chunk can commit the
+/// ready prefix — offsets are exact, they are sums of *completed* chunk
+/// sizes — while the tail still encodes. The copy work then hides inside
+/// the encode phase at ~1 thread at a time (no fault convoy), leaving only
+/// a small residual drain after the last chunk.
 ///
 /// The upper bound: a token consumes at least one input byte, so
 /// `total_bytes` tokens bounds the output; untouched reserved pages cost
@@ -353,19 +387,8 @@ impl Committer {
             return None;
         }
         let base = flat.as_mut_ptr();
-        // Ask for 2 MiB pages before first touch, as in `gather_flat`:
-        // commits fault in the buffer, and huge pages cut the fault count
-        // ~500x. No-op where THP is unavailable.
-        #[cfg(target_os = "linux")]
-        // SAFETY: the range is exactly this reservation; MADV_HUGEPAGE
-        // only hints page sizing.
-        unsafe {
-            libc::madvise(
-                base as *mut libc::c_void,
-                cap * std::mem::size_of::<u32>(),
-                libc::MADV_HUGEPAGE,
-            );
-        }
+        // The commits fault this reservation in while the encode runs.
+        madvise_hugepage(base as *mut u8, cap * std::mem::size_of::<u32>());
         Some(Self {
             flat,
             base,
@@ -499,12 +522,11 @@ impl Committer {
 /// (one pulling task per rayon thread), not `par_iter`: recursive range
 /// splitting lets a thread steal a subrange of early big chunks and still
 /// be *starting* a 2×-target chunk after everyone else has reached the
-/// small tail, which strands 15 threads behind one ~90 ms straggler
-/// (measured ~64 ms of a 1.46 s 10 GB window). In-order handout makes the
-/// LPT descending-size order of `build_doc_chunks` a guarantee, bounding
-/// the tail at roughly one small chunk — and makes chunk completion
-/// near-sequential, which is what lets the gather copy overlap the encode
-/// (see `Committer`).
+/// small tail, stranding the rest of the pool behind that one straggler.
+/// In-order handout makes the LPT descending-size order of
+/// `build_doc_chunks` a guarantee, bounding the tail at roughly one small
+/// chunk — and makes chunk completion near-sequential, which is what lets
+/// the gather copy overlap the encode (see `Committer`).
 pub(crate) fn encode_chunks_gathered(
     workers: &WorkerPool,
     proto: &Tokenizer,
@@ -575,11 +597,8 @@ fn encode_chunks_gathered_with_cap(
     let total: usize = outs.iter().map(|c| c.ids.len()).sum();
     match committer.and_then(|c| c.finish(&outs, total)) {
         Some(flat) => {
-            // The copies are done; free the spent chunk buffers off the
-            // critical path (same policy and rationale as `gather_flat`).
-            if total * std::mem::size_of::<u32>() >= DEFERRED_DROP_MIN_BYTES {
-                rayon::spawn(move || drop(outs));
-            }
+            // The copies are done; the spent chunk buffers are dead weight.
+            defer_drop(outs);
             (flat, counts)
         }
         None => (gather_flat(outs), counts),
@@ -602,21 +621,8 @@ fn gather_flat(chunks: Vec<ChunkTokens>) -> Vec<u32> {
     use rayon::prelude::*;
     let total: usize = chunks.iter().map(|c| c.ids.len()).sum();
     let mut flat = vec![0u32; total];
-    // Ask for 2 MiB pages before first touch: the parallel copy below
-    // faults in the whole (multi-GB) buffer, and huge pages cut the fault
-    // count ~500x. No-op where THP is unavailable.
-    #[cfg(target_os = "linux")]
-    if total > 0 {
-        // SAFETY: the range is exactly this allocation; MADV_HUGEPAGE only
-        // hints page sizing.
-        unsafe {
-            libc::madvise(
-                flat.as_mut_ptr() as *mut libc::c_void,
-                total * std::mem::size_of::<u32>(),
-                libc::MADV_HUGEPAGE,
-            );
-        }
-    }
+    // The parallel copy below faults in the whole buffer.
+    madvise_hugepage(flat.as_mut_ptr() as *mut u8, total * std::mem::size_of::<u32>());
     let mut rest: &mut [u32] = &mut flat;
     let mut slices = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
@@ -630,21 +636,7 @@ fn gather_flat(chunks: Vec<ChunkTokens>) -> Vec<u32> {
         .zip(chunks.par_iter())
         .with_max_len(1)
         .for_each(|(dst, chunk)| dst.copy_from_slice(&chunk.ids));
-    // Free the spent chunk buffers OFF the copy's critical path. They total
-    // as much memory as `flat` itself, and tearing them down is munmap page
-    // teardown under the address-space write lock — freeing them serially
-    // after the copy put ~110 ms single-threaded on a 10 GB encode, and
-    // freeing them *inside* the copy tasks convoyed the copy's zero-fill
-    // first-touch faults (read lock) behind each munmap (write lock): the
-    // fused gather ran at 7.2/16 threads busy, blocked ~45% of a 214 ms
-    // phase. A detached background task pays the same teardown CPU after
-    // this function has returned, overlapped with whatever the caller does
-    // next, and occupies one pool thread at most. Small results (< 32 MB)
-    // just drop inline: the teardown is microseconds and not worth holding
-    // the memory past return.
-    if total * std::mem::size_of::<u32>() >= DEFERRED_DROP_MIN_BYTES {
-        rayon::spawn(move || drop(chunks));
-    }
+    defer_drop(chunks);
     flat
 }
 
@@ -795,13 +787,80 @@ pub(crate) fn sp_encode_docs_ragged(
     assemble_ragged(outs)
 }
 
+/// encode_files core for the BPE backend. With no separator each file is one
+/// document (small files are grouped, huge ones split at pretoken-safe
+/// boundaries); otherwise each file is cut into byte regions at document
+/// boundaries and documents are extracted while encoding.
+pub(crate) fn encode_files_docs(
+    workers: &WorkerPool,
+    proto: &Tokenizer,
+    files: &[&[u8]],
+    format: &DocFormat,
+) -> (Vec<u32>, Vec<i64>) {
+    if matches!(format, DocFormat::Text { separator: None }) {
+        return encode_docs_ragged(workers, proto, files);
+    }
+    let total: usize = files.iter().map(|f| f.len()).sum();
+    let target = chunk_target_bytes(total);
+    let chunks: Vec<EncodeChunk> = files
+        .iter()
+        .flat_map(|&bytes| {
+            chunk_ranges(bytes, format, target)
+                .into_iter()
+                .map(move |r| EncodeChunk::Region {
+                    bytes: &bytes[r],
+                    format,
+                })
+        })
+        .collect();
+    encode_chunks_gathered(workers, proto, &chunks, total)
+}
+
+/// encode_files core for the SentencePiece backend: cut files into byte
+/// regions at document boundaries and encode each region's documents with a
+/// per-chunk Encoder. Documents are assumed to be valid UTF-8.
+pub(crate) fn sp_encode_files_docs(
+    tokenizer: &bpe::SentencePieceBPE,
+    files: &[&[u8]],
+    format: &DocFormat,
+) -> (Vec<u32>, Vec<i64>) {
+    let total: usize = files.iter().map(|f| f.len()).sum();
+    let target = chunk_target_bytes(total);
+    let chunks: Vec<(usize, Range<usize>)> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &bytes)| {
+            chunk_ranges(bytes, format, target)
+                .into_iter()
+                .map(move |r| (i, r))
+        })
+        .collect();
+    let outs = map_maybe_par(&chunks, |(file, range)| {
+        let bytes = &files[*file][range.clone()];
+        let mut encoder = tokenizer.encoder();
+        let mut ids: Vec<u32> = Vec::new();
+        let mut lens: Vec<i64> = Vec::new();
+        for_each_doc(bytes, format, |doc| {
+            let text = unsafe { std::str::from_utf8_unchecked(doc) };
+            sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
+        });
+        ChunkTokens {
+            ids,
+            lens,
+            continues: false,
+        }
+    });
+    assemble_ragged(outs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
 
     /// The parallel chunked path — LPT descending chunk sizes, pooled
-    /// pre-sized workers, collect-then-assemble gather — must be
+    /// pre-sized workers, overlapped Committer gather (with
+    /// collect-then-gather as the fallback) — must be
     /// token-identical, in the same order, to a serial per-document
     /// encode, with LPT both on and off (GIGATOK_NO_LPT), passed
     /// explicitly so no process env is mutated. A byte-level vocab makes
@@ -1003,70 +1062,4 @@ mod tests {
             assert_eq!(flat, flat_ref, "ids mismatch (cap={cap})");
         }
     }
-}
-
-/// encode_files core for the BPE backend. With no separator each file is one
-/// document (small files are grouped, huge ones split at pretoken-safe
-/// boundaries); otherwise each file is cut into byte regions at document
-/// boundaries and documents are extracted while encoding.
-pub(crate) fn encode_files_docs(
-    workers: &WorkerPool,
-    proto: &Tokenizer,
-    files: &[&[u8]],
-    format: &DocFormat,
-) -> (Vec<u32>, Vec<i64>) {
-    if matches!(format, DocFormat::Text { separator: None }) {
-        return encode_docs_ragged(workers, proto, files);
-    }
-    let total: usize = files.iter().map(|f| f.len()).sum();
-    let target = chunk_target_bytes(total);
-    let chunks: Vec<EncodeChunk> = files
-        .iter()
-        .flat_map(|&bytes| {
-            chunk_ranges(bytes, format, target)
-                .into_iter()
-                .map(move |r| EncodeChunk::Region {
-                    bytes: &bytes[r],
-                    format,
-                })
-        })
-        .collect();
-    encode_chunks_gathered(workers, proto, &chunks, total)
-}
-
-/// encode_files core for the SentencePiece backend: cut files into byte
-/// regions at document boundaries and encode each region's documents with a
-/// per-chunk Encoder. Documents are assumed to be valid UTF-8.
-pub(crate) fn sp_encode_files_docs(
-    tokenizer: &bpe::SentencePieceBPE,
-    files: &[&[u8]],
-    format: &DocFormat,
-) -> (Vec<u32>, Vec<i64>) {
-    let total: usize = files.iter().map(|f| f.len()).sum();
-    let target = chunk_target_bytes(total);
-    let chunks: Vec<(usize, Range<usize>)> = files
-        .iter()
-        .enumerate()
-        .flat_map(|(i, &bytes)| {
-            chunk_ranges(bytes, format, target)
-                .into_iter()
-                .map(move |r| (i, r))
-        })
-        .collect();
-    let outs = map_maybe_par(&chunks, |(file, range)| {
-        let bytes = &files[*file][range.clone()];
-        let mut encoder = tokenizer.encoder();
-        let mut ids: Vec<u32> = Vec::new();
-        let mut lens: Vec<i64> = Vec::new();
-        for_each_doc(bytes, format, |doc| {
-            let text = unsafe { std::str::from_utf8_unchecked(doc) };
-            sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
-        });
-        ChunkTokens {
-            ids,
-            lens,
-            continues: false,
-        }
-    });
-    assemble_ragged(outs)
 }

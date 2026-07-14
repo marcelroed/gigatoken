@@ -27,13 +27,7 @@ mod common;
 const DEFAULT_MB: usize = 2000;
 
 fn main() {
-    // Some session managers launch children with PR_SET_THP_DISABLE, which
-    // silently vetoes MADV_HUGEPAGE; clear it so the bench measures the
-    // tokenizer, not the launcher's memory policy (same as encode_st).
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::prctl(libc::PR_SET_THP_DISABLE, 0, 0, 0, 0);
-    }
+    common::allow_thp();
     let tokenizer_json = std::env::var("TOKENIZER_JSON")
         .unwrap_or_else(|_| "data/olmo3_tokenizer.json".to_string());
     let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&tokenizer_json);

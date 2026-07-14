@@ -45,8 +45,8 @@ flate2 = "1.1"
 zstd = "0.13"
 spm_precompiled = "0.1.4"
 
-# madvise(MADV_HUGEPAGE) for the pretoken-cache table (already in the tree
-# transitively via memmap2/pyo3).
+# madvise/prctl on Linux (pretoken cache table, batch gather, bench THP
+# setup); already in the tree transitively via memmap2/pyo3.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
@@ -62,10 +62,6 @@ inherits = "release"
 debug = true
 strip = "none"
 split-debuginfo = "packed"
-
-[profile.bench.package."*"]
-debug = true
-strip = "none"
 
 [profile.profiling]
 inherits = "release"

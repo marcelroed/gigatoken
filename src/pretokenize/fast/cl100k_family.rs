@@ -333,14 +333,18 @@ fn family_extended_masks(
         ascii_carries(bytes, scan)
     } else {
         // A multi-byte char within two bytes of the batch start.
-        let (c1, j1, e1) = mask::char_through(bytes, scan, class);
+        // SAFETY: scan > 0 on this branch, and the classifier's
+        // scan + 70 <= len batch guard covers pos + 3 <= len.
+        let (c1, j1, e1) = unsafe { mask::char_through(bytes, scan, class) };
         let pb = bytes[scan - 1];
         let chm = if e1 > scan { (1u64 << (e1 - scan)) - 1 } else { 0 };
         cl.cont = chm;
         let c2v = if j1 == 0 {
             0
         } else {
-            let c2c = mask::char_through(bytes, j1, class).0;
+            // SAFETY: j1 > 0 just checked, and j1 < scan keeps the decode
+            // within the classifier's scan + 70 <= len batch guard.
+            let c2c = unsafe { mask::char_through(bytes, j1, class) }.0;
             u64::from(bytes[j1 - 1] == b' ' || c2c == CharClass::Other)
         };
         let mut c = Carries::default();
@@ -382,7 +386,9 @@ fn family_extended_masks(
     };
 
     let mut uni = if am.hi != 0 {
-        mask::classify_uni_chars::<false, true>(bytes, scan, am.hi & !cl.cont, class)
+        // SAFETY: this classifier's scan + 70 <= len batch guard is
+        // exactly `classify_uni_chars`' contract.
+        unsafe { mask::classify_uni_chars::<false, true>(bytes, scan, am.hi & !cl.cont, class) }
     } else {
         mask::UniClasses::default()
     };
@@ -474,7 +480,9 @@ fn family_algebra(
     let nn64 = if nb64 < 0x80 {
         !is_ascii_ws(nb64)
     } else {
-        bad >> 63 == 0 && mask::nn_at_full(bytes, scan + 64)
+        // SAFETY: the same scan + 70 <= len batch guard puts the decode at
+        // scan + 64 in bounds (needs scan + 68 <= len).
+        bad >> 63 == 0 && unsafe { mask::nn_at_full(bytes, scan + 64) }
     };
     let nn64m = u64::from(nn64).wrapping_neg(); // all-ones when non-ws
 

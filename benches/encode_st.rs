@@ -5,15 +5,7 @@ use std::time::Instant;
 
 mod common;
 fn main() {
-    // The pretoken cache madvises its table to 2 MiB pages (the table far
-    // exceeds 4 KiB dTLB coverage, and Zen drops software prefetches that
-    // miss the TLB). Some session managers launch children with
-    // PR_SET_THP_DISABLE, which silently vetoes MADV_HUGEPAGE; clear it so
-    // the bench measures the tokenizer, not the launcher's memory policy.
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::prctl(libc::PR_SET_THP_DISABLE, 0, 0, 0, 0);
-    }
+    common::allow_thp();
     // ENCODE_TOKENIZER overrides the tokenizer.json (e.g.
     // data/qwen3_tokenizer.json to bench the qwen2-scheme encode path);
     // encoding then runs through the scheme dispatch instead of the

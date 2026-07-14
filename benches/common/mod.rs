@@ -4,6 +4,21 @@
 
 use std::time::Instant;
 
+/// Re-enable transparent huge pages for this process. The encode paths
+/// madvise their big tables and buffers to 2 MiB pages (they far exceed
+/// 4 KiB dTLB coverage, and Zen drops software prefetches that miss the
+/// TLB), but some session managers launch children with
+/// PR_SET_THP_DISABLE, which silently vetoes MADV_HUGEPAGE; clear it so
+/// the bench measures the tokenizer, not the launcher's memory policy.
+/// No-op off Linux.
+pub fn allow_thp() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl(PR_SET_THP_DISABLE, 0) only clears a per-process flag.
+    unsafe {
+        libc::prctl(libc::PR_SET_THP_DISABLE, 0, 0, 0, 0);
+    }
+}
+
 /// Load the benchmark input from `~/data/owt_train.txt`, truncated to a
 /// UTF-8 character boundary.
 ///
