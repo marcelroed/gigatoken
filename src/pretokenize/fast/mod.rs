@@ -46,12 +46,10 @@ pub(crate) fn fill_spans_keyed_mask<'a, S: mask::MaskScheme>(
     batch: &mut SpanBatch<'a>,
     prefetch: &impl Fn(u64),
 ) -> usize {
-    crate::pretokenize::fill_spans_keyed_with(
-        || {
-            let (start, end) = state.next_span::<S>(bytes)?;
-            // SAFETY: next_span returns in-bounds span boundaries.
-            Some(unsafe { bytes.get_unchecked(start..end) })
-        },
+    crate::pretokenize::fill_spans_keyed_with_buf(
+        bytes,
+        // next_span returns in-bounds, nonempty span boundaries.
+        || state.next_span::<S>(bytes),
         batch,
         prefetch,
     )
