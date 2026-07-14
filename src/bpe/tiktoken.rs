@@ -22,14 +22,19 @@ use std::sync::Arc;
 /// determined by the merged token's vocab ID (lower = first), which
 /// equals the merge rank for tiktoken vocabularies.
 pub struct Tokenizer {
-    pub(crate) merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
+    // The model tables (merges, pair_ranks, vocab, vocab_inv) are immutable
+    // after construction and shared across forks behind `Arc`: parallel
+    // workers read the same few MB of tables instead of holding one deep
+    // clone each, which keeps a single copy resident per cache/cluster on
+    // the cold miss path and makes forking the tables O(1). The rare
+    // mutation (`add_special_token`) goes through `Arc::make_mut`.
+    pub(crate) merges: Arc<HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>>,
     /// Flat pair-rank tables replacing `merges` lookups on the miss path's
     /// merge loop; `None` for vocabularies whose IDs don't fit its packed
-    /// keys (those keep probing `merges`). Immutable after construction and
-    /// shared across forks.
+    /// keys (those keep probing `merges`).
     pair_ranks: Option<Arc<PairRankTable>>,
-    pub(crate) vocab: Vec<Arc<[u8]>>,
-    pub(crate) vocab_inv: HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
+    pub(crate) vocab: Arc<Vec<Arc<[u8]>>>,
+    pub(crate) vocab_inv: Arc<HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>>,
     pub(crate) byte_remapping: Option<ByteRemapping>,
     /// Append-only arena of encoded token IDs. Cache entries for encodings
     /// of 5+ tokens store `(offset, len)` slices into this vector; shorter
@@ -145,10 +150,10 @@ impl Tokenizer {
         let mut token_arena = Vec::new();
         let pretoken_cache = Self::seeded_pretoken_cache(&vocab, &mut token_arena);
         Tokenizer {
-            merges,
+            merges: Arc::new(merges),
             pair_ranks,
-            vocab_inv,
-            vocab,
+            vocab_inv: Arc::new(vocab_inv),
+            vocab: Arc::new(vocab),
             byte_remapping,
             token_arena,
             pretoken_cache,
@@ -239,11 +244,11 @@ impl Tokenizer {
         let mut token_arena = Vec::new();
         let pretoken_cache = Self::seeded_pretoken_cache(&vocab, &mut token_arena);
         Ok(Tokenizer {
-            merges,
+            merges: Arc::new(merges),
             pair_ranks,
             byte_remapping,
-            vocab,
-            vocab_inv,
+            vocab: Arc::new(vocab),
+            vocab_inv: Arc::new(vocab_inv),
             token_arena,
             pretoken_cache,
             pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
@@ -263,10 +268,10 @@ impl Tokenizer {
         let mut token_arena = Vec::new();
         let pretoken_cache = Self::seeded_pretoken_cache(&self.vocab, &mut token_arena);
         Tokenizer {
-            merges: self.merges.clone(),
+            merges: Arc::clone(&self.merges),
             pair_ranks: self.pair_ranks.clone(),
-            vocab: self.vocab.clone(),
-            vocab_inv: self.vocab_inv.clone(),
+            vocab: Arc::clone(&self.vocab),
+            vocab_inv: Arc::clone(&self.vocab_inv),
             byte_remapping: self.byte_remapping.clone(),
             token_arena,
             pretoken_cache,
@@ -317,12 +322,16 @@ impl Tokenizer {
     /// added-token handling in the HF loader).
     pub fn add_special_token(&mut self, content: Vec<u8>, id: TokenId) {
         let idx = id.0 as usize;
-        if idx >= self.vocab.len() {
-            self.vocab.resize(idx + 1, Arc::from(Vec::new().as_slice()));
+        // Loader-phase mutation of the shared model tables: `make_mut`
+        // copies only when a fork holds the tables too (never during
+        // loading, where this is called).
+        let vocab = Arc::make_mut(&mut self.vocab);
+        if idx >= vocab.len() {
+            vocab.resize(idx + 1, Arc::from(Vec::new().as_slice()));
         }
-        if self.vocab[idx].is_empty() {
-            self.vocab[idx] = content.clone().into();
-            self.vocab_inv.insert(self.vocab[idx].clone(), id);
+        if vocab[idx].is_empty() {
+            vocab[idx] = content.clone().into();
+            Arc::make_mut(&mut self.vocab_inv).insert(vocab[idx].clone(), id);
             // Keep the vocab seed in sync (see `seeded_pretoken_cache`): a
             // short pretoken matching this content must resolve to `id`
             // without the miss path's reverse-vocab probe. An existing cache
@@ -873,7 +882,7 @@ mod tests {
             .pair_ranks
             .as_deref()
             .expect("GPT-2 must take the pair-rank fast path");
-        for (&(a, b), &m) in &tokenizer.merges {
+        for (&(a, b), &m) in tokenizer.merges.iter() {
             assert_eq!(table.rank(a, b), m.0, "pair ({}, {})", a.0, b.0);
         }
         // Dense negatives (byte × byte) and flat negatives must agree with
