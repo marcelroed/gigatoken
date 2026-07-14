@@ -589,6 +589,106 @@ mod tests {
             assert_eq!(flat, ids_ref, "ids mismatch (lpt={lpt})");
         }
     }
+
+    /// Parallel-vs-serial at scale on a REAL tokenizer: ~1 GB of OWT as a
+    /// multi-doc group (small grouped docs, mid docs, oversized docs that
+    /// fragment at pretoken-safe boundaries) with `<|endoftext|>` injected
+    /// mid-doc and doc-final, LPT on and off. Token AND order identity
+    /// against a serial per-document encode.
+    /// `cargo test --release verify_parallel_ragged_matches_serial_owt_gpt2 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reads 1 GB of OWT; run explicitly in release mode"]
+    fn verify_parallel_ragged_matches_serial_owt_gpt2() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        use std::io::Read;
+        let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("data/gpt2_tokenizer.json");
+        let proto = load_hf_bpe(&tokenizer_path).expect("load GPT-2 tokenizer");
+        let added = proto.added_token_contents();
+        let sep: Vec<u8> = added.first().expect("GPT-2 has an added token").to_vec();
+
+        let path = std::env::home_dir().unwrap().join("data/owt_train.txt");
+        let f = std::fs::File::open(&path).expect("open ~/data/owt_train.txt");
+        let mut input = Vec::new();
+        f.take(1_000_000_000).read_to_end(&mut input).unwrap();
+        while !input.is_empty() && std::str::from_utf8(&input).is_err() {
+            input.pop();
+        }
+        assert!(input.len() > 900_000_000, "corpus too small: {}", input.len());
+
+        // Doc size pattern: small (group), mid, large; every 20th doc is
+        // oversized (24 MB) so it splits into Fragment chunks.
+        let sizes = [64 << 10, 300 << 10, 1 << 20, 100 << 10, 3 << 20];
+        let mut owned: Vec<Vec<u8>> = Vec::new(); // docs with injected added tokens
+        let mut ranges: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, inject)
+        let mut pos = 0usize;
+        let mut i = 0usize;
+        while pos < input.len() {
+            let want = if i % 20 == 19 { 24 << 20 } else { sizes[i % sizes.len()] };
+            let end = (pos + want).min(input.len());
+            // Inject the added token into every 7th doc (mid + tail).
+            ranges.push((pos, end, i % 7 == 3));
+            pos = end;
+            i += 1;
+        }
+        for &(s, e, inject) in &ranges {
+            if inject {
+                let piece = &input[s..e];
+                let mid = piece.len() / 2;
+                let mut doc = Vec::with_capacity(piece.len() + 2 * sep.len());
+                doc.extend_from_slice(&piece[..mid]);
+                doc.extend_from_slice(&sep);
+                doc.extend_from_slice(&piece[mid..]);
+                doc.extend_from_slice(&sep);
+                owned.push(doc);
+            }
+        }
+        let mut docs: Vec<&[u8]> = Vec::with_capacity(ranges.len());
+        let mut oi = 0usize;
+        for &(s, e, inject) in &ranges {
+            if inject {
+                docs.push(&owned[oi]);
+                oi += 1;
+            } else {
+                docs.push(&input[s..e]);
+            }
+        }
+        eprintln!(
+            "{} docs ({} with injected {:?}), {} bytes total",
+            docs.len(),
+            owned.len(),
+            String::from_utf8_lossy(&sep),
+            docs.iter().map(|d| d.len()).sum::<usize>()
+        );
+
+        let mut ids_ref: Vec<u32> = Vec::new();
+        let mut lens_ref: Vec<i64> = Vec::new();
+        let mut serial = proto.fork();
+        for doc in &docs {
+            encode_into(&mut serial, doc, &mut ids_ref, &mut lens_ref);
+        }
+        drop(serial);
+        eprintln!("serial reference: {} tokens", ids_ref.len());
+
+        for lpt in [true, false] {
+            let workers = WorkerPool::new();
+            let (flat, lens) = encode_docs_ragged_with(&workers, &proto, &docs, lpt);
+            assert_eq!(lens, lens_ref, "lens mismatch (lpt={lpt})");
+            if flat != ids_ref {
+                let i = ids_ref
+                    .iter()
+                    .zip(&flat)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or_else(|| ids_ref.len().min(flat.len()));
+                panic!(
+                    "ids mismatch (lpt={lpt}) at token {i}: serial[{i}..] = {:?}, parallel[{i}..] = {:?}",
+                    &ids_ref[i..(i + 8).min(ids_ref.len())],
+                    &flat[i..(i + 8).min(flat.len())],
+                );
+            }
+            eprintln!("lpt={lpt}: {} tokens identical", flat.len());
+        }
+    }
 }
 
 /// encode_files core for the BPE backend. With no separator each file is one

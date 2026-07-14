@@ -292,10 +292,10 @@ impl ShortPretokenCache {
 
     /// Insert `key`, overwriting its value if the key is already present
     /// (the plain [`Self::insert`] assumes absence). Cold loader-phase
-    /// entry point for the vocab-seed sync (`add_special_token` and
-    /// `fork_sized`'s added-token re-apply), where an added token's
-    /// content can duplicate an already-seeded vocab byte string and must
-    /// take over its entry.
+    /// entry point for the vocab-seed sync (`set_added_tokens`' overwrite
+    /// and restore loops and `fork_sized`'s added-token re-apply), where
+    /// an added token's content can duplicate an already-seeded vocab
+    /// byte string and must take over its entry.
     pub(crate) fn replace(&mut self, key: u128, h: u64, val: u64, ext: u64) {
         debug_assert_ne!(key, EMPTY_KEY);
         let mut idx = (h as usize) & self.mask & !1;
