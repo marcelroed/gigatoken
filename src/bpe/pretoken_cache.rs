@@ -120,6 +120,18 @@ impl ShortPretokenCache {
         Self { slots: Slots::new_zeroed(cap), mask: cap - 1, len: 0 }
     }
 
+    /// A table sized to hold at least `n` entries without growing (same
+    /// 3/4-load threshold as [`Self::insert`], same 2^16 floor as
+    /// [`Self::new`]). The vocab-seeding path inserts ~50k entries up
+    /// front; pre-sizing avoids rehashing them mid-seed.
+    pub(crate) fn with_at_least(n: usize) -> Self {
+        let mut cap = 1usize << 16;
+        while (n + 1) * 4 > cap * 3 {
+            cap *= 2;
+        }
+        Self::with_pow2_capacity(cap)
+    }
+
     /// Request the probe's cache line ahead of [`Self::get`]. The encode
     /// loop calls this a chunk of pretokens early; by probe time the line
     /// is (usually) in L1 regardless of where it started.
