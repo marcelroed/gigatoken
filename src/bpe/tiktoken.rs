@@ -1391,6 +1391,17 @@ mod verify_heavy {
             eprintln!("{label}: no added tokens registered; skipping join differential");
             return;
         };
+        // OWT embeds document separators (e.g. <|endoftext|>) throughout;
+        // mask every added-token occurrence so pieces are separator-free
+        // and the expected stream can be built without find_added_token.
+        let mut corpus: Vec<u8> = corpus.to_vec();
+        for (content, _) in tok.added_tokens.clone() {
+            let hits: Vec<usize> = memchr::memmem::find_iter(&corpus, &content[..]).collect();
+            for pos in hits {
+                corpus[pos] = b'~';
+            }
+        }
+        let corpus = &corpus[..];
         let mut expected: Vec<u32> = Vec::new();
         let mut joined: Vec<u8> = Vec::new();
         let mut nfc_buf = String::new();
@@ -1404,8 +1415,8 @@ mod verify_heavy {
             };
             let piece = &corpus[start..end];
             start = end;
-            // A piece containing any added token would make the expected
-            // stream wrong; skip those rare pieces.
+            // Masking is single-byte, so no new occurrence can appear; but
+            // keep the guard as a belt-and-braces skip.
             if tok
                 .added_tokens
                 .iter()
@@ -1443,6 +1454,7 @@ mod verify_heavy {
                 &cached[i..(i + 8).min(cached.len())],
             );
         }
+        assert!(pieces > 0, "{label}: join differential ran on zero pieces (vacuous)");
         eprintln!(
             "{label}: join differential ok — {pieces} pieces, {} tokens, sep {:?} id {}",
             cached.len(),
@@ -1475,7 +1487,12 @@ mod verify_heavy {
         let input = load_owt(200_000_000);
         assert!(input.len() > 190_000_000, "corpus too small: {}", input.len());
         let mut ran = 0usize;
-        for name in ["olmo3", "qwen2", "qwen3_5", "deepseek_v3"] {
+        // qwen3_5 LAST: it fails on the KNOWN vocab-seed bug (see
+        // verify_vocab_seeded_cache_overrides_merges_known_bug) — its vocab
+        // has 201 merge-unreachable entries that the seeded cache returns
+        // as single tokens, diverging from HF. Keep it in the list so the
+        // failure stays visible until fixed, after the clean tokenizers.
+        for name in ["olmo3", "qwen2", "deepseek_v3", "qwen3_5"] {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("data/{name}_tokenizer.json"));
             let mut tok = match load_hf_bpe(&path) {
@@ -1807,5 +1824,263 @@ mod verify_heavy {
         }
         // Length > 15 routes to the long map.
         assert_eq!(pack_pretoken_key(&buf[..16]), None);
+    }
+}
+
+
+/// KNOWN BUG repro (optimization-introduced, commit d39bca2 "vocab-seeded
+/// cache"): `seeded_pretoken_cache` seeds EVERY short (<= 15 byte) vocab
+/// entry as pretoken -> [own id], but BPE encode semantics (HF
+/// `tokenizers` without `ignore_merges`, and this repo's own merge loop)
+/// only produce a vocab entry that the merge rules can derive. qwen3_5's
+/// vocab has 201 merge-unreachable entries (mostly multi-char CJK phrases,
+/// plus e.g. " Jap\u{f3}n"); when one appears as a whole pretoken the
+/// cached pipeline returns the single seeded id while HF returns the merge
+/// split. Verified against HF `tokenizers`: encode(" Jap\u{f3}n") on
+/// data/qwen3_5_tokenizer.json gives [604, 385, 3064] ("ĠJ", "ap", "Ã³n");
+/// gigatoken 1ffff3c gives [209344] (" Jap\u{f3}n"). The pre-optimization
+/// baseline (0e27c71) had no cache seeding and matched HF. The gpt2,
+/// olmo3, qwen2, and deepseek_v3 vocabs have zero unreachable entries, so
+/// only qwen3_5-style vocabs are affected. Asserts the CORRECT (HF)
+/// behavior, so it FAILS until fixed; un-ignore with the fix.
+#[cfg(test)]
+mod verify_known_bugs {
+    use crate::load_tokenizer::hf::load_hf_bpe;
+
+    #[test]
+    #[ignore = "KNOWN BUG: vocab-seeded cache overrides merge-unreachable entries (d39bca2); fails as of 1ffff3c"]
+    fn verify_vocab_seeded_cache_overrides_merges_known_bug() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("data/qwen3_5_tokenizer.json");
+        let mut tok = load_hf_bpe(&path).expect("load qwen3_5");
+        let pretoken: &[u8] = " Jap\u{f3}n".as_bytes();
+
+        let mut cached: Vec<u32> = Vec::new();
+        tok.encode_with_added_tokens_flat(pretoken, &mut cached);
+        // HF `tokenizers` ground truth for this tokenizer.json.
+        assert_eq!(
+            cached,
+            vec![604, 385, 3064],
+            "seeded cache returned the merge-unreachable whole-vocab entry"
+        );
+    }
+}
+
+/// Alignment-invariance sweep: the walkers' output must not depend on the
+/// span's heap address. (The full-suite flake of
+/// verify_walker_edge_length_pretokens motivated this: same bytes,
+/// different run -> different tokens can only come from address-dependent
+/// framing in the SIMD batch walkers.)
+#[cfg(test)]
+mod verify_alignment {
+    use super::*;
+    use crate::load_tokenizer::hf::load_hf_bpe;
+
+    fn pretoken_lens<'a, P: PretokenSpans<'a>>(mut p: P) -> Vec<usize> {
+        let mut batch = SpanBatch::new();
+        let mut lens = Vec::new();
+        loop {
+            let n = p.fill_spans_keyed(&mut batch, &|_| {});
+            for i in 0..n {
+                lens.push(batch.entries[i].span_len());
+            }
+            if n < PRETOKEN_CHUNK {
+                return lens;
+            }
+        }
+    }
+
+    #[test]
+    fn verify_walker_alignment_invariance() {
+        let mut tok = load_hf_bpe(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json"),
+        )
+        .expect("load GPT-2 tokenizer");
+        // Inputs chosen to stress batch-edge machinery: long runs of one
+        // class, class flips near multiples of 64, multi-byte chars
+        // straddling batch edges, contractions, digit groups.
+        let mut inputs: Vec<Vec<u8>> = Vec::new();
+        for n in [63usize, 64, 65, 127, 128, 129, 255, 256, 300, 4096] {
+            for fill in [&b"a"[..], b"5", b" ", b"!", b"\n", "\u{e9}".as_bytes(), "\u{597d}".as_bytes()] {
+                let mut v = Vec::new();
+                while v.len() < n {
+                    v.extend_from_slice(fill);
+                }
+                inputs.push(v);
+            }
+        }
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const PIECES: &[&str] = &[
+            " the", " a", "word", "05", "  ", "\n", "'s", "n't", ",", " \u{e9}t\u{e9}",
+            "\u{597d}\u{597d}", " 123", "...", "\t", " I'm", "\u{2014}", "e", " ",
+        ];
+        for _ in 0..200 {
+            let target = 80 + (rng() % 400) as usize;
+            let mut v = Vec::new();
+            while v.len() < target {
+                v.extend_from_slice(PIECES[(rng() % PIECES.len() as u64) as usize].as_bytes());
+            }
+            inputs.push(v);
+        }
+
+        for (which, input) in inputs.iter().enumerate() {
+            // Copy the same bytes at every offset 0..64 of a fresh buffer;
+            // walker output must be identical for all of them.
+            let mut ref_lens: Option<Vec<usize>> = None;
+            let mut ref_ids: Option<Vec<u32>> = None;
+            for off in 0..64usize {
+                let mut buf = vec![0u8; off + input.len() + 64];
+                buf[off..off + input.len()].copy_from_slice(input);
+                let span = &buf[off..off + input.len()];
+                let lens = pretoken_lens(FastR50kPretokenizer::new(span));
+                let mut ids: Vec<u32> = Vec::new();
+                tok.memoized_encode_flat(FastR50kPretokenizer::new(span), &mut ids);
+                match (&ref_lens, &ref_ids) {
+                    (None, _) => {
+                        ref_lens = Some(lens);
+                        ref_ids = Some(ids);
+                    }
+                    (Some(rl), Some(ri)) => {
+                        assert!(
+                            &lens == rl,
+                            "input {which}: pretoken lens differ at offset {off}\n  base: {rl:?}\n  off{off}: {lens:?}\n  input: {:?}",
+                            String::from_utf8_lossy(input)
+                        );
+                        assert!(
+                            &ids == ri,
+                            "input {which}: token ids differ at offset {off} on {:?}",
+                            String::from_utf8_lossy(input)
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        eprintln!("alignment invariance: {} inputs x 64 offsets ok", inputs.len());
+    }
+}
+
+/// Scratch: deterministic repro hunt for the 0xFF-run flake.
+#[cfg(test)]
+mod verify_scratch2 {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn ff_run_merge_stress() {
+        use crate::load_tokenizer::hf::load_hf_bpe;
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("data/gpt2_tokenizer.json");
+        // The two flaking spans.
+        let mut a = vec![0xFFu8; 65534];
+        a.extend_from_slice(b"cba"); // len 65537
+        let mut b = vec![b' '];
+        b.extend_from_slice(&a); // len 65538
+        let mut junk: Vec<Vec<u8>> = Vec::new();
+        let mut state = 0xDEADBEEFu64;
+        for round in 0..100 {
+            // Perturb the allocator so addresses vary in-process.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            junk.push(vec![0u8; (state % 8192) as usize]);
+            let mut tok = load_hf_bpe(&path).expect("load GPT-2");
+            for (name, input) in [("A", &a), ("B", &b)] {
+                // memoized path
+                let mut cached: Vec<u32> = Vec::new();
+                tok.memoized_encode_flat(FastR50kPretokenizer::new(input), &mut cached);
+                // hashmap plain path
+                let mut sy: Vec<TokenId> = match tok.byte_remapping.as_ref() {
+                    Some(br) => input.iter().map(|&x| br.mapping[x as usize]).collect(),
+                    None => input.iter().map(|&x| TokenId::from(x as u32)).collect(),
+                };
+                crate::bpe::bpe_merge_symbols(&tok.merges, &mut sy);
+                let plain: Vec<u32> = sy.iter().map(|t| t.0).collect();
+                // table path with fresh scratch
+                let mut sy2: Vec<TokenId> = match tok.byte_remapping.as_ref() {
+                    Some(br) => input.iter().map(|&x| br.mapping[x as usize]).collect(),
+                    None => input.iter().map(|&x| TokenId::from(x as u32)).collect(),
+                };
+                let mut scr = MergeScratch::default();
+                if let Some(table) = tok.pair_ranks.as_deref() {
+                    bpe_merge_symbols_table_with_scratch(table, &mut sy2, &mut scr);
+                }
+                let table_r: Vec<u32> = sy2.iter().map(|t| t.0).collect();
+                let tail = |v: &Vec<u32>| v[v.len().saturating_sub(3)..].to_vec();
+                if round < 3 || tail(&cached) != tail(&plain) || tail(&plain) != tail(&table_r) {
+                    eprintln!(
+                        "round {round} {name}: cached tail {:?} plain tail {:?} table tail {:?} (counts {} {} {})",
+                        tail(&cached), tail(&plain), tail(&table_r),
+                        cached.len(), plain.len(), table_r.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn ff_run_alignment_sweep() {
+        // span = 0xFF * 65534 + b"cba" (the sanitized edge-length input)
+        let mut input = vec![0xFFu8; 65534];
+        input.extend_from_slice(b"cba");
+        for &n in &[65537usize, 66usize, 130usize, 258usize] {
+            let inp = if n == 65537 { input.clone() } else {
+                let mut v = vec![0xFFu8; n - 3];
+                v.extend_from_slice(b"cba");
+                v
+            };
+            let mut seen: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
+            for off in 0..64usize {
+                let mut buf = vec![0u8; off + inp.len() + 64];
+                buf[off..off + inp.len()].copy_from_slice(&inp);
+                let span = &buf[off..off + inp.len()];
+                // Iterator path
+                let iter_lens: Vec<usize> =
+                    FastR50kPretokenizer::new(span).map(|p| p.0.len()).collect();
+                // Two-phase path
+                let mut batch = SpanBatch::new();
+                let mut tp = FastR50kPretokenizer::new(span);
+                let mut tp_lens: Vec<usize> = Vec::new();
+                loop {
+                    let k = tp.fill_spans_keyed(&mut batch, &|_| {});
+                    for i in 0..k {
+                        tp_lens.push(batch.entries[i].span_len());
+                    }
+                    if k < PRETOKEN_CHUNK {
+                        break;
+                    }
+                }
+                seen.push((off, iter_lens, tp_lens));
+            }
+            let base = &seen[0];
+            let mut all_same = true;
+            for s in &seen {
+                if s.1 != base.1 || s.2 != base.2 {
+                    all_same = false;
+                    eprintln!("n={n}: offset {} differs from offset 0", s.0);
+                    eprintln!("  off0 iter tail: {:?}", &base.1[base.1.len().saturating_sub(6)..]);
+                    eprintln!("  off{} iter tail: {:?}", s.0, &s.1[s.1.len().saturating_sub(6)..]);
+                    eprintln!("  off0 2ph tail:  {:?}", &base.2[base.2.len().saturating_sub(6)..]);
+                    eprintln!("  off{} 2ph tail: {:?}", s.0, &s.2[s.2.len().saturating_sub(6)..]);
+                    break;
+                }
+            }
+            // iterator vs two-phase at offset 0
+            if base.1 != base.2 {
+                eprintln!("n={n}: ITERATOR vs TWO-PHASE differ at off 0");
+                eprintln!("  iter count {} tail {:?}", base.1.len(), &base.1[base.1.len().saturating_sub(6)..]);
+                eprintln!("  2ph  count {} tail {:?}", base.2.len(), &base.2[base.2.len().saturating_sub(6)..]);
+            }
+            if all_same && base.1 == base.2 {
+                eprintln!("n={n}: all 64 offsets and both paths agree ({} pretokens)", base.1.len());
+            }
+        }
     }
 }
