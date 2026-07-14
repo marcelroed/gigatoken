@@ -327,6 +327,15 @@ impl Tokenizer {
         match pair_ranks {
             #[cfg(target_arch = "aarch64")]
             Some(table) => bpe_merge_symbols_short_neon(table, buf, n),
+            // x86-64 stays scalar ON PURPOSE: the AVX-512/AVX2 ports of the
+            // min-rank scan (`bpe_merge_symbols_short_avx512/_avx2`, kept as
+            // tested reference) measured ~1% SLOWER on cold encode_st (Zen 5,
+            // gpt2, 100 MB and 1 GB OWT, interleaved min-of-5) — the x86
+            // horizontal reduce is a 4-step dependent chain plus a
+            // vector->GPR transfer on the serial merge chain, and the
+            // `target_feature` boundary blocks inlining, while the scalar
+            // scan's `rank < best` branches predict well on Zen 5. See
+            // profiling/x86_port_plan.md §6.
             #[cfg(not(target_arch = "aarch64"))]
             Some(table) => bpe_merge_symbols_short_scalar(|a, b| table.rank(a, b), buf, n),
             None => bpe_merge_symbols_short_scalar(

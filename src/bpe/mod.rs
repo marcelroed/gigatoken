@@ -646,6 +646,180 @@ pub(crate) fn bpe_merge_symbols_short_neon(
     write
 }
 
+/// AVX-512 port of [`bpe_merge_symbols_short_neon`]: the whole 4-load,
+/// 3-`vmin`, 1-`vminv` scan collapses to one 64-byte `pr` load and one
+/// `vpminud` reduction tree — all 16 lanes in a single zmm, so there is no
+/// narrow/wide split to hoist (lanes at index >= n are parked at
+/// `u32::MAX` and never win). Packing, list surgery, and tie-break order
+/// are identical to the NEON and scalar variants (see
+/// [`bpe_merge_symbols_short_neon`] for the lane-packing invariants).
+///
+/// NOT dispatched by the miss path: measured ~1% slower than the scalar
+/// scan on cold encode_st (Zen 5 / 9800X3D, gpt2, 100 MB and 1 GB OWT,
+/// interleaved min-of-5, runtime-dispatched baseline build). The x86
+/// horizontal reduce is a 4-dependent-op chain plus a vector→GPR `vmovd`
+/// on the merge loop's serial chain, the `target_feature` boundary costs
+/// a real call per short merge (NEON needs no gate and inlines), and the
+/// scalar scan's `rank < best` branch predicts well on Zen 5 at typical
+/// n ≈ 4-6 — the mispredict pressure that made the NEON scan win on M4
+/// is absent. Kept, with the AVX2 tier below, as a tested reference
+/// (differential-covered by `short_merges_match_vec_merge_loop`); see
+/// profiling/x86_port_plan.md §6.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[target_feature(enable = "avx512f")]
+fn bpe_merge_symbols_short_avx512(
+    table: &PairRankTable,
+    symbols: &mut [TokenId; SHORT_MERGE_MAX],
+    n: usize,
+) -> usize {
+    use core::arch::x86_64::{_mm512_loadu_si512, _mm512_reduce_min_epu32};
+    debug_assert!((2..=SHORT_MERGE_MAX - 1).contains(&n));
+    /// Every packed value at or above this has rank u32::MAX (no merge).
+    const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
+    let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
+    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
+    let mut next = [0u8; SHORT_MERGE_MAX];
+    let mut prev = [0u8; SHORT_MERGE_MAX];
+    for i in 0..n {
+        next[i] = (i + 1) as u8;
+        prev[i] = (i as u8).wrapping_sub(1);
+    }
+    // pr[i] = packed (rank, position) of the pair starting at active
+    // position i; the only array the scan reads.
+    let mut pr = [u32::MAX; SHORT_MERGE_MAX];
+    for i in 0..n - 1 {
+        pr[i] = pack(table.rank(symbols[i], symbols[i + 1]), i);
+    }
+    loop {
+        // SAFETY: pr is 16 contiguous u32s (64 bytes); the unaligned-load
+        // intrinsic has no alignment requirement.
+        let best = unsafe {
+            _mm512_reduce_min_epu32(_mm512_loadu_si512(pr.as_ptr() as *const _))
+        };
+        if best >= NO_MERGE_FLOOR {
+            break;
+        }
+        let i = (best & 0xFF) as usize;
+        symbols[i] = TokenId(best >> 8);
+        // Unlink the right element of the merged pair.
+        let dead = next[i] as usize;
+        let new_right = next[dead] as usize;
+        next[i] = new_right as u8;
+        pr[dead] = u32::MAX;
+        // Refresh the two pairs now touching the merged symbol.
+        if new_right < n {
+            prev[new_right] = i as u8;
+            pr[i] = pack(table.rank(symbols[i], symbols[new_right]), i);
+        } else {
+            pr[i] = u32::MAX;
+        }
+        let left = prev[i] as usize;
+        if left < n {
+            pr[left] = pack(table.rank(symbols[left], symbols[i]), left);
+        }
+    }
+    // Compact survivors in place.
+    let mut write = 0;
+    let mut i = 0;
+    while i < n {
+        symbols[write] = symbols[i];
+        write += 1;
+        i = next[i] as usize;
+    }
+    write
+}
+
+/// AVX2 tier of the short merge (Haswell+, Zen 1-3): two 32-byte `pr`
+/// loads and one `vpminud`, then a 4-step horizontal min (extract + 3
+/// shuffled mins) in place of NEON's `vminv`. The NEON narrow split is
+/// kept: `n <= 8` reads one ymm and skips the cross-vector min. Packing,
+/// list surgery, and tie-break order are identical to the other variants.
+///
+/// NOT dispatched — same measured-slower verdict as the AVX-512 tier
+/// above (whose doc has the numbers and the why).
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[target_feature(enable = "avx2")]
+fn bpe_merge_symbols_short_avx2(
+    table: &PairRankTable,
+    symbols: &mut [TokenId; SHORT_MERGE_MAX],
+    n: usize,
+) -> usize {
+    use core::arch::x86_64::*;
+    debug_assert!((2..=SHORT_MERGE_MAX - 1).contains(&n));
+    /// Every packed value at or above this has rank u32::MAX (no merge).
+    const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
+    let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
+    // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
+    let mut next = [0u8; SHORT_MERGE_MAX];
+    let mut prev = [0u8; SHORT_MERGE_MAX];
+    for i in 0..n {
+        next[i] = (i + 1) as u8;
+        prev[i] = (i as u8).wrapping_sub(1);
+    }
+    // pr[i] = packed (rank, position) of the pair starting at active
+    // position i; the only array the scan reads.
+    let mut pr = [u32::MAX; SHORT_MERGE_MAX];
+    for i in 0..n - 1 {
+        pr[i] = pack(table.rank(symbols[i], symbols[i + 1]), i);
+    }
+    // Lanes at index >= n stay u32::MAX forever, so short pretokens need
+    // only the first ymm of the scan; the width branch is hoisted out of
+    // the loop and fixed per call.
+    let narrow = n <= 8;
+    loop {
+        // SAFETY: pr is 16 contiguous u32s; unaligned loads.
+        let best = unsafe {
+            let p = pr.as_ptr() as *const __m256i;
+            let m = if narrow {
+                _mm256_loadu_si256(p)
+            } else {
+                _mm256_min_epu32(_mm256_loadu_si256(p), _mm256_loadu_si256(p.add(1)))
+            };
+            // Horizontal min of 8 u32 lanes: fold 256 -> 128, then two
+            // shuffled mins; lane 0 holds the minimum.
+            let m128 = _mm_min_epu32(
+                _mm256_castsi256_si128(m),
+                _mm256_extracti128_si256::<1>(m),
+            );
+            let m128 = _mm_min_epu32(m128, _mm_shuffle_epi32::<0b01_00_11_10>(m128));
+            let m128 = _mm_min_epu32(m128, _mm_shuffle_epi32::<0b00_00_00_01>(m128));
+            _mm_cvtsi128_si32(m128) as u32
+        };
+        if best >= NO_MERGE_FLOOR {
+            break;
+        }
+        let i = (best & 0xFF) as usize;
+        symbols[i] = TokenId(best >> 8);
+        // Unlink the right element of the merged pair.
+        let dead = next[i] as usize;
+        let new_right = next[dead] as usize;
+        next[i] = new_right as u8;
+        pr[dead] = u32::MAX;
+        // Refresh the two pairs now touching the merged symbol.
+        if new_right < n {
+            prev[new_right] = i as u8;
+            pr[i] = pack(table.rank(symbols[i], symbols[new_right]), i);
+        } else {
+            pr[i] = u32::MAX;
+        }
+        let left = prev[i] as usize;
+        if left < n {
+            pr[left] = pack(table.rank(symbols[left], symbols[i]), left);
+        }
+    }
+    // Compact survivors in place.
+    let mut write = 0;
+    let mut i = 0;
+    while i < n {
+        symbols[write] = symbols[i];
+        write += 1;
+        i = next[i] as usize;
+    }
+    write
+}
+
 /// Vocabulary entries as `(id, bytes)` pairs in ID order, skipping IDs with
 /// no assigned content. Shared by both tokenizer types' `vocab_entries`.
 pub(crate) fn vocab_entries(
@@ -936,6 +1110,26 @@ mod tests {
                 neon[..n].copy_from_slice(&init);
                 let len = bpe_merge_symbols_short_neon(&table, &mut neon, n);
                 assert_eq!(&neon[..len], &reference[..], "neon diverged: {init:?}");
+            }
+
+            // Exercise both x86 tiers explicitly (not just the dispatcher's
+            // pick) so an AVX-512 box still validates the AVX2 arm.
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx512f") {
+                    let mut v = [TokenId(0); SHORT_MERGE_MAX];
+                    v[..n].copy_from_slice(&init);
+                    // SAFETY: runtime AVX-512F detection right above.
+                    let len = unsafe { bpe_merge_symbols_short_avx512(&table, &mut v, n) };
+                    assert_eq!(&v[..len], &reference[..], "avx512 diverged: {init:?}");
+                }
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let mut v = [TokenId(0); SHORT_MERGE_MAX];
+                    v[..n].copy_from_slice(&init);
+                    // SAFETY: runtime AVX2 detection right above.
+                    let len = unsafe { bpe_merge_symbols_short_avx2(&table, &mut v, n) };
+                    assert_eq!(&v[..len], &reference[..], "avx2 diverged: {init:?}");
+                }
             }
         }
     }

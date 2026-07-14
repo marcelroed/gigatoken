@@ -347,3 +347,50 @@ a perf question only), and re-run the `GIGATOK_NO_LPT` A/B noted above.
    1/10/50 GB inputs; watch Committer lock contention and finish() residual.
 5. **Prefetch distance sweep** (§3.3): D ∈ {8,16,24,32} + T0-vs-T1 fill
    stage, after THP is confirmed (meaningless before).
+
+---
+
+## 6. Zen 5 session (Ryzen 7 9800X3D, 16 threads, AVX-512): first on-metal x86 numbers
+
+First x86 metal timing of the campaign (2026-07-14; the plan above targeted
+Zen 2 EPYC — that session is still pending). Baseline runtime-dispatch build
+(no `-C target-cpu`, exactly what wheels ship): the AVX-512 tier, the CRC
+hash, and the probe_pair pin all engage via runtime detection. THP sysfs
+mode `madvise` (bench prctl clears PR_SET_THP_DISABLE), corpora from
+`~/data/owt_train.txt`.
+
+Correctness first, all green on this box: `cargo test --release` (67 + 65),
+`verify_memoized_encode_matches_reference_owt_50m`,
+`verify_gpt2_public_encode_matches_reference_owt_1g` (incl. the 100 MB join
+differential), `verify_multi_public_encode_matches_reference_owt_200m`,
+`verify_parallel_ragged_matches_serial_owt_gpt2_1g` (both LPT modes),
+`family_mask_matches_scalar_owt`, `mask_iter_matches_shipped_owt`. Token
+counts match the aarch64 references every run (22834020 @ 100 MB gpt2,
+228107519 @ 1 GB).
+
+A/B protocol as in §3: interleaved variants, min-of-5, `encode_st` gpt2,
+`ENCODE_MB=300 ENCODE_PASSES=3` (pass 0 cold, 1-2 warm), sequential runs.
+
+| Variant pair | Cold (pass 0) | Warm (pass 1-2) | Verdict |
+|---|---|---|---|
+| probe_pair asm pin vs mask-arith (§3.1.2) | 583-591 vs 570-575 MB/s (**+2.5%**) | 1013-1031 vs 969-985 (**+4.6%**) | Pin confirmed on metal; keep. |
+| CRC32C hash vs multiply fold (§3.1.3) | 587-592 vs 570-577 (**+2.2%**) | 1021-1029 vs 959-969 (**+6.3%**) | CRC arm confirmed; keep. |
+| AVX-512 tier vs forced-AVX2 tier (§3.6) | 586-591 vs 576-585 (**+1%**) | 1018-1029 vs 1008-1025 (**+0.5-1%**) | AVX-512 dispatch is the right default on Zen 5 (k-register masks save the vpmovmskb ladder); margin is small because the boundary algebra, not classification, dominates. |
+| Short-merge min-rank scan, AVX-512/AVX2 port vs scalar (NEW) | 471-480 vs 482-485 MB/s @ 100 MB; 661-670 vs 670-676 @ 1 GB (**-1%**) | n/a (miss path only) | **Negative — not dispatched.** The x86 horizontal reduce is a 4-dependent-op chain + vector→GPR `vmovd` on the merge loop's serial chain, and the `target_feature` boundary forces a real call per short merge (NEON inlines, gate-free); Zen 5 predicts the scalar scan's `rank < best` branches well at typical n ≈ 4-6, so M4's mispredict-driven win does not transfer. Both arms kept in `src/bpe/mod.rs` as tested reference (`short_merges_match_vec_merge_loop` covers them), dispatch stays scalar on x86_64. |
+
+Not re-run here (Zen 2 EPYC items, still open): thread-topology and NUMA
+sweeps, 255-thread LPT/chunking, prefetch-distance recalibration, smaps
+AnonHugePages verification under the production launcher.
+
+Rebase note: after rebasing onto the simplification commits (ff7c821 +
+8d704a3, "A/B-verified neutral" on the ARM box), the same interleaved
+protocol on this box measured the simplified tree **+5% cold** (610-625 vs
+585-594 MB/s) and warm-neutral (~1014-1028 both) against the pre-rebase
+binary — i.e. the simplification is a small cold-path win on Zen 5, not
+just neutral. Full suite + the heavy differentials (1 GB gpt2 + join,
+200 MB qwen3.5 multi, 1 GB parallel ragged both LPT modes) re-verified
+green post-rebase, counts unchanged. Protocol reminder this session
+re-taught: back-to-back NON-interleaved sessions on this box can differ
+by ~4% from post-compile thermal state — a standalone triple-run of the
+rebased binary first read as a 4% regression that interleaving inverted.
+Never compare across sessions; interleave or it didn't happen.
