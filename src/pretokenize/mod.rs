@@ -55,19 +55,21 @@ pub fn pretokenize_as_iter(bytes: &[u8]) -> FastR50kPretokenizer<'_> {
 /// loop's phase arrays.
 pub const PRETOKEN_CHUNK: usize = 256;
 
-/// Per-length masks for [`pack_pretoken_key`]: one L1-resident table load
-/// replaces a 128-bit variable shift + sub (u128 shifts lower to a
-/// multi-instruction sequence). The length tag is computed (`n << 120`
-/// touches only the high half: one shift + or), not loaded.
-const PACK_MASK: [u128; 16] = {
-    let mut t = [0u128; 16];
-    let mut n = 1;
-    while n < 16 {
-        t[n] = u128::MAX >> (8 * (16 - n));
-        n += 1;
-    }
-    t
-};
+/// Both 64-bit halves of the per-length pack mask, in scalar ALU ops. A
+/// u128 `MAX >> s` lowers to a multi-instruction sequence and the 16-entry
+/// table this replaces put a dependent L1 load (2.43% of process) on the
+/// `n → key → store` chain; per-half variable shifts are single 1-cycle
+/// ops, so the halves cost two independent 3-deep chains and no load port.
+/// The length tag (`n << 120`) touches only the high half and is OR'd in
+/// by the caller.
+#[inline(always)]
+pub(crate) fn pack_mask_halves(n: usize) -> (u64, u64) {
+    debug_assert!((1..=15).contains(&n));
+    let s = (n * 8) as u32;
+    let lo = if n < 8 { u64::MAX >> (64u32.wrapping_sub(s) & 63) } else { u64::MAX };
+    let hi = if n > 8 { u64::MAX >> (128u32.wrapping_sub(s) & 63) } else { 0 };
+    (lo, hi)
+}
 
 /// Pack a pretoken of ≤ 15 bytes into a `u128` cache key: bytes in the low
 /// 15 lanes, length in the top byte (so keys of different lengths never
@@ -94,33 +96,51 @@ pub(crate) fn pack_pretoken_key(bytes: &[u8]) -> Option<u128> {
         return Some(0);
     }
     let p = bytes.as_ptr();
-    let mask = PACK_MASK[n];
     let low = if (p as usize) & 4095 <= 4096 - 16 {
         // SAFETY: the offset within the (≥ 4096-byte) page is ≤ 4096 - 16,
         // so a 16-byte read stays inside the page holding `p`, which is
         // mapped because `p` points to at least one valid byte.
         let v = unsafe { (p as *const u128).read_unaligned() };
-        v & mask
+        let (mask_lo, mask_hi) = pack_mask_halves(n);
+        ((v as u64 & mask_lo) as u128) | ((((v >> 64) as u64 & mask_hi) as u128) << 64)
     } else {
         // Rare: `p` is within 16 bytes of a page boundary. Gather with a
-        // plain copy (≤ 15 bytes) — correctness over speed on this cold path.
+        // plain copy (≤ 15 bytes) — correctness over speed on this cold
+        // path. Lanes past `n` stay zero, so no mask is needed.
         let mut lanes = [0u8; 16];
         lanes[..n].copy_from_slice(bytes);
-        u128::from_le_bytes(lanes) & mask
+        u128::from_le_bytes(lanes)
     };
     Some(low | ((n as u128) << 120))
 }
 
-/// Hash of a packed pretoken key: one folded multiply, the cheapest mix
-/// whose low bits (the table index) still see every key bit. Quality is
-/// noncritical for correctness (the table compares full keys).
+/// Hash of a packed pretoken key. Quality is noncritical for correctness
+/// (the table compares full keys), but every consumer — the fill loops,
+/// `ShortPretokenCache::grow`, `encode_bytes_cached` — must derive it
+/// through this one function: the two implementations below produce
+/// different values and may never mix in one process image. Both map key 0
+/// to hash 0, which the fill loops' long-pretoken route stores.
 #[inline(always)]
 pub(crate) fn pretoken_key_hash(key: u128) -> u64 {
-    let lo = key as u64;
-    let hi = (key >> 64) as u64;
-    let mut h = (lo ^ hi.rotate_right(25)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    h ^= h >> 32;
-    h
+    #[cfg(all(target_arch = "aarch64", target_feature = "crc"))]
+    {
+        // Hardware CRC32: two 3-cycle ops replace the 5-op multiply fold.
+        // Linear over GF(2), so the low bits (the table index) see every
+        // key bit; 32 bits suffice for any table under 2^32 slots.
+        use core::arch::aarch64::__crc32d;
+        // SAFETY: gated on the `crc` target feature at compile time.
+        unsafe { __crc32d(__crc32d(0, key as u64), (key >> 64) as u64) as u64 }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "crc")))]
+    {
+        // One folded multiply, the cheapest mix whose low bits still see
+        // every key bit.
+        let lo = key as u64;
+        let hi = (key >> 64) as u64;
+        let mut h = (lo ^ hi.rotate_right(25)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 32;
+        h
+    }
 }
 
 /// One chunk of pretoken spans with their packed cache keys (0 = longer
@@ -170,11 +190,13 @@ pub trait PretokenSpans<'a> {
     fn fill_spans_keyed(&mut self, batch: &mut SpanBatch<'a>, prefetch: &impl Fn(u64)) -> usize;
 }
 
-/// Shared body of every [`PretokenSpans`] implementation: pull spans from
-/// `next` and derive each one's key, hash, and prefetch on the way out.
-/// `#[inline(always)]` so each `#[inline(never)]` implementation fuses it
-/// with its span walker into a single out-of-line loop (see the trait
-/// docs for why that fusion matters).
+/// Shared body of the iterator-backed [`PretokenSpans`] implementations
+/// (spans with no single backing buffer): pull spans from `next` and derive
+/// each one's key, hash, and prefetch on the way out. `#[inline(always)]`
+/// so each `#[inline(never)]` implementation fuses it with its span walker
+/// into a single out-of-line loop (see the trait docs for why that fusion
+/// matters). Sources that walk one backing slice use
+/// [`fill_spans_keyed_with_buf`] instead.
 #[inline(always)]
 pub(crate) fn fill_spans_keyed_with<'a>(
     mut next: impl FnMut() -> Option<&'a [u8]>,
@@ -188,6 +210,69 @@ pub(crate) fn fill_spans_keyed_with<'a>(
             Some(key) => (key, pretoken_key_hash(key)),
             None => (0, 0),
         };
+        prefetch(h);
+        batch.spans[n] = span;
+        batch.keys[n] = key;
+        batch.hashes[n] = h;
+        n += 1;
+    }
+    n
+}
+
+/// [`fill_spans_keyed_with`] for span sources that walk a single backing
+/// slice, with `next` yielding `(start, end)` byte offsets into `bytes`.
+/// Knowing the buffer removes the two data-dependent branches of
+/// [`pack_pretoken_key`] from the per-span path:
+///
+/// - the `> 15` long-pretoken route becomes a select — for a long span the
+///   16-byte load sits entirely inside the span, so it needs no guard, and
+///   the select (not the mask clamp) provides the key-0 routing;
+/// - the per-span page-boundary check (mispredict-prone: ~0.4% of spans on
+///   4 KiB pages) becomes one buffer-end bound, hoisted per fill and false
+///   only for short spans starting in the last 15 bytes of `bytes` — once
+///   per input, so the branch predicts ~perfectly.
+///
+/// Empty spans cannot occur (`next` contract: `start < end`), so the key-0
+/// route is exactly "longer than 15 bytes", as in the fallible packer.
+#[inline(always)]
+pub(crate) fn fill_spans_keyed_with_buf<'a>(
+    bytes: &'a [u8],
+    mut next: impl FnMut() -> Option<(usize, usize)>,
+    batch: &mut SpanBatch<'a>,
+    prefetch: &impl Fn(u64),
+) -> usize {
+    // A 16-byte load at `start` is in bounds iff `start < tail_lim`.
+    let tail_lim = bytes.len().saturating_sub(15);
+    let mut n = 0;
+    while n < PRETOKEN_CHUNK {
+        let Some((start, end)) = next() else { break };
+        debug_assert!(start < end && end <= bytes.len());
+        // SAFETY: `next` returns in-bounds span boundaries.
+        let span = unsafe { bytes.get_unchecked(start..end) };
+        let len = end - start;
+        let long = len > 15;
+        // `|` not `||`: one combined test, taken for all but the tail spans.
+        let key = if long | (start < tail_lim) {
+            // SAFETY: `start < tail_lim` puts `start + 16` within `bytes`;
+            // a long span (len ≥ 16) contains its own first 16 bytes.
+            let v = unsafe { (bytes.as_ptr().add(start) as *const u128).read_unaligned() };
+            let m = len.min(15);
+            let (mask_lo, mask_hi) = pack_mask_halves(m);
+            let lo = (v as u64) & mask_lo;
+            let hi = ((v >> 64) as u64 & mask_hi) | ((m as u64) << 56);
+            let packed = (lo as u128) | ((hi as u128) << 64);
+            if long { 0 } else { packed }
+        } else {
+            // Short span starting in the buffer's last 15 bytes: gather
+            // with a plain copy, once per input. Lanes past `len` stay
+            // zero, so no mask is needed.
+            let mut lanes = [0u8; 16];
+            lanes[..len].copy_from_slice(span);
+            u128::from_le_bytes(lanes) | ((len as u128) << 120)
+        };
+        // pretoken_key_hash(0) == 0, so long spans store hash 0 exactly as
+        // the fallible-packer route does.
+        let h = pretoken_key_hash(key);
         prefetch(h);
         batch.spans[n] = span;
         batch.keys[n] = key;

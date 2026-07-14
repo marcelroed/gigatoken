@@ -967,14 +967,20 @@ impl MaskState {
                     // SAFETY: p + 16 <= base_ptr + last_end + 16 <= end of
                     // the input slice (hoisted check above).
                     let raw = unsafe { (p as *const u128).read_unaligned() };
-                    // Branchless pack_pretoken_key: ALU mask instead of the
-                    // dependent PACK_MASK load, a select instead of the
+                    // Branchless pack_pretoken_key: per-half ALU masks
+                    // (shared pack_mask_halves helper) instead of the
+                    // dependent table load, a select instead of the
                     // pattern-free n > 15 branch. tok_len >= 1 (boundaries
-                    // are strictly increasing) keeps the shift <= 120.
-                    // Long spans select key 0; pretoken_key_hash(0) == 0.
-                    let mask = u128::MAX >> (8 * (16 - tok_len.min(16)));
-                    let sel = 0u128.wrapping_sub((tok_len <= 15) as u128);
-                    let key = ((raw & mask) | ((tok_len as u128) << 120)) & sel;
+                    // are strictly increasing), so the clamped length is in
+                    // pack_mask_halves' 1..=15 domain. Long spans select
+                    // key 0; pretoken_key_hash(0) == 0.
+                    let m = tok_len.min(15);
+                    let (mask_lo, mask_hi) = crate::pretokenize::pack_mask_halves(m);
+                    let klo = (raw as u64) & mask_lo;
+                    let khi = ((raw >> 64) as u64 & mask_hi) | ((m as u64) << 56);
+                    let packed = (klo as u128) | ((khi as u128) << 64);
+                    let long = tok_len > 15;
+                    let key = if long { 0 } else { packed };
                     let hv = pretoken_key_hash(key);
                     prefetch(hv);
                     // SAFETY: fill_base + end <= len (boundaries are token

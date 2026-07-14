@@ -78,15 +78,16 @@ impl<'a> crate::pretokenize::PretokenSpans<'a> for FastDeepSeekV3Pretokenizer<'a
     ) -> usize {
         let (bytes, len) = (self.bytes, self.bytes.len());
         let mut pos = self.pos;
-        let n = crate::pretokenize::fill_spans_keyed_with(
+        let n = crate::pretokenize::fill_spans_keyed_with_buf(
+            bytes,
             || {
                 if pos >= len {
                     return None;
                 }
                 let start = pos;
+                // advance_pos returns an in-bounds end > start.
                 pos = advance_pos(bytes, start);
-                // SAFETY: advance_pos returns an in-bounds end > start.
-                Some(unsafe { bytes.get_unchecked(start..pos) })
+                Some((start, pos))
             },
             batch,
             prefetch,
