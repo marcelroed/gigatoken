@@ -800,7 +800,7 @@ impl MaskState {
     /// boundary positions into a flat buffer (branchless [`flatten_bits`]
     /// per clean batch; the scheme's scalar `advance` through bad zones,
     /// with `next_span`'s exact segment/overrun/tail trust rules), then
-    /// phase B turns consecutive boundary pairs into spans + keys + hashes
+    /// phase B turns consecutive boundary pairs into batch entries
     /// in a counted loop with no data-dependent branch. The per-span
     /// refill ladder, pop-exit and pack mispredicts of the fused
     /// `next_span` loop (the dominant share of encode's 25% discarded

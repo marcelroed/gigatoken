@@ -51,8 +51,8 @@ pub fn pretokenize_as_iter(bytes: &[u8]) -> FastR50kPretokenizer<'_> {
 // Batched pretoken pulling (the encode loop's input interface)
 // ---------------------------------------------------------------------------
 
-/// Chunk size of [`PretokenSpans::fill_spans`] — one batch of the encode
-/// loop's phase arrays.
+/// Chunk size of [`PretokenSpans::fill_spans_keyed`] — the live entries of
+/// one [`SpanBatch`] fill.
 pub const PRETOKEN_CHUNK: usize = 256;
 
 /// Both 64-bit halves of the per-length pack mask, in scalar ALU ops. A
@@ -181,12 +181,20 @@ impl BatchEntry {
     }
 }
 
+/// Readable slack entries past a full chunk, so the emit loop's
+/// prefetch-ahead `entries[i + D].meta` load needs no index clamp (a
+/// per-pretoken `add + cmp + csel` in the hottest loop). Slack entries
+/// are never written by a fill; prefetching a stale or zero `meta`
+/// requests an arbitrary masked (in-bounds) table line — harmless.
+pub const SPAN_BATCH_SLACK: usize = 16;
+
 /// One chunk of pretoken spans with their packed cache keys (0 = longer
 /// than 15 bytes, routed to the slice-keyed fallback map) and key hashes,
 /// filled by [`PretokenSpans::fill_spans_keyed`]. See [`BatchEntry`] for
-/// the record layout.
+/// the record layout. Fills only ever write the first [`PRETOKEN_CHUNK`]
+/// entries; the tail is prefetch slack (see [`SPAN_BATCH_SLACK`]).
 pub struct SpanBatch<'a> {
-    pub entries: [BatchEntry; PRETOKEN_CHUNK],
+    pub entries: [BatchEntry; PRETOKEN_CHUNK + SPAN_BATCH_SLACK],
     /// The entries' `ptr`s borrow the spans' backing storage.
     _spans: std::marker::PhantomData<&'a [u8]>,
 }
@@ -194,7 +202,8 @@ pub struct SpanBatch<'a> {
 impl<'a> SpanBatch<'a> {
     pub fn new() -> Self {
         SpanBatch {
-            entries: [BatchEntry { key: 0, ptr: std::ptr::null(), meta: 0 }; PRETOKEN_CHUNK],
+            entries: [BatchEntry { key: 0, ptr: std::ptr::null(), meta: 0 };
+                PRETOKEN_CHUNK + SPAN_BATCH_SLACK],
             _spans: std::marker::PhantomData,
         }
     }

@@ -651,17 +651,20 @@ impl Tokenizer {
         // short distance ahead (the fill phase staged it into L2; D only
         // has to cover the L2 hit latency, a handful of iterations).
         const D: usize = 16;
+        const _: () = assert!(D <= crate::pretokenize::SPAN_BATCH_SLACK);
         for i in 0..D.min(n) {
             table.prefetch(batch.entries[i].meta);
         }
         for i in 0..n {
-            // Clamped prefetch distance instead of an `i + D < n` guard:
-            // the tail re-requests the last pair's line, which is free,
-            // and the compare+branch it replaces was 3.7% of encode.
-            // For long entries `meta` is a length, not a hash — the
-            // masked prefetch of an arbitrary in-bounds line is harmless
-            // (long pretokens are rare and bypass the short table).
-            table.prefetch(batch.entries[(i + D).min(n - 1)].meta);
+            // Unclamped prefetch distance: the batch carries D slack
+            // entries past a full chunk, so `i + D` always indexes into
+            // the array and the clamp's per-pretoken add+cmp+csel (and
+            // before that, an `i + D < n` compare+branch worth 3.7% of
+            // encode) disappears — the load is one fixed-offset ldr off
+            // the walking entry pointer. Tail iterations prefetch stale
+            // or zero `meta`, and long entries a length, not a hash —
+            // either way a masked, in-bounds table line: harmless.
+            table.prefetch(batch.entries[i + D].meta);
             // One 32-byte entry: key + meta land in a single cache line
             // (the parallel-array layout walked three load streams here).
             let (key, h) = (batch.entries[i].key, batch.entries[i].meta);
