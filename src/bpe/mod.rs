@@ -86,9 +86,12 @@ impl ByteRemapping {
 ///   since initial symbols are byte tokens — become one shift-or index and
 ///   one L1/L2 load: no hash, no probe.
 /// - a flat open-addressed table of all merges: power-of-two slots at
-///   ≤ 1/2 load, linear probing, SoA keys/vals so a probe touches one
-///   8-byte key per step. hashbrown pays a tuple hash, a ctrl-byte line,
-///   a NEON group match, and a second line for the bucket per lookup; this
+///   ≤ 1/2 load, linear probing, one `u64` slot packing key and value
+///   (`(key << 21) | merged_id`; keys are 42 bits and merged IDs 21, so a
+///   packed slot uses 63 bits and `u64::MAX` can never collide) so a probe
+///   touches one 8-byte load per step — the hit's value rides on the same
+///   line as its key. hashbrown pays a tuple hash, a ctrl-byte line, a
+///   NEON group match, and a second line for the bucket per lookup; this
 ///   pays one multiply, one load, one compare — and the common mid-merge
 ///   *miss* usually terminates on the first empty slot.
 ///
@@ -101,13 +104,14 @@ pub(crate) struct PairRankTable {
     /// `< 2^dense_log2`, `u32::MAX` when they do not merge.
     dense: Box<[u32]>,
     dense_log2: u32,
-    /// Flat table keys, `(a << 21) | b` packed; `u64::MAX` = empty (real
-    /// keys are < 2^42, so the sentinel can never collide).
-    keys: Box<[u64]>,
-    vals: Box<[u32]>,
-    /// `keys.len() - 1` (length is a power of two).
+    /// Flat table slots, `((a << 21 | b) << 21) | merged_id` packed;
+    /// `u64::MAX` = empty (real slots fit 63 bits, so the sentinel can
+    /// never collide, and its key field `MAX >> 21` exceeds every real
+    /// 42-bit key, so the hit compare rejects it for free).
+    slots: Box<[u64]>,
+    /// `slots.len() - 1` (length is a power of two).
     mask: usize,
-    /// `64 - log2(keys.len())`: the hash keeps the top bits.
+    /// `64 - log2(slots.len())`: the hash keeps the top bits.
     shift: u32,
 }
 
@@ -153,8 +157,7 @@ impl PairRankTable {
         let n_slots = (merges.len().max(1) * 2).next_power_of_two().max(64);
         let shift = 64 - n_slots.trailing_zeros();
         let mask = n_slots - 1;
-        let mut keys = vec![u64::MAX; n_slots].into_boxed_slice();
-        let mut vals = vec![u32::MAX; n_slots].into_boxed_slice();
+        let mut slots = vec![u64::MAX; n_slots].into_boxed_slice();
         for (&(a, b), &m) in merges {
             if (a.0 | b.0) >> dense_log2 == 0 {
                 dense[((a.0 as usize) << dense_log2) | b.0 as usize] = m.0;
@@ -162,7 +165,7 @@ impl PairRankTable {
             let key = ((a.0 as u64) << PAIR_ID_BITS) | b.0 as u64;
             let mut idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize;
             let mut displacement = 0usize;
-            while keys[idx] != u64::MAX {
+            while slots[idx] != u64::MAX {
                 idx = (idx + 1) & mask;
                 displacement += 1;
                 // Ugly clustering (never seen on real vocabs at this load
@@ -171,11 +174,12 @@ impl PairRankTable {
                     return None;
                 }
             }
-            keys[idx] = key;
-            vals[idx] = m.0;
+            // Merged IDs are < 2^21 (checked above), so key and value pack
+            // into 63 bits without overlap.
+            slots[idx] = (key << PAIR_ID_BITS) | m.0 as u64;
         }
 
-        Some(PairRankTable { dense, dense_log2, keys, vals, mask, shift })
+        Some(PairRankTable { dense, dense_log2, slots, mask, shift })
     }
 
     /// Merged token ID of the pair `(a, b)`, or `u32::MAX` when it does not
@@ -191,13 +195,17 @@ impl PairRankTable {
         let key = ((a.0 as u64) << PAIR_ID_BITS) | b.0 as u64;
         let mut idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize;
         loop {
-            // SAFETY: idx starts < keys.len() (shift keeps log2(len) bits)
-            // and stays masked; vals has the same length.
-            let k = unsafe { *self.keys.get_unchecked(idx) };
-            if k == key {
-                return unsafe { *self.vals.get_unchecked(idx) };
+            // SAFETY: idx starts < slots.len() (shift keeps log2(len) bits)
+            // and stays masked.
+            let slot = unsafe { *self.slots.get_unchecked(idx) };
+            // One load answers both hit and value: the key rides in the
+            // slot's top 43 bits, the merged ID in the low 21. The empty
+            // sentinel's key field (u64::MAX >> 21) exceeds every real
+            // 42-bit key, so it never false-hits.
+            if slot >> PAIR_ID_BITS == key {
+                return (slot & ((1 << PAIR_ID_BITS) - 1)) as u32;
             }
-            if k == u64::MAX {
+            if slot == u64::MAX {
                 return u32::MAX;
             }
             idx = (idx + 1) & self.mask;
@@ -529,9 +537,12 @@ pub(crate) fn bpe_merge_symbols_short_scalar(
 /// [`PairRankTable`] build invariant, which is why this variant requires
 /// one), so packed lanes are < 2^29 and "no merge" (`u32::MAX << 8`, from
 /// the wrapping shift of the MAX sentinel) sorts above every real lane.
-/// The scan is a fixed 16 lanes with inactive lanes parked at `u32::MAX` —
+/// The scan covers 16 lanes with inactive lanes parked at `u32::MAX` —
 /// four loads, three `vmin`s, one `vminv`, zero data-dependent branches on
-/// a core where the scalar scan's `rank < best` mispredicts freely.
+/// a core where the scalar scan's `rank < best` mispredicts freely. Every
+/// live lane index is `< n` (pairs start below `n` and merges only clear
+/// lanes), so when `n <= 8` the scan reads just the first two vectors —
+/// the width branch is hoisted out of the loop and fixed per call.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn bpe_merge_symbols_short_neon(
     table: &PairRankTable,
@@ -556,14 +567,23 @@ pub(crate) fn bpe_merge_symbols_short_neon(
     for i in 0..n - 1 {
         pr[i] = pack(table.rank(symbols[i], symbols[i + 1]), i);
     }
+    // Lanes at index >= n stay u32::MAX forever (initial pairs sit below
+    // n - 1; the loop below only writes lanes < n), so short pretokens
+    // need only the first half of the scan.
+    let narrow = n <= 8;
     loop {
         // SAFETY: pr is 16 contiguous u32s; vld1q_u32 has no alignment
         // requirement beyond u32's.
         let best = unsafe {
             let p = pr.as_ptr();
             let m01 = vminq_u32(vld1q_u32(p), vld1q_u32(p.add(4)));
-            let m23 = vminq_u32(vld1q_u32(p.add(8)), vld1q_u32(p.add(12)));
-            vminvq_u32(vminq_u32(m01, m23))
+            let m = if narrow {
+                m01
+            } else {
+                let m23 = vminq_u32(vld1q_u32(p.add(8)), vld1q_u32(p.add(12)));
+                vminq_u32(m01, m23)
+            };
+            vminvq_u32(m)
         };
         if best >= NO_MERGE_FLOOR {
             break;
