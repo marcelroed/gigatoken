@@ -728,4 +728,61 @@ mod span_source_tests {
             }
         }
     }
+
+    /// Long runs hit the two-phase walker's rare paths: a pretoken longer
+    /// than its u16 offset window (direct single-span emit, both the
+    /// clean-batch and bad-zone variants), a scalar overrun whose end
+    /// leaves the window mid-fill (dropped and re-derived next fill), and
+    /// maximum-density boundary batches straddling fill boundaries.
+    #[test]
+    fn fill_spans_keyed_long_runs_all_schemes() {
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        // > 64 KB letter run between ordinary words.
+        let mut v = b"intro words ".to_vec();
+        v.extend(std::iter::repeat_n(b'a', 70_000));
+        v.extend_from_slice(b" tail words");
+        cases.push(v);
+        // > 64 KB space run: boundaries only at the run's edges.
+        let mut v = b"x".to_vec();
+        v.extend(std::iter::repeat_n(b' ', 70_000));
+        v.extend_from_slice(b"y z");
+        cases.push(v);
+        // > 64 KB of 3-byte unicode whitespace: batch-edge straddles make
+        // bad zones, and the scalar walk overruns the whole run.
+        let mut v = b"hello world ".repeat(4);
+        for _ in 0..25_000 {
+            v.extend_from_slice("\u{2003}".as_bytes());
+        }
+        v.extend_from_slice(b"end");
+        cases.push(v);
+        // Monster token flush at end of input.
+        cases.push(std::iter::repeat_n(b'a', 70_000).collect());
+        // Single-byte token alternation (64 boundaries per batch), then a
+        // digit run some schemes split every 3 chars.
+        let mut v = b"a1".repeat(2_000);
+        v.extend(std::iter::repeat_n(b'7', 40_000));
+        v.extend_from_slice(b" end");
+        cases.push(v);
+        for case in &cases {
+            let b: &[u8] = case;
+            check_source(FastR50kPretokenizer::new(b), FastR50kPretokenizer::new(b), "r50k");
+            check_source(
+                FastCl100kPretokenizer::new(b),
+                FastCl100kPretokenizer::new(b),
+                "cl100k",
+            );
+            check_source(FastQwen2Pretokenizer::new(b), FastQwen2Pretokenizer::new(b), "qwen2");
+            check_source(
+                FastQwen35Pretokenizer::new(b),
+                FastQwen35Pretokenizer::new(b),
+                "qwen3_5",
+            );
+            check_source(FastOlmo3Pretokenizer::new(b), FastOlmo3Pretokenizer::new(b), "olmo3");
+            check_source(
+                FastDeepSeekV3Pretokenizer::new(b),
+                FastDeepSeekV3Pretokenizer::new(b),
+                "deepseek_v3",
+            );
+        }
+    }
 }

@@ -31,14 +31,18 @@ use crate::pretokenize::unicode;
 // -----------------------------------------------------------------------
 
 /// The `PretokenSpans::fill_spans_keyed` body shared by every mask-scanner
-/// pretokenizer (all of them wrap a `(bytes, MaskState)` pair): pull spans
-/// directly over `next_span`, fusing its `#[inline(always)]` walker body
-/// into one tight loop so the `MaskState` fields stay in registers across
-/// the whole chunk. `#[inline(never)]`: each monomorphization is its own
-/// out-of-line loop, keeping its register allocation away from the
-/// (register-hungry) encode loop that calls it. Routing this through
-/// `Iterator::next` instead measured ~23% of warm encode time in
-/// un-inlined call overhead.
+/// pretokenizer (all of them wrap a `(bytes, MaskState)` pair). With a SIMD
+/// scanner this is the two-phase chunk walker
+/// ([`mask::MaskState::fill_spans_two_phase`]): boundary harvest into a
+/// flat buffer, then a branch-free emission loop — the per-span refill
+/// ladder and pack branches of the fused pull loop were the largest single
+/// source of encode's discarded issue bandwidth. Without SIMD support it
+/// pulls spans one at a time over `next_span`, fusing its
+/// `#[inline(always)]` walker body into one tight loop. `#[inline(never)]`:
+/// each monomorphization is its own out-of-line loop, keeping its register
+/// allocation away from the (register-hungry) encode loop that calls it.
+/// Routing this through `Iterator::next` instead measured ~23% of warm
+/// encode time in un-inlined call overhead.
 #[inline(never)]
 pub(crate) fn fill_spans_keyed_mask<'a, S: mask::MaskScheme>(
     bytes: &'a [u8],
@@ -46,6 +50,10 @@ pub(crate) fn fill_spans_keyed_mask<'a, S: mask::MaskScheme>(
     batch: &mut SpanBatch<'a>,
     prefetch: &impl Fn(u64),
 ) -> usize {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if mask::simd_scanner_available() {
+        return state.fill_spans_two_phase::<S>(bytes, batch, prefetch);
+    }
     crate::pretokenize::fill_spans_keyed_with(
         || {
             let (start, end) = state.next_span::<S>(bytes)?;
