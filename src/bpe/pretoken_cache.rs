@@ -212,6 +212,37 @@ impl ShortPretokenCache {
         }
     }
 
+    /// [`Self::get`] for the encode miss path: a miss also reports where
+    /// the key belongs — the first empty slot of the walk, which is
+    /// exactly what [`Self::first_empty`] would find (every pair before
+    /// the terminating one was full), discovered by loads the lookup
+    /// performs anyway. [`Self::insert_at`] then skips re-walking the
+    /// chain. The slot stays valid until the next insert or grow: lookups
+    /// never mutate, and the miss path computes the entry's value without
+    /// touching the table.
+    pub(crate) fn get_or_slot(&self, key: u128, h: u64) -> Result<(u64, u64), usize> {
+        debug_assert_ne!(key, EMPTY_KEY);
+        let mut idx = (h as usize) & self.mask & !1;
+        loop {
+            // SAFETY: idx is masked and even, so idx + 1 <= mask.
+            let e0 = unsafe { self.slots.get(idx) };
+            let e1 = unsafe { self.slots.get(idx + 1) };
+            if e0.key == key {
+                return Ok((e0.val, e0.ext));
+            }
+            if e1.key == key {
+                return Ok((e1.val, e1.ext));
+            }
+            if e0.key == EMPTY_KEY {
+                return Err(idx);
+            }
+            if e1.key == EMPTY_KEY {
+                return Err(idx + 1);
+            }
+            idx = (idx + 2) & self.mask;
+        }
+    }
+
     /// First empty slot of `h`'s pair walk (load < 1 guarantees one).
     fn first_empty(&self, h: u64) -> usize {
         let mut idx = (h as usize) & self.mask & !1;
@@ -239,6 +270,23 @@ impl ShortPretokenCache {
         let idx = self.first_empty(h);
         // SAFETY: first_empty returns an in-bounds index.
         unsafe { *self.slots.get_mut(idx) = Entry { key, val, ext } };
+        self.len += 1;
+    }
+
+    /// [`Self::insert`] with the destination already known from a
+    /// [`Self::get_or_slot`] miss on the same `key`/`h` (with no insert or
+    /// grow in between), skipping the `first_empty` chain walk. A growth
+    /// pass invalidates `slot`, so that branch recomputes it.
+    pub(crate) fn insert_at(&mut self, slot: usize, key: u128, h: u64, val: u64, ext: u64) {
+        debug_assert_ne!(key, EMPTY_KEY);
+        let mut slot = slot;
+        if (self.len + 1) * 4 > self.slots.cap * 3 {
+            self.grow();
+            slot = self.first_empty(h);
+        }
+        debug_assert_eq!(slot, self.first_empty(h));
+        // SAFETY: get_or_slot and first_empty return in-bounds indices.
+        unsafe { *self.slots.get_mut(slot) = Entry { key, val, ext } };
         self.len += 1;
     }
 
@@ -367,5 +415,36 @@ impl ProbeView {
             )
         };
         (val, ext, m0 | m1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pretokenize::pretoken_key_hash;
+
+    /// The encode miss path inserts at the slot its failed lookup
+    /// reported. Drive that exact flow across several growth passes and
+    /// verify every entry stays retrievable — i.e. `get_or_slot`'s miss
+    /// slot always agrees with where `insert` would have placed the key.
+    #[test]
+    fn get_or_slot_insert_at_roundtrip() {
+        let mut cache = ShortPretokenCache::with_pow2_capacity(64);
+        // Multiplier chosen to scatter keys; count forces multiple grows
+        // from the 64-slot start (grow threshold is 3/4 load).
+        let keys: Vec<u128> = (1u128..=500).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
+        for (i, &key) in keys.iter().enumerate() {
+            let h = pretoken_key_hash(key);
+            match cache.get_or_slot(key, h) {
+                Ok(_) => panic!("key {i} present before insert"),
+                Err(slot) => cache.insert_at(slot, key, h, i as u64, !(i as u64)),
+            }
+        }
+        assert_eq!(cache.len(), keys.len());
+        for (i, &key) in keys.iter().enumerate() {
+            let h = pretoken_key_hash(key);
+            assert_eq!(cache.get(key, h), Some((i as u64, !(i as u64))), "key {i}");
+            assert_eq!(cache.get_or_slot(key, h), Ok((i as u64, !(i as u64))), "key {i}");
+        }
     }
 }

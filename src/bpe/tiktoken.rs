@@ -121,6 +121,15 @@ fn pack_val_inline(symbols: &[TokenId]) -> Option<(u64, u64)> {
     }
 }
 
+/// View a `TokenId` slice as its underlying `u32`s (repr(transparent)),
+/// so bulk emits are `extend_from_slice` memcpys instead of per-element
+/// iterator writes.
+#[inline(always)]
+fn token_ids_as_u32s(toks: &[TokenId]) -> &[u32] {
+    // SAFETY: TokenId is #[repr(transparent)] over u32.
+    unsafe { std::slice::from_raw_parts(toks.as_ptr() as *const u32, toks.len()) }
+}
+
 /// Unpack an inline value's four token lanes (lanes past the count are
 /// another key's leftovers; callers truncate by the count).
 #[inline(always)]
@@ -739,8 +748,11 @@ impl Tokenizer {
         // (emit-loop invariant); Vec append methods need len in sync.
         unsafe { out.set_len(w) };
         if key != 0 {
-            match self.pretoken_cache.get(key, h) {
-                Some((val, ext)) => {
+            // A miss hands back the insert slot its walk found, so the
+            // miss path's insert skips re-walking the (just-touched)
+            // chain.
+            match self.pretoken_cache.get_or_slot(key, h) {
+                Ok((val, ext)) => {
                     let len = (val & 0x7F) as usize;
                     if val & VAL_SPILL == 0 {
                         out.extend_from_slice(&unpack_val_lanes(val, ext)[..len]);
@@ -750,10 +762,10 @@ impl Tokenizer {
                         // tokens at `start`; the arena never shrinks.
                         let toks =
                             unsafe { self.token_arena.get_unchecked(start..start + len) };
-                        out.extend(toks.iter().map(|t| t.0));
+                        out.extend_from_slice(token_ids_as_u32s(toks));
                     }
                 }
-                None => self.encode_pretoken_miss(bytes, key, h, out),
+                Err(slot) => self.encode_pretoken_miss(bytes, key, h, slot, out),
             }
         } else {
             // Long pretokens (> 15 bytes, rare) always spill to the arena;
@@ -766,9 +778,9 @@ impl Tokenizer {
                     let toks = unsafe {
                         self.token_arena.get_unchecked(start..start + len as usize)
                     };
-                    out.extend(toks.iter().map(|t| t.0));
+                    out.extend_from_slice(token_ids_as_u32s(toks));
                 }
-                None => self.encode_pretoken_miss(bytes, 0, 0, out),
+                None => self.encode_pretoken_miss(bytes, 0, 0, 0, out),
             }
         }
         out.reserve(4 * PRETOKEN_CHUNK);
@@ -777,13 +789,17 @@ impl Tokenizer {
 
     /// Cache-miss path of the probe/emit loop: BPE-encode `bytes`, record
     /// it in the table `key` routes to (the short-pretoken table, or the
-    /// long map when `key == 0`), and append its tokens to `out`.
+    /// long map when `key == 0`), and append its tokens to `out`. `slot`
+    /// is the short-cache insert position reported by the failed
+    /// `get_or_slot` probe (meaningful only when `key != 0`); nothing
+    /// here touches the short cache before the insert, so it stays valid.
     #[inline(never)]
     fn encode_pretoken_miss(
         &mut self,
         bytes: &[u8],
         key: u128,
         h: u64,
+        slot: usize,
         out: &mut Vec<u32>,
     ) {
         if key != 0 {
@@ -826,8 +842,8 @@ impl Tokenizer {
             };
             let symbols = &buf[..n];
             let (val, ext) = Self::pack_val(symbols, &mut self.token_arena);
-            self.pretoken_cache.insert(key, h, val, ext);
-            out.extend(symbols.iter().map(|t| t.0));
+            self.pretoken_cache.insert_at(slot, key, h, val, ext);
+            out.extend_from_slice(token_ids_as_u32s(symbols));
         } else {
             // Long pretoken (> 15 bytes, rare). A pretoken that is a
             // complete vocab entry skips the merge loop entirely via one
@@ -855,7 +871,7 @@ impl Tokenizer {
             let offset = self.token_arena.len() as u32;
             self.token_arena.extend_from_slice(symbols);
             self.pretoken_cache_long.insert(bytes.into(), (offset, len));
-            out.extend(symbols.iter().map(|t| t.0));
+            out.extend_from_slice(token_ids_as_u32s(symbols));
         }
     }
 
