@@ -1349,6 +1349,8 @@ mod tests {
             PretokenizerType::Qwen35,
             PretokenizerType::Olmo3,
             PretokenizerType::DeepSeekV3,
+            PretokenizerType::O200k,
+            PretokenizerType::Nemotron,
         ];
         let input = "Hello, 世界! café 12345\r\ncan't  stop".as_bytes();
 

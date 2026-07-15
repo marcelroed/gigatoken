@@ -8,9 +8,12 @@
 
 pub(crate) mod cl100k_family;
 pub(crate) mod mask;
+pub(crate) mod o200k_family;
 
 pub mod cl100k;
 pub mod deepseek_v3;
+pub mod nemotron;
+pub mod o200k;
 pub mod olmo3;
 pub mod qwen2;
 pub mod qwen3_5;
@@ -18,6 +21,8 @@ pub mod r50k;
 
 pub use cl100k::FastCl100kPretokenizer;
 pub use deepseek_v3::FastDeepSeekV3Pretokenizer;
+pub use nemotron::FastNemotronPretokenizer;
+pub use o200k::FastO200kPretokenizer;
 pub use olmo3::FastOlmo3Pretokenizer;
 pub use qwen2::FastQwen2Pretokenizer;
 pub use qwen3_5::FastQwen35Pretokenizer;

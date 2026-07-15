@@ -188,6 +188,87 @@ pub(crate) fn ds_class_of(cp: u32) -> DsCharClass {
     }
 }
 
+// ---------------------------------------------------------------------------
+// o200k character classes (case-aware split of Letter)
+// ---------------------------------------------------------------------------
+
+/// Character class as used by the o200k regex family (gpt-oss, Nemotron-3),
+/// whose letter runs are case-structured:
+/// `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+` etc.
+/// `Upper` is Lu|Lt (the strict-uppercase classes that appear only in the
+/// first bracket), `Lower` is Ll (only in the second), and `Caseless` is
+/// Lm|Lo (in both). Marks (`\p{M}`) are their own class: they join letter
+/// runs like `Caseless` but, being outside `\p{L}`, also continue
+/// `[^\s\p{L}\p{N}]+` punctuation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum O200kCharClass {
+    Upper = 0,
+    Lower = 1,
+    Caseless = 2,
+    Mark = 3,
+    Number = 4,
+    Whitespace = 5,
+    Other = 6,
+}
+
+/// 4-bit class per codepoint, 2 codepoints per byte (~544 KiB total).
+static O200K_CLASS_TABLE: std::sync::LazyLock<Box<[u8]>> =
+    std::sync::LazyLock::new(build_o200k_class_table);
+
+fn build_o200k_class_table() -> Box<[u8]> {
+    use icu::properties::CodePointMapData;
+    const N: usize = 0x110000;
+    let mut classes = vec![O200kCharClass::Other as u8; N];
+    let gc = CodePointMapData::<GeneralCategory>::new();
+    for (category, class) in [
+        (GeneralCategory::UppercaseLetter, O200kCharClass::Upper),
+        (GeneralCategory::TitlecaseLetter, O200kCharClass::Upper),
+        (GeneralCategory::LowercaseLetter, O200kCharClass::Lower),
+        (GeneralCategory::ModifierLetter, O200kCharClass::Caseless),
+        (GeneralCategory::OtherLetter, O200kCharClass::Caseless),
+    ] {
+        for range in gc.iter_ranges_for_value(category) {
+            classes[*range.start() as usize..=*range.end() as usize].fill(class as u8);
+        }
+    }
+    for (group, class) in [
+        (GeneralCategoryGroup::Mark, O200kCharClass::Mark),
+        (GeneralCategoryGroup::Number, O200kCharClass::Number),
+    ] {
+        for range in gc.iter_ranges_for_group(group) {
+            classes[*range.start() as usize..=*range.end() as usize].fill(class as u8);
+        }
+    }
+    // White_Space is disjoint from Letter/Mark/Number, so fill order is moot.
+    for range in CodePointSetData::new::<WhiteSpace>().iter_ranges() {
+        classes[*range.start() as usize..=*range.end() as usize]
+            .fill(O200kCharClass::Whitespace as u8);
+    }
+    classes
+        .as_chunks::<2>().0.iter()
+        .map(|c| c[0] | (c[1] << 4))
+        .collect()
+}
+
+/// Classify a codepoint for the o200k scheme family with one table load.
+/// `cp` must be a valid scalar value (guaranteed when decoded from valid
+/// UTF-8).
+#[inline(always)]
+pub(crate) fn o200k_class_of(cp: u32) -> O200kCharClass {
+    debug_assert!(cp < 0x110000);
+    let byte = unsafe { *O200K_CLASS_TABLE.get_unchecked((cp >> 1) as usize) };
+    match (byte >> ((cp & 1) << 2)) & 0xF {
+        0 => O200kCharClass::Upper,
+        1 => O200kCharClass::Lower,
+        2 => O200kCharClass::Caseless,
+        3 => O200kCharClass::Mark,
+        4 => O200kCharClass::Number,
+        5 => O200kCharClass::Whitespace,
+        _ => O200kCharClass::Other,
+    }
+}
+
 /// The CJK ranges isolated by the DeepSeek pretokenizer's second Split:
 /// `[\u{4E00}-\u{9FA5}\u{3040}-\u{309F}\u{30A0}-\u{30FF}]` (CJK unified
 /// ideographs, hiragana, katakana — the two kana blocks are contiguous).
@@ -215,6 +296,34 @@ mod tests {
                 CharClass::Other
             };
             assert_eq!(class_of(cp), expected, "mismatch at U+{cp:04X}");
+        }
+    }
+
+    /// The o200k table must agree with ICU for every scalar.
+    #[test]
+    fn o200k_class_table_matches_icu() {
+        for cp in 0..=char::MAX as u32 {
+            let Some(c) = char::from_u32(cp) else { continue };
+            let gc = get_general_category(c);
+            let expected = if matches!(
+                gc,
+                GeneralCategory::UppercaseLetter | GeneralCategory::TitlecaseLetter
+            ) {
+                O200kCharClass::Upper
+            } else if gc == GeneralCategory::LowercaseLetter {
+                O200kCharClass::Lower
+            } else if is_gc_letter(gc) {
+                O200kCharClass::Caseless
+            } else if GeneralCategoryGroup::Mark.contains(gc) {
+                O200kCharClass::Mark
+            } else if is_gc_number(gc) {
+                O200kCharClass::Number
+            } else if is_whitespace(c) {
+                O200kCharClass::Whitespace
+            } else {
+                O200kCharClass::Other
+            };
+            assert_eq!(o200k_class_of(cp), expected, "mismatch at U+{cp:04X}");
         }
     }
 

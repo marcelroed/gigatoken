@@ -74,6 +74,10 @@ struct PreTokenizerJson {
     add_prefix_space: Option<bool>,
     #[serde(default)]
     split: Option<bool>,
+    /// `Split` field (e.g. "MergedWithPrevious" for the gemma-3/4 no-op
+    /// space Split).
+    #[serde(default)]
+    behavior: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -323,7 +327,7 @@ fn build_sentencepiece(tj: &TokenizerJson) -> Result<SentencePieceBPE> {
     if let Some(n) = &tj.normalizer {
         parse_sp_normalizer(n, &mut norm_ops)?;
     }
-    let metaspace = parse_sp_metaspace(&tj.pre_tokenizer)?;
+    let metaspace = parse_sp_metaspace(&tj.pre_tokenizer, &norm_ops)?;
 
     // --- Extract added tokens (for splitting before encoding) ----------------
 
@@ -451,7 +455,13 @@ fn parse_sp_normalizer(n: &NormalizerJson, out: &mut Vec<NormOp>) -> Result<()> 
 /// Translate a tokenizer.json `pre_tokenizer` into a [`Metaspace`] config.
 /// `None` (no pre-tokenizer, e.g. Llama 2) leaves spaces to the normalizer
 /// and lets merges cross word boundaries.
-fn parse_sp_metaspace(pre_tokenizer: &Option<PreTokenizerJson>) -> Result<Option<Metaspace>> {
+///
+/// `norm_ops`: the already-parsed normalizer ops, used to prove that a
+/// `Split` on a literal space is a no-op (gemma-3/4).
+fn parse_sp_metaspace(
+    pre_tokenizer: &Option<PreTokenizerJson>,
+    norm_ops: &[NormOp],
+) -> Result<Option<Metaspace>> {
     fn from_metaspace(pt: &PreTokenizerJson) -> Result<Metaspace> {
         ensure!(
             pt.replacement.as_deref().unwrap_or("\u{2581}") == "\u{2581}",
@@ -485,6 +495,24 @@ fn parse_sp_metaspace(pre_tokenizer: &Option<PreTokenizerJson>) -> Result<Option
             if pt.pretokenizers.len() == 1 && pt.pretokenizers[0].kind == "Metaspace" =>
         {
             Ok(Some(from_metaspace(&pt.pretokenizers[0])?))
+        }
+        // gemma-3/4: `Split` on a literal " " with MergedWithPrevious. The
+        // normalizer has already replaced every space with "\u{2581}", so
+        // the Split never matches and the model BPE-merges across word
+        // boundaries exactly as with no pre-tokenizer at all. Accept it
+        // only when a norm op proves all spaces are gone by then.
+        "Split"
+            if matches!(
+                &pt.pattern,
+                Some(PatternJson { literal: Some(l), .. }) if l == " "
+            ) && pt.behavior.as_deref() == Some("MergedWithPrevious")
+                && norm_ops.iter().any(|op| matches!(
+                    op,
+                    NormOp::Replace { pattern, content }
+                        if pattern == " " && !content.contains(' ')
+                )) =>
+        {
+            Ok(None)
         }
         other => Err(eyre::eyre!(
             "Unsupported pre_tokenizer type for SentencePiece tokenizers: {other}"
