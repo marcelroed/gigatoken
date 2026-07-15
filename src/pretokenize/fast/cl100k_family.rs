@@ -359,12 +359,18 @@ fn family_extended_masks(
                 cl.l = chm;
                 c.pl = 1;
             }
-            // A digit P1 needs no carries: `\p{N}` groups restart at
-            // token boundaries, and a batch can only start inside a
-            // digit run after the previous batch deferred it — the `pd`
-            // seed below defers the leading run.
+            // A digit P1 sets no letter/punct carries: `\p{N}` groups
+            // restart at token boundaries. A P1 entirely before the batch
+            // is covered by the `pd` seed (bit 0 is then an ASCII digit
+            // when the run continues). A digit char STRADDLING into the
+            // batch defeats that seed — bit 0 is its continuation byte,
+            // not an ASCII digit — so its claimed bytes defer via resid
+            // and the bad<<1 seed catches the following run. (Found by
+            // the o200k-family port's differential fuzz: "٢1234" with the
+            // ٢ split across a batch edge mis-phased `\p{N}{1,3}`.)
             CharClass::Number => {
                 cl.n = chm;
+                cl.resid |= chm;
             }
             CharClass::Other => {
                 cl.o = chm;
@@ -690,6 +696,21 @@ mod tests {
                 buf.extend_from_slice(case.as_bytes());
                 check_all(&buf);
             }
+        }
+    }
+
+    /// A multi-byte digit char straddling a batch edge, followed by
+    /// ASCII digits: the `\p{N}{1,3}` phase starts at the straddling
+    /// char, which the `pd` seed alone cannot see (bit 0 is a
+    /// continuation byte). Regression for the resid fix in
+    /// `family_extended_masks`; lead 127 was the failing alignment.
+    #[test]
+    fn family_straddling_digit_char_phase() {
+        for lead in 100..200usize {
+            let mut buf = vec![b'a'; lead];
+            buf.extend_from_slice("\u{662}1234".as_bytes());
+            buf.extend_from_slice(&vec![b'a'; 262 - 6 - lead][..]);
+            check_all(&buf);
         }
     }
 

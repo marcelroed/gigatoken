@@ -1,7 +1,8 @@
 use crate::pretokenize::Pretoken;
 use crate::pretokenize::fast::{
-    FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
-    FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
+    FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastNemotronPretokenizer,
+    FastO200kPretokenizer, FastOlmo3Pretokenizer, FastQwen2Pretokenizer,
+    FastQwen35Pretokenizer, FastR50kPretokenizer,
 };
 
 /// Which pretokenization scheme (regex) a tokenizer uses.
@@ -13,6 +14,8 @@ pub enum PretokenizerType {
     Qwen35,     // Qwen2 with `[\p{L}\p{M}]+` letter runs, marks excluded from punct runs
     Olmo3,      // dolma2: Qwen2 scheme with cl100k's \p{N}{1,3}; used by Olmo 2/3
     DeepSeekV3, // Sequence of three Splits (digits, CJK, main); used by DeepSeek V3/V3.1/V4
+    O200k,      // o200k_base: case-structured letter runs; GPT-4o, gpt-oss
+    Nemotron,   // o200k without contractions, single-digit \p{N}; nvidia Nemotron-3
 }
 
 /// The three Split regexes of the DeepSeek V3/V4 pre_tokenizer Sequence, as
@@ -50,6 +53,12 @@ impl PretokenizerType {
             PretokenizerType::DeepSeekV3 => {
                 FastPretokenizerDispatch::DeepSeekV3(FastDeepSeekV3Pretokenizer::new(bytes))
             }
+            PretokenizerType::O200k => {
+                FastPretokenizerDispatch::O200k(FastO200kPretokenizer::new(bytes))
+            }
+            PretokenizerType::Nemotron => {
+                FastPretokenizerDispatch::Nemotron(FastNemotronPretokenizer::new(bytes))
+            }
         }
     }
 
@@ -84,6 +93,12 @@ impl PretokenizerType {
             r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+" => {
                 Some(PretokenizerType::Olmo3)
             }
+            r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+" => {
+                Some(PretokenizerType::O200k)
+            }
+            r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+" => {
+                Some(PretokenizerType::Nemotron)
+            }
             _ => None,
         }
     }
@@ -98,6 +113,8 @@ pub enum FastPretokenizerDispatch<'a> {
     Qwen35(FastQwen35Pretokenizer<'a>),
     Olmo3(FastOlmo3Pretokenizer<'a>),
     DeepSeekV3(FastDeepSeekV3Pretokenizer<'a>),
+    O200k(FastO200kPretokenizer<'a>),
+    Nemotron(FastNemotronPretokenizer<'a>),
 }
 
 impl<'a> Iterator for FastPretokenizerDispatch<'a> {
@@ -112,6 +129,8 @@ impl<'a> Iterator for FastPretokenizerDispatch<'a> {
             FastPretokenizerDispatch::Qwen35(it) => it.next(),
             FastPretokenizerDispatch::Olmo3(it) => it.next(),
             FastPretokenizerDispatch::DeepSeekV3(it) => it.next(),
+            FastPretokenizerDispatch::O200k(it) => it.next(),
+            FastPretokenizerDispatch::Nemotron(it) => it.next(),
         }
     }
 }
@@ -135,6 +154,8 @@ unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispat
             FastPretokenizerDispatch::Qwen35(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::Olmo3(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::DeepSeekV3(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::O200k(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::Nemotron(it) => it.fill_spans_keyed(batch, prefetch),
         }
     }
 }
