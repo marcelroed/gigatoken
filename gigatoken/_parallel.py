@@ -1,6 +1,8 @@
-"""Avoid Rayon oversubscription and post-fork deadlocks in worker processes.
+"""Avoid Rayon oversubscription and post-fork deadlocks in workers.
 
-Batch methods use the serial Rust path in workers unless explicitly overridden.
+A forked child inherits the Rayon pool object but not its worker threads;
+spawned workers have fresh pools but would each use all cores. Batch methods
+therefore default to the serial Rust path in workers unless overridden.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ def _mark_forked_child() -> None:
 
 
 if hasattr(os, "register_at_fork"):
-    # parent_process() covers spawn/forkserver; this covers plain fork.
+    # parent_process() catches spawn/forkserver workers; the hook is needed
+    # for plain fork, including children created outside multiprocessing.
     os.register_at_fork(after_in_child=_mark_forked_child)
 
 

@@ -66,7 +66,10 @@ pub(crate) fn fill_spans_keyed_mask<'a, S: mask::MaskScheme>(
     )
 }
 
-/// Define the common public wrapper for a [`mask::MaskScheme`].
+/// Define the common public wrapper for a [`mask::MaskScheme`]. `MaskState`
+/// selects the SIMD mask scanner when the target supports it and otherwise
+/// calls the scheme's scalar `advance`; centralizing this keeps iterator,
+/// resume-position, and batched-span behavior identical across schemes.
 macro_rules! define_mask_pretokenizer {
     ($(#[$meta:meta])* $pretokenizer:ident, $scheme:ty) => {
         $(#[$meta])*

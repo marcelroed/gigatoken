@@ -45,6 +45,8 @@ pub trait Resource: Sync {
     }
 }
 
+// Covers slices, strings, Vec, and Mmap without parallel implementations that
+// can drift; owned wrappers such as MmappedFile remain explicit below.
 impl<T: AsRef<[u8]> + Sync + ?Sized> Resource for T {
     fn as_bytes(&self) -> &[u8] {
         self.as_ref()
@@ -107,6 +109,8 @@ impl<'a> Iterator for DocumentIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            // Every terminal branch sets position to end before yielding, so
+            // this offset is also the finished state; no separate flag is needed.
             if self.position >= self.end {
                 return None;
             }

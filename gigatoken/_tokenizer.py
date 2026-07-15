@@ -40,7 +40,8 @@ class Tokenizer:
         self,
         tokenizer: str | Path | PathLike[str] | Tokenizer | BPETokenizer | SentencePieceTokenizer | HFTokenizerLike,
     ) -> None:
-        # Source metadata used by the compatibility adapters.
+        # Adapters need format-specific source metadata that the Rust backend
+        # does not retain: tokenizer.json, named HF tokens, or tiktoken specials.
         self._hf_json: str | bytes | None = None
         self._hf_config_cache: dict[str, Any] | None = None
         self._named_specials: dict[str, str | list[str]] = {}

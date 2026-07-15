@@ -186,8 +186,10 @@ pub(crate) fn ds_class_of(cp: u32) -> DsCharClass {
 
 // o200k character classes (case-aware split of Letter)
 
-/// Classes for o200k's case-structured letter runs. Marks stay separate
-/// because they can continue both letter and punctuation runs.
+/// Classes for o200k's case-structured letter runs: `Upper` is Lu|Lt,
+/// `Lower` is Ll, and `Caseless` is Lm|Lo. Marks stay separate because the
+/// regex lets them continue both letter runs and `[^\s\p{L}\p{N}]+`
+/// punctuation runs; folding them into either class changes boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum O200kCharClass {
@@ -239,7 +241,8 @@ fn build_o200k_class_table() -> Box<[u8]> {
         .collect()
 }
 
-/// Classify a valid scalar for the o200k family with one table load.
+/// Classify a valid Unicode scalar for the o200k family with one table load.
+/// Callers satisfy this by decoding valid UTF-8 before lookup.
 #[inline(always)]
 pub(crate) fn o200k_class_of(cp: u32) -> O200kCharClass {
     debug_assert!(cp < 0x110000);

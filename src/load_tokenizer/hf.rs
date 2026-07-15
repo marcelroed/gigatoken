@@ -448,7 +448,7 @@ fn parse_sp_normalizer(n: &NormalizerJson, out: &mut Vec<NormOp>) -> Result<()> 
 /// Translate a tokenizer.json `pre_tokenizer` into a [`Metaspace`] config.
 /// `None` (no pre-tokenizer, e.g. Llama 2) leaves spaces to the normalizer
 /// and lets merges cross word boundaries.
-/// `norm_ops` proves when Gemma's literal-space `Split` is a no-op.
+/// `norm_ops` is needed to prove when Gemma's literal-space `Split` is a no-op.
 fn parse_sp_metaspace(
     pre_tokenizer: &Option<PreTokenizerJson>,
     norm_ops: &[NormOp],
@@ -487,8 +487,10 @@ fn parse_sp_metaspace(
         {
             Ok(Some(from_metaspace(&pt.pretokenizers[0])?))
         }
-        // Gemma's space Split is inert after normalization removes spaces.
-        // Require that proof before treating it as no pre-tokenizer.
+        // Gemma-3/4 replaces spaces with ▁ before this MergedWithPrevious
+        // Split runs, so the literal-space pattern cannot match and BPE may
+        // still merge across word boundaries. Accept it only when a normalizer
+        // op proves spaces are gone; otherwise silently ignoring Split is wrong.
         "Split"
             if matches!(
                 &pt.pattern,

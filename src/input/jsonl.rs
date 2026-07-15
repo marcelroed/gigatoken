@@ -21,6 +21,7 @@ impl<'a> JsonLinesSlice<'a> {
 }
 
 impl<'a> Iterator for JsonLinesSlice<'a> {
+    // JSON extraction does not expose a borrow that can outlive its parsed value.
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -69,6 +70,7 @@ impl<R: BufRead> JsonLinesReader<R> {
 }
 
 impl<R: BufRead> Iterator for JsonLinesReader<R> {
+    // Own each result because `line_buf` is reused on the next iteration.
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {

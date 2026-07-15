@@ -17,6 +17,7 @@ dashmap = "6.1"
 indicatif = "0.18"
 itertools = "0.15"
 priority-queue = "2.0"
+# abi3-py310 keeps one wheel compatible with GIL-enabled CPython 3.10+.
 pyo3 = { version = "0.29", features = ["abi3-py310", "eyre"] }
 numpy = "0.29"
 rayon = "1.11"
@@ -28,6 +29,8 @@ polars = { version = "0.54", features = [
 ], optional = true }
 memmap2 = { version = "0.9", features = ["stable_deref_trait"] }
 base64 = "0.22"
+# Runtime classification uses bundled tables; `datagen` is generation tooling
+# and adds a large build graph without contributing runtime data.
 icu = { version = "2.2", features = ["compiled_data"] }
 eyre = "0.6.12"
 sonic-rs = "0.5.8"
@@ -75,6 +78,7 @@ strip = "none"
 criterion = "0.8"
 fancy-regex = "0.18.0"
 rand = "0.10"
+# Used only by the dedicated transcoding benchmark.
 simdutf = "0.7.0"
 
 

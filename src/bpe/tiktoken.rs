@@ -154,8 +154,10 @@ enum Piece<'a> {
     Added(TokenId),
 }
 
-/// Make short added-token cache entries resolve directly to their vocab IDs.
-/// Parent and forked tokenizers both apply this after seeding.
+/// Overwrite seeded 1..=15-byte entries so added-token contents resolve
+/// atomically to their vocab IDs instead of their merge decomposition.
+/// Both `set_added_tokens` and `fork_sized` call this after seeding; keep that
+/// shared path so parent and worker caches cannot disagree.
 fn apply_added_token_overwrites(
     added_tokens: &[(Arc<[u8]>, TokenId)],
     vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
@@ -233,9 +235,14 @@ impl Tokenizer {
         }
     }
 
-    /// Seed short vocab entries with the result the miss path would compute.
-    /// Normal mode stores their merge decomposition; `ignore_merges` stores
-    /// the vocab ID. `min_slots` may reserve extra worker capacity.
+    /// Precompute cache misses for every 1..=15-byte vocab entry.
+    ///
+    /// Normal BPE must store the merge result, not blindly the entry's own ID:
+    /// some vocab entries (notably Qwen3.5 CJK phrases) are unreachable through
+    /// the merge rules and must still encode as their decomposition. With
+    /// `ignore_merges`, HF semantics instead require the direct `vocab_inv` ID.
+    /// Sharing [`Self::seed_symbols`] with the miss path keeps both cases exact.
+    /// `min_slots` reserves worker capacity before seeding to avoid table growth.
     fn seeded_pretoken_cache(
         vocab: &[Arc<[u8]>],
         byte_remapping: Option<&ByteRemapping>,
@@ -333,7 +340,11 @@ impl Tokenizer {
         match pair_ranks {
             #[cfg(target_arch = "aarch64")]
             Some(table) => bpe_merge_symbols_short_neon(table, buf, n),
-            // x86 stays scalar: vector implementations measured slower.
+            // Keep x86 scalar: AVX-512/AVX2 ports measured ~1% slower on Zen 5
+            // (100 MB and 1 GB OWT). Their horizontal reduction and vector-to-GPR
+            // transfer sit on the serial merge chain, while this branchy scan
+            // predicts well for typical 4-6-symbol pretokens. See
+            // profiling/x86_port_plan.md §6 before reintroducing a vector path.
             #[cfg(not(target_arch = "aarch64"))]
             Some(table) => bpe_merge_symbols_short_scalar(|a, b| table.rank(a, b), buf, n),
             None => bpe_merge_symbols_short_scalar(
