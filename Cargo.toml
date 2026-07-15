@@ -38,6 +38,8 @@ serde = { version = "1.0.228", features = ["derive"] }
 flate2 = "1.1"
 zstd = "0.13"
 spm_precompiled = "0.1.4"
+simdutf = "0.7.0"
+winnow = { version = "1", features = ["simd"] }
 
 # madvise/prctl on Linux (pretoken cache table, batch gather, bench THP
 # setup); already in the tree transitively via memmap2/pyo3.
