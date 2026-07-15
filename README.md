@@ -2,16 +2,18 @@
 
 <div align="center">
 
-400-1600x faster than HuggingFace's Rust tokenizers, drop-in replacement.
+400-1600x faster than HuggingFace's tokenizers, drop-in replacement.
 
 *Tokenize your text data at GB/s!*
 
 ![GPT-2 Speedup](assets/throughput_owt_train_gpt-2.svg)
+
+Keep in mind that both HF tokenizers and tiktoken are already implemented in Rust!
 </div>
 
 ## What is Gigatoken?
 Gigatoken is the fastest tokenizer for language modeling.
-It supports a wide range of CPU hardware, and nearly all reasonably commonly used tokenizers.
+It supports a wide range of CPU hardware, and nearly all commonly used tokenizers.
 
 ## Installation
 ```
