@@ -112,11 +112,20 @@ impl ByteRemapping {
 /// cache-miss merge path. Two levels, both immutable after construction (so
 /// forks share one copy via `Arc` instead of cloning the map):
 ///
-/// - a dense `byte × byte` grid covering every pair whose sides are both
-///   below the initial-symbol range (256 for GPT-2, 512 for DeepSeek-style
-///   layouts). All round-1 lookups — roughly half of all lookups per miss,
-///   since initial symbols are byte tokens — become one shift-or index and
-///   one L1/L2 load: no hash, no probe.
+/// - a dense grid covering every pair whose sides are both below
+///   `2^dense_log2` — the initial byte tokens (0..255 for GPT-2, 3..=258
+///   for DeepSeek-style layouts) plus the earliest merged IDs, which by
+///   merge order are the most frequent symbols in the merge loop. All
+///   round-1 lookups — roughly half of all lookups per miss, since initial
+///   symbols are byte tokens — become one shift-or index and one L1/L2
+///   load: no hash, no probe. The grid is sized DOWN to the byte-token
+///   tier (1 MiB at 2^9×2^9 u32), not up to the merge tail: an OWT-miss
+///   census shows 59% of mid-merge lookups have both sides < 512 and only
+///   18% more are covered by 2048, while a dependent-load latency ladder
+///   on M4 Max puts a random cell of a 1 MiB table at ~6 ns against ~12+
+///   for 16 MiB (worse once the hit path's 256 MB pretoken-table probes
+///   share L2). The measured merge loop runs ~20% faster with the small
+///   grid; the larger one's extra coverage does not pay its latency.
 /// - a flat open-addressed table of all merges: power-of-two slots at
 ///   ≤ 1/2 load, linear probing, one `u64` slot packing key and value
 ///   (`(key << 21) | merged_id`; keys are 42 bits and merged IDs 21, so a
@@ -174,19 +183,24 @@ impl PairRankTable {
             return None;
         }
 
-        // Dense level covering every pair with both sides < 2^11 — the
-        // initial byte tokens (0..255 for GPT-2, 3..258 for DeepSeek) AND
-        // the earliest ~1.8k merged IDs, which by merge order are the most
-        // frequent symbols in the merge loop. Round-1 lookups plus the bulk
-        // of mid-merge lookups (hits and, crucially, no-merge misses, which
-        // the flat table answers only after probing to an empty slot)
-        // become one shift-or index and one load into a 16 MiB, L3-resident,
-        // Arc-shared grid. A vocab with byte tokens above the grid keeps
-        // correctness — its round-1 lookups just fall through to the flat
-        // table.
+        // Dense level covering the initial byte tokens (plus the earliest
+        // merged IDs up to the 2^9 floor): the pairs the merge loop looks
+        // up most, at one shift-or index and one L2-resident load. Sizing
+        // is latency-driven, not coverage-driven: every pair the grid does
+        // not cover is answered correctly (and still cheaply, ~1-2 L2
+        // probes) by the flat table below, and a 2^11 grid's extra coverage
+        // costs ~2x the per-lookup latency (see the struct doc for the
+        // census/latency numbers). The 2^11 ceiling keeps byte tokens above
+        // 2^9 (never seen on real vocabs) on the dense path as before; the
+        // 2^9 floor keeps DeepSeek-style byte layouts (tokens 3..=258)
+        // covered. Round-1 lookups plus the most frequent mid-merge
+        // lookups (hits and, crucially, no-merge misses, which the flat
+        // table answers only after probing to an empty slot) become one
+        // shift-or index and one load into the 1 MiB (16 MiB at the 2^11
+        // ceiling), L2-resident, Arc-shared grid.
         let max_initial = byte_remapping
             .map_or(255, |br| br.mapping.iter().map(|t| t.0).max().unwrap_or(0));
-        let dense_log2 = (32 - max_initial.leading_zeros()).clamp(11, 11);
+        let dense_log2 = (32 - max_initial.leading_zeros()).clamp(9, 11);
         let mut dense = vec![u32::MAX; 1usize << (2 * dense_log2)].into_boxed_slice();
 
         // Flat level holds all merges (including the dense subset, so it is
