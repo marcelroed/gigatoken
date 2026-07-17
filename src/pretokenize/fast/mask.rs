@@ -793,9 +793,14 @@ unsafe fn flatten_bits(m: u64, rel: u16, out: *mut u16) -> usize {
 /// is a straight instruction-count cut. The ALU form stays in
 /// `pack_mask_halves` for the latency-chained per-span paths — see its
 /// docs for the measured cost of a dependent load on those chains.
+///
+/// Row 16 is all zeros: the emission loop clamps the span length to
+/// `min(n, 16)`, so a long span's key ANDs to zero with no
+/// keep-mask/select ops of its own (the length tag is folded separately —
+/// see the loop).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-static PACK_MASK_TABLE: [[u64; 2]; 16] = {
-    let mut t = [[0u64; 2]; 16];
+static PACK_MASK_TABLE: [[u64; 2]; 17] = {
+    let mut t = [[0u64; 2]; 17];
     let mut n = 1;
     while n <= 15 {
         let (lo, hi) = crate::pretokenize::pack_mask_halves(n);
@@ -1082,25 +1087,29 @@ impl MaskState {
                     // PACK_MASK_TABLE instead of the 7-op per-half ALU
                     // chain (see the table's docs). tok_len >= 1
                     // (boundaries are strictly increasing), so the clamped
-                    // length is in the table's 1..=15 domain. Long spans
-                    // take key 0 (pretoken_key_hash(0) == 0) through the
-                    // `keep` AND-mask — an if/select here gets if-converted
-                    // into a real branch (LLVM hoists it to skip the two
-                    // loads), reintroducing the pattern-free n > 15 branch
+                    // length is in the table's 1..=16 domain. Row 16's
+                    // zero masks route long spans to key 0
+                    // (pretoken_key_hash(0) == 0) with no keep-mask of
+                    // their own; the length tag's `m & 15` folds the
+                    // clamp's bit 4 away (16 tags 0 = long, every short
+                    // length tags itself). An if/select over the loads
+                    // gets if-converted into a real branch (LLVM hoists
+                    // them), reintroducing the pattern-free n > 15 branch
                     // this loop exists to avoid.
-                    let m = tok_len.min(15);
-                    // SAFETY: m <= 15, in the 16-entry table.
+                    let m = tok_len.min(16);
+                    // SAFETY: m <= 16, in the 17-entry table.
                     let [mask_lo, mask_hi] = unsafe { *pack_masks.add(m) };
-                    let keep = ((tok_len <= 15) as u64).wrapping_neg();
-                    let klo = (raw as u64) & mask_lo & keep;
-                    let khi = (((raw >> 64) as u64 & mask_hi) | ((m as u64) << 56)) & keep;
+                    let klo = (raw as u64) & mask_lo;
+                    let khi = (((raw >> 64) as u64) & mask_hi) | (((m & 15) as u64) << 56);
                     let key = (klo as u128) | ((khi as u128) << 64);
                     let hv = fill_span_hash::<X86_CRC>(key);
                     prefetch(hv);
                     // meta = hash for short spans, length for long ones
-                    // (see `BatchEntry::meta`), in the same AND-mask style
-                    // as the key routing — a select gets if-converted.
-                    let meta = (hv & keep) | (tok_len as u64 & !keep);
+                    // (see `BatchEntry::meta`); a select on the clamp's
+                    // flags, which the AND-mask form canonicalizes to
+                    // anyway (if-conversion is the hazard above, and it
+                    // targets branches around the loads, not this).
+                    let meta = if tok_len < 16 { hv } else { tok_len as u64 };
                     e.key = key;
                     e.ptr = p;
                     e.meta = meta;

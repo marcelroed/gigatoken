@@ -100,13 +100,26 @@ fn nfc_segment<'a>(seg: &'a [u8], buf: &'a mut String) -> &'a [u8] {
 }
 
 /// Cache-value packing (shared by the short-pretoken table and decode in
-/// the encode loop). `val` low byte: token count in bits 0-6 plus a
-/// "spilled" flag in bit 7. Inline values (1-4 tokens; only the first ID
-/// must fit 24 bits — true of every real vocab) carry tokens 1-2 in `val`
-/// bits 8-31 and 32-63 and tokens 3-4 in `ext`'s two u32 lanes; spilled
-/// values carry the token-arena offset in `val`'s high 32 bits and leave
-/// `ext` unused.
-const VAL_SPILL: u64 = 0x80;
+/// the encode loop). `val` is emit-ready: token 1 in bits 0-23 (only the
+/// first ID must fit 24 bits — true of every real vocab) and token 2 in
+/// bits 32-63, exactly the two u32 lanes the probe/emit loop stores for
+/// every hit, so the hot loop's lane store is one AND clearing the
+/// metadata byte instead of a shift/OR re-pack. That byte carries the
+/// token count in bits 24-30 plus a "spilled" flag in bit 31; tokens 3-4
+/// ride `ext`'s two u32 lanes verbatim, and spilled values leave bits
+/// 0-23 zero and carry the token-arena offset in `val`'s high 32 bits.
+/// Every real entry has `val != 0` (a nonzero count or the spill flag),
+/// and a real inline entry's low 32 bits land in [1, 2^31) (count in bits
+/// 24-30, spill flag in bit 31), so the emit loop's fast predicate —
+/// inline ∧ not the empty-slot false hit — is one unsigned range test on
+/// `val`'s low half instead of separate spill/zero checks.
+const VAL_SPILL: u64 = 0x8000_0000;
+
+/// Clears `val`'s metadata byte (count + spill flag, bits 24-31), leaving
+/// the emit-ready token-1/token-2 lanes. One AArch64 logical-and
+/// immediate (a rotated run of 56 ones), replacing the two-op
+/// shift/mask/OR the old layout needed per probe hit.
+const VAL_TOKEN_MASK: u64 = 0xFFFF_FFFF_00FF_FFFF;
 
 /// Maximum token count one short pretoken (≤ 15 bytes) can encode to:
 /// merges only ever reduce the ≤ 15 seeded byte symbols. Bounds every
@@ -119,16 +132,16 @@ const SHORT_EMIT_MAX: usize = SHORT_MERGE_MAX - 1;
 #[inline(always)]
 fn pack_val_inline(symbols: &[TokenId]) -> Option<(u64, u64)> {
     match *symbols {
-        [a] if a.0 < (1 << 24) => Some((1 | ((a.0 as u64) << 8), 0)),
+        [a] if a.0 < (1 << 24) => Some(((1 << 24) | a.0 as u64, 0)),
         [a, b] if a.0 < (1 << 24) => {
-            Some((2 | ((a.0 as u64) << 8) | ((b.0 as u64) << 32), 0))
+            Some(((2 << 24) | a.0 as u64 | ((b.0 as u64) << 32), 0))
         }
         [a, b, c] if a.0 < (1 << 24) => Some((
-            3 | ((a.0 as u64) << 8) | ((b.0 as u64) << 32),
+            (3 << 24) | a.0 as u64 | ((b.0 as u64) << 32),
             c.0 as u64,
         )),
         [a, b, c, d] if a.0 < (1 << 24) => Some((
-            4 | ((a.0 as u64) << 8) | ((b.0 as u64) << 32),
+            (4 << 24) | a.0 as u64 | ((b.0 as u64) << 32),
             c.0 as u64 | ((d.0 as u64) << 32),
         )),
         _ => None,
@@ -398,7 +411,7 @@ impl Tokenizer {
         pack_val_inline(symbols).unwrap_or_else(|| {
             let offset = token_arena.len() as u64;
             token_arena.extend_from_slice(symbols);
-            (VAL_SPILL | symbols.len() as u64 | (offset << 32), 0)
+            (VAL_SPILL | ((symbols.len() as u64) << 24) | (offset << 32), 0)
         })
     }
 
@@ -922,13 +935,20 @@ impl Tokenizer {
             return;
         }
         out.reserve(SHORT_EMIT_MAX * n);
-        let mut w = out.len();
         // Loop-invariant raw cursors. The slow path's `&mut self` call is
         // the only thing that can move `out`'s buffer or the cache's slot
         // array, so both are refreshed there and nowhere else; without
         // these the compiler reloaded the Vec pointer, table base, and
         // mask from the stack on every iteration.
         let mut dst = out.as_mut_ptr();
+        // The write cursor walks as a pointer: the fast iteration then
+        // pays one `p += len` bump instead of a separate `dst + w*4`
+        // store-address add. The element count `w` only materializes
+        // where it is observed (the slow route's Vec cursor, `record`,
+        // the final set_len) as `p - dst`; a no-op `record` (the flat
+        // variant) leaves that derivation dead and LLVM deletes it.
+        // SAFETY: out.len() <= capacity.
+        let mut p = unsafe { dst.add(out.len()) };
         let mut table = self.pretoken_cache.probe_view();
         // Probe-stage prefetch: promote the pair's line L2 -> L1 a fixed
         // short distance ahead (the fill phase staged it into L2; D only
@@ -951,23 +971,29 @@ impl Tokenizer {
             // (the parallel-array layout walked three load streams here).
             let (key, h) = (batch.entries[i].key, batch.entries[i].meta);
             let (val, ext, found) = table.probe_pair(key, h);
-            // `key != 0` folds the long-pretoken route in AND guards the
-            // empty-slot sentinel (probe_pair matches key 0 against empty
-            // slots); on !found the lanes below are another entry's, dead
-            // because the cursor does not advance.
-            let fast = found & (val & VAL_SPILL == 0) & (key != 0);
-            // Lanes 1-2 packed into one u64 store, lanes 3-4 are `ext`
-            // verbatim (little-endian lane order, like the raw key load in
-            // `pack_pretoken_key`); the two u64 writes fuse into one 16 B
-            // `stp`.
-            let ab = ((val >> 8) & 0x00FF_FFFF) | (val & 0xFFFF_FFFF_0000_0000);
-            // SAFETY: the slack invariant leaves >= 4 u32s past `w`.
+            // A real inline entry is exactly `val`'s low 32 bits landing
+            // in [1, 2^31): nonzero — rejects the empty-slot false hit
+            // (probe_pair matches key 0 against empty slots, whose val
+            // reads 0), which also folds the long-pretoken route in —
+            // and the spill flag (bit 31) clear. One unsigned range test
+            // covers both rejections. On !found the lanes below are
+            // another entry's, dead because the cursor does not advance.
+            let fast = found & ((val as u32).wrapping_sub(1) < 0x7FFF_FFFF);
+            // Lanes 1-2 are `val` with the metadata byte cleared (the
+            // stored layout is emit-ready — see VAL_TOKEN_MASK), lanes
+            // 3-4 are `ext` verbatim (little-endian lane order, like the
+            // raw key load in `pack_pretoken_key`); the two u64 writes
+            // fuse into one 16 B `stp`.
+            let ab = val & VAL_TOKEN_MASK;
+            // SAFETY: the slack invariant leaves >= 4 u32s past `p`.
             unsafe {
-                let p = dst.add(w);
                 (p as *mut u64).write_unaligned(ab);
                 (p.add(2) as *mut u64).write_unaligned(ext);
+                // The bump stays in bounds: a fast advance writes <= 4
+                // lanes of the SHORT_EMIT_MAX-lane slack, and a rejected
+                // pretoken leaves the cursor where the slack starts.
+                p = p.add(if fast { ((val >> 24) & 0x7F) as usize } else { 0 });
             }
-            w += if fast { (val & 0x7F) as usize } else { 0 };
             if !fast {
                 // Cold: reconstruct the span from the entry. For key == 0
                 // `h` is really the span length, but the slow path never
@@ -977,17 +1003,23 @@ impl Tokenizer {
                 // SAFETY: entry `i` was written by this chunk's fill, so
                 // `ptr` points at a live span of the input's lifetime.
                 let bytes = unsafe { batch.span(i) };
-                w = self.probe_emit_slow(bytes, key, h, out, w);
+                // SAFETY: p and dst point into the same live allocation.
+                let w = unsafe { p.offset_from(dst) } as usize;
+                let w = self.probe_emit_slow(bytes, key, h, out, w);
                 dst = out.as_mut_ptr();
+                // SAFETY: w <= out.len() (probe_emit_slow returned a live
+                // length) <= capacity.
+                p = unsafe { dst.add(w) };
                 table = self.pretoken_cache.probe_view();
             }
-            record(i, w);
+            // SAFETY: p and dst point into the same live allocation.
+            record(i, unsafe { p.offset_from(dst) } as usize);
         }
-        // SAFETY: w <= capacity by the slack invariant, and every element
-        // below `w` was written (fast advances never skip lanes; the slow
-        // path's short route wrote its tokens at the raw cursor, its long
-        // route appended through Vec).
-        unsafe { out.set_len(w) };
+        // SAFETY: p - dst <= capacity by the slack invariant, and every
+        // element below it was written (fast advances never skip lanes;
+        // the slow path's short route wrote its tokens at the raw cursor,
+        // its long route appended through Vec).
+        unsafe { out.set_len(p.offset_from(dst) as usize) };
     }
 
     /// Everything [`Self::probe_emit_chunk`]'s fast predicate rejects.
@@ -1027,12 +1059,11 @@ impl Tokenizer {
             // chain.
             match self.pretoken_cache.get_or_slot(key, h) {
                 Ok((val, ext)) => {
-                    let len = (val & 0x7F) as usize;
+                    let len = ((val >> 24) & 0x7F) as usize;
                     if val & VAL_SPILL == 0 {
                         // The fast path's two-lane store, verbatim (lane
                         // order documented there).
-                        let ab =
-                            ((val >> 8) & 0x00FF_FFFF) | (val & 0xFFFF_FFFF_0000_0000);
+                        let ab = val & VAL_TOKEN_MASK;
                         // SAFETY: 4 lanes <= SHORT_EMIT_MAX; see dst above.
                         unsafe {
                             (dst as *mut u64).write_unaligned(ab);
@@ -1374,7 +1405,7 @@ mod tests {
             // the entry's own ID (GPT-2 has no duplicate byte strings and,
             // added-token overwrites included, no entry whose cached value
             // differs from its own ID).
-            assert_eq!(val, 1 | ((id as u64) << 8), "vocab entry {id}");
+            assert_eq!(val, (1 << 24) | id as u64, "vocab entry {id}");
             assert_eq!(ext, 0, "vocab entry {id}");
             seeded += 1;
         }

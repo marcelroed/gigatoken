@@ -410,7 +410,8 @@ impl ProbeView {
     /// genuine misses both come back `!found` — the slow path disambiguates
     /// via [`ShortPretokenCache::get_or_slot`]. Callers must not pass `key == 0`
     /// expecting a miss: empty slots compare equal to it (the emit
-    /// predicate carries its own `key != 0` term).
+    /// predicate rejects the false hit through its own `val != 0` term —
+    /// an empty slot's `val` reads 0).
     ///
     /// The selects run over unconditionally loaded `val`/`ext` of BOTH
     /// slots so they are register-value selects. Every pure-Rust spelling
@@ -418,41 +419,60 @@ impl ProbeView {
     /// select — csel of a slot pointer feeding a second, dependent load —
     /// putting an extra L1 latency on the probe's critical path (the next
     /// thing waiting on `val` is the emit store and the cursor advance,
-    /// the loop's only carried dependency), so on aarch64 the select is
-    /// two asm `csel`s. Loading all four words up front costs two more
-    /// loads per probe from the same already-touched line, all issued in
-    /// parallel, none dependent on the compares.
+    /// the loop's only carried dependency), so on aarch64 the compare and
+    /// the select are one asm `cmp`/`ccmp`/`csel`/`csel`/`cset` block: the
+    /// `csel`s ride the key compare's flags directly, saving the
+    /// test-and-branch pair a separate bool input would cost. Loading all
+    /// four words up front costs two more loads per probe from the same
+    /// already-touched line, all issued in parallel, none dependent on the
+    /// compares.
     #[inline(always)]
     pub(crate) fn probe_pair(&self, key: u128, h: u64) -> (u64, u64, bool) {
         let p = self.pair_ptr(h);
         // SAFETY: pair_ptr's index is masked and even, so idx + 1 <= mask;
         // the base is live for the view's chunk (see type docs).
         let (e0, e1) = unsafe { (&*p, &*p.add(1)) };
-        let m0 = e0.key == key;
+        // The second slot's key compare: folded into the compare/select
+        // asm block on aarch64, a plain bool everywhere else.
+        #[cfg(not(target_arch = "aarch64"))]
         let m1 = e1.key == key;
         #[cfg(target_arch = "aarch64")]
-        let (val, ext) = {
+        let (val, ext, found) = {
             let (mut val, mut ext) = (e0.val, e0.ext);
-            // SAFETY: register-only conditional selects; no memory access,
-            // no stack use (NZCV is clobbered, which the default options
-            // already declare).
+            let (m0, found): (u64, u64);
+            // SAFETY: register-only compares and conditional selects; no
+            // memory access, no stack use (NZCV is clobbered, which the
+            // default options already declare).
             unsafe {
                 core::arch::asm!(
-                    "cmp {m}, #0",
-                    "csel {val}, {val}, {v1}, ne",
-                    "csel {ext}, {ext}, {x1}, ne",
-                    m = in(reg) m0 as u64,
+                    "cmp {klo}, {e0klo}",
+                    "ccmp {khi}, {e0khi}, #0, eq",
+                    "csel {val}, {val}, {v1}, eq",
+                    "csel {ext}, {ext}, {x1}, eq",
+                    "cset {m0}, eq",
+                    "cmp {klo}, {e1klo}",
+                    "ccmp {khi}, {e1khi}, #0, eq",
+                    "csinc {found}, {m0}, xzr, ne",
+                    klo = in(reg) key as u64,
+                    khi = in(reg) (key >> 64) as u64,
+                    e0klo = in(reg) e0.key as u64,
+                    e0khi = in(reg) (e0.key >> 64) as u64,
+                    e1klo = in(reg) e1.key as u64,
+                    e1khi = in(reg) (e1.key >> 64) as u64,
                     val = inout(reg) val,
                     ext = inout(reg) ext,
                     v1 = in(reg) e1.val,
                     x1 = in(reg) e1.ext,
+                    m0 = out(reg) m0,
+                    found = out(reg) found,
                     options(pure, nomem, nostack),
                 );
             }
-            (val, ext)
+            (val, ext, found != 0)
         };
         #[cfg(target_arch = "x86_64")]
-        let (val, ext) = {
+        let (val, ext, found) = {
+            let m0 = e0.key == key;
             // LLVM canonicalizes every pure-Rust spelling into an
             // address-cmov feeding a dependent load — the extra L1 latency
             // this function exists to avoid; the asm pins register-value
@@ -475,17 +495,19 @@ impl ProbeView {
                     options(pure, nomem, nostack),
                 );
             }
-            (val, ext)
+            (val, ext, m0 | m1)
         };
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let (val, ext) = {
+        let (val, ext, found) = {
+            let m0 = e0.key == key;
             let sel = (m0 as u64).wrapping_neg();
             (
                 (e0.val & sel) | (e1.val & !sel),
                 (e0.ext & sel) | (e1.ext & !sel),
+                m0 | m1,
             )
         };
-        (val, ext, m0 | m1)
+        (val, ext, found)
     }
 }
 
