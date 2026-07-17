@@ -740,24 +740,24 @@ mod tests {
         assert!(first_line.contains("vocab"), "unhelpful error: {first_line}");
     }
 
+    fn tinyllama_path() -> Option<std::path::PathBuf> {
+        let path = crate::test_hub::hf_tokenizer_json("TinyLlama/TinyLlama-1.1B-Chat-v1.0");
+        if path.is_none() {
+            eprintln!("Skipping: TinyLlama tokenizer.json not in the HF cache");
+        }
+        path
+    }
+
     #[test]
     fn test_load_tinyllama_sentencepiece() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/tinyllama_tokenizer.json");
-        if !std::path::Path::new(path).exists() {
-            eprintln!("Skipping: {path} not found");
-            return;
-        }
+        let Some(path) = tinyllama_path() else { return };
         let tokenizer = load_hf_sentencepiece(path).unwrap();
         eprintln!("{:?}", tokenizer);
     }
 
     #[test]
     fn test_encode_hello_sentencepiece() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/tinyllama_tokenizer.json");
-        if !std::path::Path::new(path).exists() {
-            eprintln!("Skipping: {path} not found");
-            return;
-        }
+        let Some(path) = tinyllama_path() else { return };
         let tokenizer = load_hf_sentencepiece(path).unwrap();
         let ids = tokenizer.encode_raw("Hello world");
         eprintln!("Encoded: {:?}", ids);
@@ -767,12 +767,8 @@ mod tests {
 
     #[test]
     fn test_load_gpt2_from_hf() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/gpt2_tokenizer.json");
-        if !std::path::Path::new(path).exists() {
-            eprintln!("Skipping: {path} not found");
-            return;
-        }
-        let mut tokenizer = load_hf_bpe(path).unwrap();
+        let path = crate::test_hub::gpt2_tokenizer_json();
+        let mut tokenizer = load_hf_bpe(&path).unwrap();
         eprintln!("{:?}", tokenizer);
 
         // Encode and verify roundtrip

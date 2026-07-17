@@ -1038,8 +1038,7 @@ mod tests {
     fn verify_parallel_ragged_matches_serial_owt_gpt2_1g() {
         use crate::load_tokenizer::hf::load_hf_bpe;
         use std::io::Read;
-        let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("data/gpt2_tokenizer.json");
+        let tokenizer_path = crate::test_hub::gpt2_tokenizer_json();
         let proto = load_hf_bpe(&tokenizer_path).expect("load GPT-2 tokenizer");
         let added = proto.added_token_contents();
         let sep: Vec<u8> = added.first().expect("GPT-2 has an added token").to_vec();

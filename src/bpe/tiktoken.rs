@@ -1136,7 +1136,7 @@ mod test_util {
     use super::*;
 
     pub(super) fn gpt2_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json")
+        crate::test_hub::gpt2_tokenizer_json()
     }
 
     /// Uncached reference encode of one pretoken: byte remap + plain merge
@@ -1712,9 +1712,16 @@ mod verify_heavy {
         // from HF (see verify_vocab_seeded_cache_matches_merge_decomposition);
         // the seed now stores merge decompositions. Kept last so the clean
         // tokenizers report first on a regression.
-        for name in ["olmo3", "qwen2", "deepseek_v3", "qwen3_5"] {
-            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(format!("data/{name}_tokenizer.json"));
+        for (name, repo_id) in [
+            ("olmo3", "allenai/Olmo-3-1025-7B"),
+            ("qwen2", "Qwen/Qwen2-1.5B-Instruct"),
+            ("deepseek_v3", "deepseek-ai/DeepSeek-V3"),
+            ("qwen3_5", "Qwen/Qwen3.5-9B"),
+        ] {
+            let Some(path) = crate::test_hub::hf_tokenizer_json(repo_id) else {
+                eprintln!("{name}: {repo_id} tokenizer.json not in the HF cache; skipping");
+                continue;
+            };
             let mut tok = match load_hf_bpe(&path) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1747,12 +1754,14 @@ mod verify_heavy {
     /// must return the merge decomposition, exactly as if it had missed —
     /// the seed is precomputed misses (`merge_short`), never the raw ID.
     /// Ground truth verified against HF `tokenizers`: encode(" Jap\u{f3}n")
-    /// on data/qwen3_5_tokenizer.json gives [604, 385, 3064] ("ĠJ", "ap",
-    /// "Ã³n"); the raw-ID seed returned [209344] (" Jap\u{f3}n").
+    /// on Qwen/Qwen3.5-9B's tokenizer.json gives [604, 385, 3064] ("ĠJ",
+    /// "ap", "Ã³n"); the raw-ID seed returned [209344] (" Jap\u{f3}n").
     #[test]
     fn verify_vocab_seeded_cache_matches_merge_decomposition() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("data/qwen3_5_tokenizer.json");
+        let Some(path) = crate::test_hub::hf_tokenizer_json("Qwen/Qwen3.5-9B") else {
+            eprintln!("Skipping: Qwen/Qwen3.5-9B tokenizer.json not in the HF cache");
+            return;
+        };
         let mut tok = load_hf_bpe(&path).expect("load qwen3_5");
         let pretoken: &[u8] = " Jap\u{f3}n".as_bytes();
 

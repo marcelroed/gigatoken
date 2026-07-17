@@ -5,6 +5,8 @@ mod bpe_train;
 mod input;
 mod load_tokenizer;
 mod pretokenize;
+#[cfg(test)]
+mod test_hub;
 mod token;
 
 use input::MmappedFile;
