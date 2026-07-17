@@ -62,8 +62,15 @@ In addition, interactions with Python are minimized, and threads are minimally i
 
 ### Q: How can I quickly check if my tokenizer is supported?
 You can try it out without installing anything! The following command will validate and time tokenization for a given HuggingFace model repo: 
+
 ```bash
-uvx --with tokenizers gigatoken bench 'openai-community/gpt2' ~/data/owt_train.txt \
+# Download your data
+wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz  # Just an example!
+gunzip owt_train.txt.gz
+```
+
+```bash
+uvx --with tokenizers gigatoken bench 'openai-community/gpt2' owt_train.txt \
     --in-memory --validate --comparison-limit 100MB \
     --separator "<|endoftext|>"
 ```
