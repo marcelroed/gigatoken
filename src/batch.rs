@@ -793,7 +793,7 @@ pub fn encode_docs_ragged_serial(
 /// parallel chunks and encode each with its own Encoder. SentencePiece
 /// merges can span the whole document, so oversized documents are never
 /// split.
-pub(crate) fn sp_encode_docs_ragged(
+pub fn sp_encode_docs_ragged(
     tokenizer: &bpe::SentencePieceBPE,
     texts: &[&str],
 ) -> (Vec<u32>, Vec<i64>) {

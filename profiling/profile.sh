@@ -13,6 +13,9 @@
 # inline frames resolve. Never run two profiling/bench processes at once.
 #
 # Env: PROFILE_OUT overrides the trace output directory.
+#      ENCODE_TOKENIZER selects the tokenizer: a local tokenizer.json path or
+#      a HuggingFace repo id (e.g. Qwen/Qwen2-1.5B-Instruct; fetched into the
+#      standard HF cache on first use, served from it afterwards).
 set -euo pipefail
 
 MB="${1:-10000}"
@@ -32,6 +35,13 @@ BIN=$(echo "$BUILD_LOG" | sed -n 's|.*(\(target/release/deps/encode_st-[0-9a-f]*
 [ -n "$BIN" ] || { echo "could not locate bench binary"; echo "$BUILD_LOG"; exit 1; }
 echo "binary: $ROOT/$BIN"
 
+# A repo-id ENCODE_TOKENIZER downloads on first use; do that (plus a 1 MB
+# encode) outside the recording so the trace only measures encoding.
+if [[ -n "${ENCODE_TOKENIZER:-}" ]]; then
+    echo "== prefetching tokenizer ($ENCODE_TOKENIZER) =="
+    ENCODE_MB=1 ENCODE_TOKENIZER="$ENCODE_TOKENIZER" "./$BIN" >/dev/null
+fi
+
 if [[ "$MODE" == "samply" || "$MODE" == "both" ]]; then
     TRACE="$OUT/samply_$LABEL.json.gz"
     echo "== samply record (4 kHz, main thread) -> $TRACE =="
@@ -49,6 +59,7 @@ if [[ "$MODE" == "counters" || "$MODE" == "both" ]]; then
     echo "== xctrace CPU Counters (CPU Bottlenecks mode) -> $TRACE =="
     rm -rf "$TRACE"
     xcrun xctrace record --template 'CPU Counters' --output "$TRACE" \
-        --env ENCODE_MB="$MB" --launch -- "./$BIN"
+        --env ENCODE_MB="$MB" ${ENCODE_TOKENIZER:+--env ENCODE_TOKENIZER="$ENCODE_TOKENIZER"} \
+        --launch -- "./$BIN"
     echo "trace: $TRACE"
 fi

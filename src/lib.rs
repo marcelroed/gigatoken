@@ -9,14 +9,14 @@ pub mod pretokenize;
 #[cfg(test)]
 pub(crate) mod test_hub;
 pub(crate) mod token;
-pub use crate::batch::{WorkerPool, encode_docs_ragged};
+pub use crate::batch::{WorkerPool, encode_docs_ragged, sp_encode_docs_ragged};
 pub use crate::bpe::Tokenizer;
 pub use crate::bpe::sentencepiece::EncodeState;
 pub mod load_tokenizer;
 
 use crate::batch::{
-    encode_files_docs, encode_files_docs_serial, encode_into, sp_encode_docs_ragged,
-    sp_encode_docs_ragged_serial, sp_encode_files_docs, sp_encode_files_docs_serial,
+    encode_files_docs, encode_files_docs_serial, encode_into, sp_encode_docs_ragged_serial,
+    sp_encode_files_docs, sp_encode_files_docs_serial,
 };
 use crate::bindings::bridge::{
     EncodeInput, encode_batch_pylist, encode_batch_ragged, extract_doc, extract_token_ids,
@@ -526,5 +526,8 @@ fn gigatoken_rs<'py>(py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pretokenizer, m)?)?;
     m.add_function(wrap_pyfunction!(pretokenized_counts, m)?)?;
     m.add_function(wrap_pyfunction!(load_hf_json, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::hub::hub_file, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::hub::looks_like_repo_id, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::hub::get_hf_token, m)?)?;
     Ok(())
 }

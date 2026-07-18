@@ -1,5 +1,6 @@
 from os import PathLike
 from pathlib import Path
+from typing import Literal
 
 import awkward as ak
 import numpy as np
@@ -225,6 +226,26 @@ def load_hf_json(
 ) -> BPETokenizer | SentencePieceTokenizer:
     """Load a tokenizer from in-memory tokenizer.json contents; the model's
     byte_fallback flag selects SentencePieceTokenizer vs BPETokenizer."""
+
+def hub_file(
+    repo_id: str,
+    filename: str = "tokenizer.json",
+    *,
+    repo_type: Literal["model", "dataset", "space"] = "model",
+    revision: str = "main",
+) -> Path:
+    """Path of `filename` from Hub repo `repo_id` at `revision`, served from
+    the standard HF cache, downloading into it first when absent. Raises
+    FileNotFoundError on HTTP 404 and PermissionError on 401/403."""
+
+def looks_like_repo_id(name: str) -> bool:
+    """Whether `name` is shaped like a HuggingFace Hub repo id: `org/name` or
+    a bare legacy repo name, and not an obvious local tokenizer-file path."""
+
+def get_hf_token() -> str | None:
+    """The HuggingFace access token, discovered like huggingface_hub does it:
+    HF_TOKEN (or legacy HUGGING_FACE_HUB_TOKEN), then the token file
+    (HF_TOKEN_PATH, default $HF_HOME/token)."""
 
 class SpecialTokenFound(Exception):
     """Raised by _encode_batch_list_compat when a `forbid` pattern occurs in

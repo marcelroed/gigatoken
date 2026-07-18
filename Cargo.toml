@@ -43,6 +43,7 @@ parquet = { version = "59.1.0", default-features = false, features = [
 ] }
 arrow-array = "59"
 arrow-schema = "59"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 
 # madvise/prctl on Linux (pretoken cache table, batch gather, bench THP
 # setup); already in the tree transitively via memmap2/pyo3.

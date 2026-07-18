@@ -6,6 +6,7 @@
 //! (matcher), and the pretokenizer helpers (pretokenize).
 
 pub(crate) mod bridge;
+pub(crate) mod hub;
 pub(crate) mod matcher;
 pub(crate) mod padding;
 pub(crate) mod pretokenize;

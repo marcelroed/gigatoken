@@ -1,4 +1,5 @@
-import sys
+import http.server
+import threading
 
 import pytest
 
@@ -20,44 +21,79 @@ def test_tokenizer_from_repo_id(repo_id: str):
     assert tokenizer.decode(tokenizer.encode("Hello, world!")) == b"Hello, world!"
 
 
-def test_tokenizer_from_repo_id_without_huggingface_hub(monkeypatch, tmp_path, gpt2_tokenizer_path):
-    """The Hub fallback must work with huggingface_hub not installed. The
-    urllib request is served from the local fixture, so no network is hit.
-    HF_HOME points at an empty directory so the cache fast path misses."""
+@pytest.fixture
+def hub_server(gpt2_tokenizer_path):
+    """Loopback stand-in for the Hub: `resolve/` answers with x-repo-commit
+    and a redirect to a `/cdn/` path serving the gpt2 fixture, like the real
+    endpoint does for LFS files. Yields (endpoint, commit, requests) where
+    requests collects (path, authorization_header) per request."""
+    data = gpt2_tokenizer_path.read_bytes()
+    commit = "a" * 40
+    requests: list[tuple[str, str | None]] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.path, self.headers.get("Authorization")))
+            if self.path == "/openai-community/gpt2/resolve/main/tokenizer.json":
+                self.send_response(302)
+                self.send_header("x-repo-commit", commit)
+                self.send_header("Location", "/cdn/tokenizer.json")
+                self.end_headers()
+            elif self.path == "/cdn/tokenizer.json":
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_error(404)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", commit, requests
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_tokenizer_from_repo_id_downloads_into_cache(monkeypatch, tmp_path, hub_server):
+    """On a cache miss the file is fetched from the endpoint (no
+    huggingface_hub involved) and lands in the standard HF cache layout under
+    the commit from x-repo-commit; the token travels only to the resolve URL,
+    not to the redirect target; a reload is served from the cache with no
+    request. HF_HOME points at an empty directory so the fast path misses."""
+    endpoint, commit, requests = hub_server
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", str(tmp_path))
-    monkeypatch.setitem(sys.modules, "huggingface_hub", None)  # makes its import raise
+    monkeypatch.setenv("HF_ENDPOINT", endpoint)
+    monkeypatch.setenv("HF_TOKEN", "hf_testtoken")
 
-    data = gpt2_tokenizer_path.read_bytes()
-    opened = []
-
-    class _FakeResponse:
-        def read(self):
-            return data
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    class _FakeOpener:
-        def open(self, req):
-            opened.append(req.full_url)
-            return _FakeResponse()
-
-    monkeypatch.setattr("gigatoken._load.hub.urllib.request.build_opener", lambda *handlers: _FakeOpener())
     tokenizer = Tokenizer("openai-community/gpt2")
-    assert len(opened) == 1
-    assert opened[0].endswith("/openai-community/gpt2/resolve/main/tokenizer.json")
     assert tokenizer.decode(tokenizer.encode("Hello, world!")) == b"Hello, world!"
+    assert requests == [
+        ("/openai-community/gpt2/resolve/main/tokenizer.json", "Bearer hf_testtoken"),
+        ("/cdn/tokenizer.json", None),
+    ]
+
+    repo_dir = tmp_path / "hub" / "models--openai-community--gpt2"
+    assert (repo_dir / "snapshots" / commit / "tokenizer.json").is_file()
+    assert (repo_dir / "refs" / "main").read_text() == commit
+
+    tokenizer = Tokenizer("openai-community/gpt2")
+    assert tokenizer.decode(tokenizer.encode("Hello, world!")) == b"Hello, world!"
+    assert len(requests) == 2, "second load must be served from the cache"
 
 
 def test_tokenizer_from_repo_id_cache_fast_path(monkeypatch, tmp_path, gpt2_tokenizer_path):
     """A file already in the standard HF cache layout is served by the pure
-    filesystem lookup: no huggingface_hub import and no network request."""
+    filesystem lookup: no network request (the endpoint points at a closed
+    port, so any request would error out)."""
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.setenv("HF_ENDPOINT", "http://127.0.0.1:9")  # discard port: nothing listens
     commit = "0" * 40
     repo_dir = tmp_path / "hub" / "models--openai-community--gpt2"
     (repo_dir / "refs").mkdir(parents=True)
@@ -66,11 +102,6 @@ def test_tokenizer_from_repo_id_cache_fast_path(monkeypatch, tmp_path, gpt2_toke
     snapshot.mkdir(parents=True)
     (snapshot / "tokenizer.json").write_bytes(gpt2_tokenizer_path.read_bytes())
 
-    def _no_network(*handlers):
-        raise AssertionError("cache fast path must not hit the network")
-
-    monkeypatch.setitem(sys.modules, "huggingface_hub", None)  # makes its import raise
-    monkeypatch.setattr("gigatoken._load.hub.urllib.request.build_opener", _no_network)
     tokenizer = Tokenizer("openai-community/gpt2")
     assert tokenizer.decode(tokenizer.encode("Hello, world!")) == b"Hello, world!"
 

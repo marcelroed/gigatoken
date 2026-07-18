@@ -6,11 +6,20 @@ use std::time::Instant;
 mod common;
 fn main() {
     common::allow_thp();
-    // ENCODE_TOKENIZER overrides the tokenizer.json (e.g.
-    // data/qwen3_tokenizer.json to bench the qwen2-scheme encode path);
-    // encoding then runs through the scheme dispatch instead of the
-    // hardcoded r50k pretokenizer.
-    let tokenizer_override = std::env::var("ENCODE_TOKENIZER").ok().map(PathBuf::from);
+    // ENCODE_TOKENIZER overrides the tokenizer.json: a local path (e.g.
+    // data/qwen3_tokenizer.json to bench the qwen2-scheme encode path) or a
+    // HuggingFace repo id (e.g. Qwen/Qwen2-1.5B-Instruct), served from the
+    // standard HF cache and downloaded into it on a miss. Encoding then runs
+    // through the scheme dispatch instead of the hardcoded r50k pretokenizer.
+    let tokenizer_override = std::env::var("ENCODE_TOKENIZER").ok().map(|value| {
+        let path = PathBuf::from(&value);
+        if !path.exists() && gigatoken_rs::load_tokenizer::hub::looks_like_repo_id(&value) {
+            gigatoken_rs::load_tokenizer::hub::hub_file(&value, "tokenizer.json", "main")
+                .expect("Could not fetch tokenizer.json from the HuggingFace Hub")
+        } else {
+            path
+        }
+    });
     let tokenizer_path = tokenizer_override.clone().unwrap_or_else(|| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json")
     });
