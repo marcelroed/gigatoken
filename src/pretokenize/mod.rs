@@ -3,8 +3,9 @@
 //!
 //! The production implementations live in `fast` (one submodule per scheme:
 //! `fast::r50k` for GPT-2, `fast::cl100k` for GPT-4, ...), selected via
-//! [`PretokenizerType`]. The state-machine, combinator, and SIMD variants are
-//! kept as references and benchmark baselines.
+//! [`PretokenizerType`]. Superseded designs (state machine, combinator,
+//! SIMD prototypes) live in [`reference`] as benchmark baselines and test
+//! oracles — nothing there runs in the encode path.
 //!
 //! The main entry points are:
 //! - `pretokenize_as_iter`: iterate pretokens of a `&[u8]` (r50k scheme)
@@ -23,20 +24,16 @@ use std::collections::HashMap;
 pub mod fast;
 mod options;
 mod pretoken;
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
-pub mod pretoken_avx512;
-pub mod pretoken_combinator;
-pub mod pretoken_state_machine;
 pub(crate) mod pretokenize_traits;
+pub mod reference;
 mod unicode;
-pub mod pretoken_simd;
 
 pub use fast::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
 };
 pub use options::{FastPretokenizerDispatch, PretokenizerType};
-pub use pretoken_state_machine::PretokenizerIter;
+pub use reference::state_machine::PretokenizerIter;
 
 /// Default document separator used in common training corpora.
 pub const DEFAULT_SEPARATOR: &[u8] = b"<|endoftext|>";
