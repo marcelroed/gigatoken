@@ -2538,25 +2538,87 @@ mod walker_edge {
         use std::hint::black_box;
         use std::time::Instant;
 
-        /// Local copy of the pre-R3d demand-lookup NEON merge (baseline).
-        fn old_neon(
+        // Sub-blocks shared verbatim by the measurement copies below.
+        // `#[inline(always)]` reproduces the written-out form's codegen in
+        // each variant, and the census loop's differential asserts guard
+        // against drift from the lib implementation.
+        const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
+
+        /// The R3d n == 2 / n == 3 written-out merge chains; `None` for
+        /// larger n (mirrors `bpe_merge_symbols_short_neon`).
+        #[inline(always)]
+        fn fast_small(
             table: &PairRankTable,
             symbols: &mut [TokenId; SHORT_MERGE_MAX],
             n: usize,
-        ) -> usize {
-            use core::arch::aarch64::{vld1q_u32, vminq_u32, vminvq_u32};
-            const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
-            let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
+        ) -> Option<usize> {
+            if n == 2 {
+                let r = table.rank(symbols[0], symbols[1]);
+                if r == u32::MAX {
+                    return Some(2);
+                }
+                symbols[0] = TokenId(r);
+                return Some(1);
+            }
+            if n == 3 {
+                let r0 = table.rank(symbols[0], symbols[1]);
+                let r1 = table.rank(symbols[1], symbols[2]);
+                if r0 == u32::MAX && r1 == u32::MAX {
+                    return Some(3);
+                }
+                let c0 = if r0 != u32::MAX {
+                    table.rank(TokenId(r0), symbols[2])
+                } else {
+                    u32::MAX
+                };
+                let c1 = if r1 != u32::MAX {
+                    table.rank(symbols[0], TokenId(r1))
+                } else {
+                    u32::MAX
+                };
+                let first_left = r0 <= r1;
+                let c = if first_left { c0 } else { c1 };
+                if c != u32::MAX {
+                    symbols[0] = TokenId(c);
+                    return Some(1);
+                }
+                if first_left {
+                    symbols[0] = TokenId(r0);
+                    symbols[1] = symbols[2];
+                } else {
+                    symbols[1] = TokenId(r1);
+                }
+                return Some(2);
+            }
+            None
+        }
+
+        /// Doubly-linked active list over positions 0..n.
+        #[inline(always)]
+        fn init_links(n: usize) -> ([u8; SHORT_MERGE_MAX], [u8; SHORT_MERGE_MAX]) {
             let mut next = [0u8; SHORT_MERGE_MAX];
             let mut prev = [0u8; SHORT_MERGE_MAX];
             for i in 0..n {
                 next[i] = (i + 1) as u8;
                 prev[i] = (i as u8).wrapping_sub(1);
             }
-            let mut pr = [u32::MAX; SHORT_MERGE_MAX];
-            let pairs = n - 1;
+            (next, prev)
+        }
+
+        /// Round-1 rank burst: pack `(rank, i)` into `pr` for pairs
+        /// 0..pairs, four independent lookups in flight at a time.
+        #[inline(always)]
+        fn fill_round1(
+            table: &PairRankTable,
+            symbols: &[TokenId; SHORT_MERGE_MAX],
+            pairs: usize,
+            pr: &mut [u32; SHORT_MERGE_MAX],
+        ) {
+            let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
             let mut i = 0;
             while i + 4 <= pairs {
+                // SAFETY: i + 4 <= pairs = n - 1 <= SHORT_MERGE_MAX - 2,
+                // so every index read is < 16.
                 let (r0, r1, r2, r3) = unsafe {
                     let s = symbols.as_ptr();
                     (
@@ -2573,23 +2635,61 @@ mod walker_edge {
                 i += 4;
             }
             while i < pairs {
+                // SAFETY: i + 1 <= pairs <= SHORT_MERGE_MAX - 2.
                 let (a, b) = unsafe { (*symbols.get_unchecked(i), *symbols.get_unchecked(i + 1)) };
                 pr[i] = pack(table.rank(a, b), i);
                 i += 1;
             }
+        }
+
+        /// NEON min-scan over the packed (rank, position) lanes.
+        #[inline(always)]
+        fn scan_min(pr: &[u32; SHORT_MERGE_MAX], narrow: bool) -> u32 {
+            use core::arch::aarch64::{vld1q_u32, vminq_u32, vminvq_u32};
+            unsafe {
+                let p = pr.as_ptr();
+                let m01 = vminq_u32(vld1q_u32(p), vld1q_u32(p.add(4)));
+                let m = if narrow {
+                    m01
+                } else {
+                    let m23 = vminq_u32(vld1q_u32(p.add(8)), vld1q_u32(p.add(12)));
+                    vminq_u32(m01, m23)
+                };
+                vminvq_u32(m)
+            }
+        }
+
+        /// Compact the surviving symbols along the `next` chain.
+        #[inline(always)]
+        fn compact(
+            symbols: &mut [TokenId; SHORT_MERGE_MAX],
+            next: &[u8; SHORT_MERGE_MAX],
+            n: usize,
+        ) -> usize {
+            let mut write = 0;
+            let mut i = 0;
+            while i < n {
+                symbols[write] = symbols[i];
+                write += 1;
+                i = next[i] as usize;
+            }
+            write
+        }
+
+        /// Local copy of the pre-R3d demand-lookup NEON merge (baseline).
+        fn old_neon(
+            table: &PairRankTable,
+            symbols: &mut [TokenId; SHORT_MERGE_MAX],
+            n: usize,
+        ) -> usize {
+            let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
+            let (mut next, mut prev) = init_links(n);
+            let mut pr = [u32::MAX; SHORT_MERGE_MAX];
+            let pairs = n - 1;
+            fill_round1(table, symbols, pairs, &mut pr);
             let narrow = n <= 8;
             loop {
-                let best = unsafe {
-                    let p = pr.as_ptr();
-                    let m01 = vminq_u32(vld1q_u32(p), vld1q_u32(p.add(4)));
-                    let m = if narrow {
-                        m01
-                    } else {
-                        let m23 = vminq_u32(vld1q_u32(p.add(8)), vld1q_u32(p.add(12)));
-                        vminq_u32(m01, m23)
-                    };
-                    vminvq_u32(m)
-                };
+                let best = scan_min(&pr, narrow);
                 if best >= NO_MERGE_FLOOR {
                     break;
                 }
@@ -2610,14 +2710,7 @@ mod walker_edge {
                     pr[left] = pack(table.rank(symbols[left], symbols[i]), left);
                 }
             }
-            let mut write = 0;
-            let mut i = 0;
-            while i < n {
-                symbols[write] = symbols[i];
-                write += 1;
-                i = next[i] as usize;
-            }
-            write
+            compact(symbols, &next, n)
         }
 
         /// Local copy of the R3d speculative NEON merge (must mirror
@@ -2627,78 +2720,15 @@ mod walker_edge {
             symbols: &mut [TokenId; SHORT_MERGE_MAX],
             n: usize,
         ) -> usize {
-            use core::arch::aarch64::{vld1q_u32, vminq_u32, vminvq_u32};
-            const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
             const NO_TAG: u32 = u32::MAX;
             let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
-            if n == 2 {
-                let r = table.rank(symbols[0], symbols[1]);
-                if r == u32::MAX {
-                    return 2;
-                }
-                symbols[0] = TokenId(r);
-                return 1;
+            if let Some(len) = fast_small(table, symbols, n) {
+                return len;
             }
-            if n == 3 {
-                let r0 = table.rank(symbols[0], symbols[1]);
-                let r1 = table.rank(symbols[1], symbols[2]);
-                if r0 == u32::MAX && r1 == u32::MAX {
-                    return 3;
-                }
-                let c0 = if r0 != u32::MAX {
-                    table.rank(TokenId(r0), symbols[2])
-                } else {
-                    u32::MAX
-                };
-                let c1 = if r1 != u32::MAX {
-                    table.rank(symbols[0], TokenId(r1))
-                } else {
-                    u32::MAX
-                };
-                let first_left = r0 <= r1;
-                let c = if first_left { c0 } else { c1 };
-                if c != u32::MAX {
-                    symbols[0] = TokenId(c);
-                    return 1;
-                }
-                if first_left {
-                    symbols[0] = TokenId(r0);
-                    symbols[1] = symbols[2];
-                } else {
-                    symbols[1] = TokenId(r1);
-                }
-                return 2;
-            }
-            let mut next = [0u8; SHORT_MERGE_MAX];
-            let mut prev = [0u8; SHORT_MERGE_MAX];
-            for i in 0..n {
-                next[i] = (i + 1) as u8;
-                prev[i] = (i as u8).wrapping_sub(1);
-            }
+            let (mut next, mut prev) = init_links(n);
             let mut pr = [u32::MAX; SHORT_MERGE_MAX];
             let pairs = n - 1;
-            let mut i = 0;
-            while i + 4 <= pairs {
-                let (r0, r1, r2, r3) = unsafe {
-                    let s = symbols.as_ptr();
-                    (
-                        table.rank(*s.add(i), *s.add(i + 1)),
-                        table.rank(*s.add(i + 1), *s.add(i + 2)),
-                        table.rank(*s.add(i + 2), *s.add(i + 3)),
-                        table.rank(*s.add(i + 3), *s.add(i + 4)),
-                    )
-                };
-                pr[i] = pack(r0, i);
-                pr[i + 1] = pack(r1, i + 1);
-                pr[i + 2] = pack(r2, i + 2);
-                pr[i + 3] = pack(r3, i + 3);
-                i += 4;
-            }
-            while i < pairs {
-                let (a, b) = unsafe { (*symbols.get_unchecked(i), *symbols.get_unchecked(i + 1)) };
-                pr[i] = pack(table.rank(a, b), i);
-                i += 1;
-            }
+            fill_round1(table, symbols, pairs, &mut pr);
             let mut lspec = [u32::MAX; SHORT_MERGE_MAX];
             let mut rspec = [u32::MAX; SHORT_MERGE_MAX];
             let mut ltag = [NO_TAG; SHORT_MERGE_MAX];
@@ -2721,17 +2751,7 @@ mod walker_edge {
             }
             let narrow = n <= 8;
             loop {
-                let best = unsafe {
-                    let p = pr.as_ptr();
-                    let m01 = vminq_u32(vld1q_u32(p), vld1q_u32(p.add(4)));
-                    let m = if narrow {
-                        m01
-                    } else {
-                        let m23 = vminq_u32(vld1q_u32(p.add(8)), vld1q_u32(p.add(12)));
-                        vminq_u32(m01, m23)
-                    };
-                    vminvq_u32(m)
-                };
+                let best = scan_min(&pr, narrow);
                 if best >= NO_MERGE_FLOOR {
                     break;
                 }
@@ -2804,14 +2824,7 @@ mod walker_edge {
                     }
                 }
             }
-            let mut write = 0;
-            let mut i = 0;
-            while i < n {
-                symbols[write] = symbols[i];
-                write += 1;
-                i = next[i] as usize;
-            }
-            write
+            compact(symbols, &next, n)
         }
 
         /// Candidate: branchless full-maintenance speculation. No tags, no
@@ -2827,47 +2840,10 @@ mod walker_edge {
             symbols: &mut [TokenId; SHORT_MERGE_MAX],
             n: usize,
         ) -> usize {
-            use core::arch::aarch64::{vld1q_u32, vminq_u32, vminvq_u32};
-            const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
             const S: usize = SHORT_MERGE_MAX - 1; // sentinel position
             let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
-            if n == 2 {
-                let r = table.rank(symbols[0], symbols[1]);
-                if r == u32::MAX {
-                    return 2;
-                }
-                symbols[0] = TokenId(r);
-                return 1;
-            }
-            if n == 3 {
-                let r0 = table.rank(symbols[0], symbols[1]);
-                let r1 = table.rank(symbols[1], symbols[2]);
-                if r0 == u32::MAX && r1 == u32::MAX {
-                    return 3;
-                }
-                let c0 = if r0 != u32::MAX {
-                    table.rank(TokenId(r0), symbols[2])
-                } else {
-                    u32::MAX
-                };
-                let c1 = if r1 != u32::MAX {
-                    table.rank(symbols[0], TokenId(r1))
-                } else {
-                    u32::MAX
-                };
-                let first_left = r0 <= r1;
-                let c = if first_left { c0 } else { c1 };
-                if c != u32::MAX {
-                    symbols[0] = TokenId(c);
-                    return 1;
-                }
-                if first_left {
-                    symbols[0] = TokenId(r0);
-                    symbols[1] = symbols[2];
-                } else {
-                    symbols[1] = TokenId(r1);
-                }
-                return 2;
+            if let Some(len) = fast_small(table, symbols, n) {
+                return len;
             }
             let mut next = [S as u8; SHORT_MERGE_MAX];
             let mut prev = [S as u8; SHORT_MERGE_MAX];
@@ -2880,28 +2856,7 @@ mod walker_edge {
             symbols[S] = TokenId(0); // harmless junk operand
             let mut pr = [u32::MAX; SHORT_MERGE_MAX];
             let pairs = n - 1;
-            let mut i = 0;
-            while i + 4 <= pairs {
-                let (r0, r1, r2, r3) = unsafe {
-                    let s = symbols.as_ptr();
-                    (
-                        table.rank(*s.add(i), *s.add(i + 1)),
-                        table.rank(*s.add(i + 1), *s.add(i + 2)),
-                        table.rank(*s.add(i + 2), *s.add(i + 3)),
-                        table.rank(*s.add(i + 3), *s.add(i + 4)),
-                    )
-                };
-                pr[i] = pack(r0, i);
-                pr[i + 1] = pack(r1, i + 1);
-                pr[i + 2] = pack(r2, i + 2);
-                pr[i + 3] = pack(r3, i + 3);
-                i += 4;
-            }
-            while i < pairs {
-                let (a, b) = unsafe { (*symbols.get_unchecked(i), *symbols.get_unchecked(i + 1)) };
-                pr[i] = pack(table.rank(a, b), i);
-                i += 1;
-            }
+            fill_round1(table, symbols, pairs, &mut pr);
             // Wave-2: both would-be neighbor ranks for every pair,
             // branchless (unconditional lookups, csel-forced results).
             let mut lspec = [u32::MAX; SHORT_MERGE_MAX];
@@ -2918,17 +2873,7 @@ mod walker_edge {
             }
             let narrow = n <= 8;
             loop {
-                let best = unsafe {
-                    let p = pr.as_ptr();
-                    let m01 = vminq_u32(vld1q_u32(p), vld1q_u32(p.add(4)));
-                    let m = if narrow {
-                        m01
-                    } else {
-                        let m23 = vminq_u32(vld1q_u32(p.add(8)), vld1q_u32(p.add(12)));
-                        vminq_u32(m01, m23)
-                    };
-                    vminvq_u32(m)
-                };
+                let best = scan_min(&pr, narrow);
                 if best >= NO_MERGE_FLOOR {
                     break;
                 }
@@ -2983,14 +2928,7 @@ mod walker_edge {
                 let f = table.rank(mt, qid);
                 lspec[q] = if fq { f } else { u32::MAX };
             }
-            let mut write = 0;
-            let mut i = 0;
-            while i < n {
-                symbols[write] = symbols[i];
-                write += 1;
-                i = next[i] as usize;
-            }
-            write
+            compact(symbols, &next, n)
         }
 
         /// Candidate: n2/n3 fast paths + demand merge loop (as old) +
@@ -3005,77 +2943,14 @@ mod walker_edge {
             symbols: &mut [TokenId; SHORT_MERGE_MAX],
             n: usize,
         ) -> usize {
-            use core::arch::aarch64::{vld1q_u32, vminq_u32, vminvq_u32};
-            const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
             let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
-            if n == 2 {
-                let r = table.rank(symbols[0], symbols[1]);
-                if r == u32::MAX {
-                    return 2;
-                }
-                symbols[0] = TokenId(r);
-                return 1;
+            if let Some(len) = fast_small(table, symbols, n) {
+                return len;
             }
-            if n == 3 {
-                let r0 = table.rank(symbols[0], symbols[1]);
-                let r1 = table.rank(symbols[1], symbols[2]);
-                if r0 == u32::MAX && r1 == u32::MAX {
-                    return 3;
-                }
-                let c0 = if r0 != u32::MAX {
-                    table.rank(TokenId(r0), symbols[2])
-                } else {
-                    u32::MAX
-                };
-                let c1 = if r1 != u32::MAX {
-                    table.rank(symbols[0], TokenId(r1))
-                } else {
-                    u32::MAX
-                };
-                let first_left = r0 <= r1;
-                let c = if first_left { c0 } else { c1 };
-                if c != u32::MAX {
-                    symbols[0] = TokenId(c);
-                    return 1;
-                }
-                if first_left {
-                    symbols[0] = TokenId(r0);
-                    symbols[1] = symbols[2];
-                } else {
-                    symbols[1] = TokenId(r1);
-                }
-                return 2;
-            }
-            let mut next = [0u8; SHORT_MERGE_MAX];
-            let mut prev = [0u8; SHORT_MERGE_MAX];
-            for i in 0..n {
-                next[i] = (i + 1) as u8;
-                prev[i] = (i as u8).wrapping_sub(1);
-            }
+            let (mut next, mut prev) = init_links(n);
             let mut pr = [u32::MAX; SHORT_MERGE_MAX];
             let pairs = n - 1;
-            let mut i = 0;
-            while i + 4 <= pairs {
-                let (r0, r1, r2, r3) = unsafe {
-                    let s = symbols.as_ptr();
-                    (
-                        table.rank(*s.add(i), *s.add(i + 1)),
-                        table.rank(*s.add(i + 1), *s.add(i + 2)),
-                        table.rank(*s.add(i + 2), *s.add(i + 3)),
-                        table.rank(*s.add(i + 3), *s.add(i + 4)),
-                    )
-                };
-                pr[i] = pack(r0, i);
-                pr[i + 1] = pack(r1, i + 1);
-                pr[i + 2] = pack(r2, i + 2);
-                pr[i + 3] = pack(r3, i + 3);
-                i += 4;
-            }
-            while i < pairs {
-                let (a, b) = unsafe { (*symbols.get_unchecked(i), *symbols.get_unchecked(i + 1)) };
-                pr[i] = pack(table.rank(a, b), i);
-                i += 1;
-            }
+            fill_round1(table, symbols, pairs, &mut pr);
             // Wave-2 prefetch: the lines the two refresh lookups of each
             // pair's would-be merge would read. Clamped junk (id 0 /
             // repeated neighbor) prefetches are harmless hot lines.
@@ -3091,17 +2966,7 @@ mod walker_edge {
             }
             let narrow = n <= 8;
             loop {
-                let best = unsafe {
-                    let p = pr.as_ptr();
-                    let m01 = vminq_u32(vld1q_u32(p), vld1q_u32(p.add(4)));
-                    let m = if narrow {
-                        m01
-                    } else {
-                        let m23 = vminq_u32(vld1q_u32(p.add(8)), vld1q_u32(p.add(12)));
-                        vminq_u32(m01, m23)
-                    };
-                    vminvq_u32(m)
-                };
+                let best = scan_min(&pr, narrow);
                 if best >= NO_MERGE_FLOOR {
                     break;
                 }
@@ -3141,14 +3006,7 @@ mod walker_edge {
                     table.prefetch_pair(wid, symbols[qc]);
                 }
             }
-            let mut write = 0;
-            let mut i = 0;
-            while i < n {
-                symbols[write] = symbols[i];
-                write += 1;
-                i = next[i] as usize;
-            }
-            write
+            compact(symbols, &next, n)
         }
 
         /// Old algorithm + the n==2/n==3 fast paths only (attribution).
@@ -3157,43 +3015,8 @@ mod walker_edge {
             symbols: &mut [TokenId; SHORT_MERGE_MAX],
             n: usize,
         ) -> usize {
-            if n == 2 {
-                let r = table.rank(symbols[0], symbols[1]);
-                if r == u32::MAX {
-                    return 2;
-                }
-                symbols[0] = TokenId(r);
-                return 1;
-            }
-            if n == 3 {
-                let r0 = table.rank(symbols[0], symbols[1]);
-                let r1 = table.rank(symbols[1], symbols[2]);
-                if r0 == u32::MAX && r1 == u32::MAX {
-                    return 3;
-                }
-                let c0 = if r0 != u32::MAX {
-                    table.rank(TokenId(r0), symbols[2])
-                } else {
-                    u32::MAX
-                };
-                let c1 = if r1 != u32::MAX {
-                    table.rank(symbols[0], TokenId(r1))
-                } else {
-                    u32::MAX
-                };
-                let first_left = r0 <= r1;
-                let c = if first_left { c0 } else { c1 };
-                if c != u32::MAX {
-                    symbols[0] = TokenId(c);
-                    return 1;
-                }
-                if first_left {
-                    symbols[0] = TokenId(r0);
-                    symbols[1] = symbols[2];
-                } else {
-                    symbols[1] = TokenId(r1);
-                }
-                return 2;
+            if let Some(len) = fast_small(table, symbols, n) {
+                return len;
             }
             old_neon(table, symbols, n)
         }

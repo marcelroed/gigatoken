@@ -55,11 +55,9 @@ def run_sample(binary: str, encode_mb: int, passes: int) -> tuple[int, float]:
     env["ENCODE_MB"] = str(encode_mb)
     if passes > 1:
         env["ENCODE_PASSES"] = str(passes)
-    t0 = time.time()
     proc = subprocess.run(
         [binary], env=env, capture_output=True, text=True, check=False
     )
-    wall = time.time() - t0
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise RuntimeError(f"{binary} exited {proc.returncode}")

@@ -582,7 +582,7 @@ def main():
             )
             for sym, w in incl.most_common(10):
                 f.write(f"{gpct(w):6.1f}%  {sym}\n")
-            f.write(f"\n== Top inline leaves (finest attribution) ==\n")
+            f.write("\n== Top inline leaves (finest attribution) ==\n")
             for (sym, file, ctx), w in leaf_w[g].most_common(15):
                 floc = f"  [{os.path.basename(file) if file else '?'}]"
                 ctx_s = f"  <- {ctx}" if ctx else ""
