@@ -230,7 +230,38 @@ impl PairRankTable {
             slots[idx] = (key << PAIR_ID_BITS) | m.0 as u64;
         }
 
-        Some(PairRankTable { dense, dense_log2, slots, mask, shift })
+        Some(PairRankTable {
+            dense,
+            dense_log2,
+            slots,
+            mask,
+            shift,
+        })
+    }
+
+    /// Prefetch the cache line a [`Self::rank`] of `(a, b)` would read
+    /// first (the dense cell, or the flat table's first probe slot), into
+    /// L1. Used by the short-merge speculation: the addresses of the next
+    /// round's lookups are computable from already-known rank values, so
+    /// prefetching them costs a few ALU ops and no result dependency,
+    /// while the later demand load hits L1 instead of L2.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub(crate) fn prefetch_pair(&self, a: TokenId, b: TokenId) {
+        let ptr: *const u8 = if (a.0 | b.0) >> self.dense_log2 == 0 {
+            let idx = ((a.0 as usize) << self.dense_log2) | b.0 as usize;
+            // SAFETY: both IDs < 2^dense_log2 => idx < dense.len().
+            unsafe { self.dense.as_ptr().add(idx) as *const u8 }
+        } else {
+            let key = ((a.0 as u64) << PAIR_ID_BITS) | b.0 as u64;
+            let idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize;
+            // SAFETY: idx < slots.len() (shift keeps log2(len) bits).
+            unsafe { self.slots.as_ptr().add(idx) as *const u8 }
+        };
+        // SAFETY: prfm is architecturally a hint; any address is safe.
+        unsafe {
+            core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(nostack, readonly));
+        }
     }
 
     /// Merged token ID of the pair `(a, b)`, or `u32::MAX` when it does not
@@ -631,6 +662,38 @@ pub(crate) fn bpe_merge_symbols_short_scalar(
 /// [`bpe_merge_symbols_short_scalar`], and 16..=32-symbol sequences take
 /// the Vec-based [`bpe_merge_symbols_small`] — the three are deliberately
 /// not unified (disjoint domains; see `bpe_merge_symbols_short_scalar`).
+///
+/// # R3d: fast n=2/n=3 paths + wave-2 rank-line prefetch
+///
+/// Two additions from the R3d miss-merge experiment (both aimed at the
+/// merge loop's serial chain — one dependent L2-latency rank load per
+/// merge round, ~5.5 rounds per miss):
+///
+/// - `n == 2` / `n == 3` run written-out merge chains with no linked
+///   list, no `pr` array, and no NEON scan; the n=3 second-round lookups
+///   for both possible winners are issued together so the winner select
+///   is branch-free.
+/// - After the round-1 rank burst, the lines that the *next* rounds'
+///   refresh lookups would touch are prefetched (`prfm pldl1keep` via
+///   [`PairRankTable::prefetch_pair`]): a pair with round-1 rank `m`
+///   would, if merged, refresh `(left_sym, m)` and `(m, right_sym)` —
+///   addresses computable from wave-1 values alone, so all prefetches
+///   issue with full memory-level parallelism and no result registers.
+///   The demand loads in the (unchanged) merge loop then hit L1 or an
+///   in-flight fill instead of L2.
+///
+/// Full *value* speculation of those neighbor ranks (tag-validated or
+/// branchless always-maintained) was measured 25..140% SLOWER on the
+/// real 100 MB-OWT miss population: after the R2α grid shrink a
+/// dependent level costs only ~6 ns, so the whole chain is a minority of
+/// the ~130-200 ns miss, and the 12-38 extra rank *loads* (plus their
+/// unpredictable finiteness/tag branches) cost far more than the 3
+/// chain levels they remove. Prefetch keeps the speculative addresses
+/// but drops the result dependency, the forcing selects, and the flat
+/// probe walk — a handful of ALU ops per pair. See
+/// `r3d_miss_microbench` in `tiktoken.rs` for the harness and numbers,
+/// and `short_neon_speculative_differential_gpt2` for why the classic
+/// local-minima parallel merge is unsound on real tables.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn bpe_merge_symbols_short_neon(
     table: &PairRankTable,
@@ -642,6 +705,54 @@ pub(crate) fn bpe_merge_symbols_short_neon(
     /// Every packed value at or above this has rank u32::MAX (no merge).
     const NO_MERGE_FLOOR: u32 = u32::MAX << 8;
     let pack = |rank: u32, i: usize| (rank << 8) | i as u32;
+
+    // n == 2 and n == 3 (~3% of OWT misses, more of the vocab-seed
+    // merges) skip the list + scan setup entirely; strictly less work,
+    // no downside for larger n.
+    if n == 2 {
+        let r = table.rank(symbols[0], symbols[1]);
+        if r == u32::MAX {
+            return 2;
+        }
+        symbols[0] = TokenId(r);
+        return 1;
+    }
+    if n == 3 {
+        let r0 = table.rank(symbols[0], symbols[1]);
+        let r1 = table.rank(symbols[1], symbols[2]);
+        if r0 == u32::MAX && r1 == u32::MAX {
+            return 3;
+        }
+        // Equal finite ranks only arise for identical pairs; the
+        // sequential scan takes the lower position, so `<=` is
+        // leftmost-wins. Both possible second-round lookups are issued
+        // before the winner is known — they are independent, and the
+        // final select is branch-free.
+        let c0 = if r0 != u32::MAX {
+            table.rank(TokenId(r0), symbols[2])
+        } else {
+            u32::MAX
+        };
+        let c1 = if r1 != u32::MAX {
+            table.rank(symbols[0], TokenId(r1))
+        } else {
+            u32::MAX
+        };
+        let first_left = r0 <= r1;
+        let c = if first_left { c0 } else { c1 };
+        if c != u32::MAX {
+            symbols[0] = TokenId(c);
+            return 1;
+        }
+        if first_left {
+            symbols[0] = TokenId(r0);
+            symbols[1] = symbols[2];
+        } else {
+            symbols[1] = TokenId(r1);
+        }
+        return 2;
+    }
+
     // Stack-resident doubly-linked list; see `bpe_merge_symbols_small`.
     let mut next = [0u8; SHORT_MERGE_MAX];
     let mut prev = [0u8; SHORT_MERGE_MAX];
@@ -657,10 +768,8 @@ pub(crate) fn bpe_merge_symbols_short_neon(
     // with every grid load of the burst in flight at once. A rolled loop
     // keeps one load in flight per iteration and carries a bounds check
     // LLVM cannot fold (`symbols[i + 1]` being bounded by a runtime `n`),
-    // and on the miss path each grid load is an L2/L3-latency random
-    // access into the 16 MiB dense table. The merge loop's later rank
-    // lookups stay serial by construction: each depends on the merge
-    // before it.
+    // and on the miss path each grid load is an L2-latency random access
+    // into the dense table.
     let mut pr = [u32::MAX; SHORT_MERGE_MAX];
     let pairs = n - 1;
     let mut i = 0;
@@ -687,6 +796,19 @@ pub(crate) fn bpe_merge_symbols_short_neon(
         let (a, b) = unsafe { (*symbols.get_unchecked(i), *symbols.get_unchecked(i + 1)) };
         pr[i] = pack(table.rank(a, b), i);
         i += 1;
+    }
+    // Wave-2 prefetch: for each pair that can merge, the two lines its
+    // merge's refresh lookups would read. Ids of no-merge pairs are
+    // clamped to 0 and out-of-range neighbors to an adjacent live one, so
+    // the loop is select-only (no data-dependent branches) and junk
+    // prefetches land on hot lines.
+    for (i, &prv) in pr.iter().enumerate().take(pairs) {
+        let fin = prv < NO_MERGE_FLOOR;
+        let mid = TokenId(if fin { prv >> 8 } else { 0 });
+        let li = i.saturating_sub(1);
+        table.prefetch_pair(symbols[li], mid);
+        let ri = if i + 2 < n { i + 2 } else { i + 1 };
+        table.prefetch_pair(mid, symbols[ri]);
     }
     // Lanes at index >= n stay u32::MAX forever (initial pairs sit below
     // n - 1; the loop below only writes lanes < n), so short pretokens

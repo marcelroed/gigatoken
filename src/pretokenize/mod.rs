@@ -53,7 +53,7 @@ pub fn pretokenize_as_iter(bytes: &[u8]) -> FastR50kPretokenizer<'_> {
 
 /// Chunk size of [`PretokenSpans::fill_spans_keyed`] — the live entries of
 /// one [`SpanBatch`] fill.
-pub const PRETOKEN_CHUNK: usize = 256;
+pub const PRETOKEN_CHUNK: usize = 512;
 
 /// Both 64-bit halves of the per-length pack mask, in scalar ALU ops. A
 /// u128 `MAX >> s` lowers to a multi-instruction sequence and the 16-entry
