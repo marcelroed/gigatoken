@@ -148,9 +148,17 @@ def _subset_docs(docs: list[bytes], limit_bytes: int | None) -> tuple[list[bytes
     return subset, False
 
 
+def _label(name: str) -> str:
+    """A right-aligned row label, styled after padding so the ANSI codes
+    don't count against the field width."""
+    return typer.style(f"{name:>9}", fg=typer.colors.CYAN, bold=True)
+
+
 def _report(name: str, seconds: float, n_bytes: int, n_tokens: int) -> None:
+    mb_per_s = typer.style(f"{n_bytes / 1e6 / seconds:8.2f}", fg=typer.colors.GREEN, bold=True)
+    mtok_per_s = typer.style(f"{n_tokens / 1e6 / seconds:7.2f}", fg=typer.colors.GREEN, bold=True)
     typer.echo(
-        f"{name:>9}: {seconds:8.3f} s | {n_bytes / 1e6:10.2f} MB at {n_bytes / 1e6 / seconds:8.2f} MB/s | {n_tokens / 1e6:8.2f} Mtok at {n_tokens / 1e6 / seconds:7.2f} Mtok/s"
+        f"{_label(name)}: {seconds:8.3f} s | {n_bytes / 1e6:10.2f} MB at {mb_per_s} MB/s | {n_tokens / 1e6:8.2f} Mtok at {mtok_per_s} Mtok/s"
     )
 
 
@@ -173,7 +181,7 @@ def bench(
         raise typer.BadParameter("--comparison-limit requires --compare-to hf (or --validate)")
     limit_bytes = _parse_size(comparison_limit) if comparison_limit is not None else None
 
-    typer.echo(f"{'cpu':>9}: {_cpu_info()}")
+    typer.echo(f"{_label('cpu')}: {_cpu_info()}")
 
     import awkward as ak
 
@@ -209,12 +217,12 @@ def bench(
     # same documents, always in memory.
     hf_json = gt_tokenizer._hf_json
     if hf_json is None:
-        typer.echo("error: --compare-to hf needs a tokenizer with a HuggingFace configuration (.tiktoken files are not supported)", err=True)
+        typer.secho("error: --compare-to hf needs a tokenizer with a HuggingFace configuration (.tiktoken files are not supported)", fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
     try:
         from tokenizers import Tokenizer as HFTokenizer
     except ModuleNotFoundError:
-        typer.echo("error: --compare-to hf requires the `tokenizers` package (pip install tokenizers)", err=True)
+        typer.secho("error: --compare-to hf requires the `tokenizers` package (pip install tokenizers)", fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
     hf_tokenizer = HFTokenizer.from_str(hf_json.decode("utf-8") if isinstance(hf_json, bytes) else hf_json)
 
@@ -224,7 +232,7 @@ def bench(
     docs = _read_docs(files, separator)
     subset, last_truncated = _subset_docs(docs, limit_bytes)
     if not subset:
-        typer.echo("error: --comparison-limit is smaller than the first document; nothing to compare", err=True)
+        typer.secho("error: --comparison-limit is smaller than the first document; nothing to compare", fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
     subset_bytes = sum(len(doc) for doc in subset)
     hf_docs = [doc.decode("utf-8") for doc in subset]  # tokenizers only accepts str
@@ -234,7 +242,9 @@ def bench(
     hf_seconds = time.perf_counter() - start
     hf_ids = [encoding.ids for encoding in hf_encodings]
     _report("hf", hf_seconds, subset_bytes, sum(len(ids) for ids in hf_ids))
-    typer.echo(f"gigatoken is {(gt_bytes / gt_seconds) / (subset_bytes / hf_seconds):.2f}x faster than hf")
+    speedup = (gt_bytes / gt_seconds) / (subset_bytes / hf_seconds)
+    speedup_text = typer.style(f"{speedup:.2f}x", fg=typer.colors.GREEN if speedup >= 1 else typer.colors.RED, bold=True)
+    typer.echo(f"gigatoken is {speedup_text} {'faster' if speedup >= 1 else 'slower'} than hf")
 
     if not validate:
         return
@@ -250,15 +260,17 @@ def bench(
                 continue
         if gt_doc != hf_doc:
             mismatch = next((i for i, (a, b) in enumerate(zip(gt_doc, hf_doc)) if a != b), min(len(gt_doc), len(hf_doc)))
-            typer.echo(
+            typer.secho(
                 f"validation FAILED: document {index}: first mismatch at token {mismatch} "
                 f"(gigatoken {gt_doc[mismatch : mismatch + 5]}... vs hf {hf_doc[mismatch : mismatch + 5]}..., "
                 f"lengths {len(gt_doc)} vs {len(hf_doc)})",
+                fg=typer.colors.RED,
+                bold=True,
                 err=True,
             )
             raise typer.Exit(1)
     guard_note = f" (last {_TRUNCATION_GUARD_TOKENS} tokens of the truncated final document ignored)" if last_truncated else ""
-    typer.echo(f"validation OK: {len(subset)} documents match{guard_note}")
+    typer.echo(typer.style(f"validation OK: {len(subset)} documents match", fg=typer.colors.GREEN) + guard_note)
 
 
 if __name__ == "__main__":
