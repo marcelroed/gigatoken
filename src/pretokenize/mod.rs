@@ -397,6 +397,17 @@ pub unsafe trait PretokenSpans<'a> {
     /// end to end: the extra multiply sits on the probe loop's critical
     /// path, while this loop has store slots to spare.)
     fn fill_spans_keyed(&mut self, batch: &mut SpanBatch<'a>, prefetch: &impl Fn(u64)) -> usize;
+
+    /// Total input bytes this source will still yield, when it knows
+    /// (sources walking one backing slice: slice length minus the
+    /// consumed prefix; `None` — the default — otherwise). The encode
+    /// loop reads this once, before the first fill, to pre-size its miss
+    /// caches (see `Tokenizer::reserve_caches_for_input`). A capacity
+    /// hint only, free to over- or undershoot: the caches grow on demand
+    /// regardless, so a wrong estimate changes allocation, never results.
+    fn remaining_bytes_hint(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Shared body of the iterator-backed [`PretokenSpans`] implementations

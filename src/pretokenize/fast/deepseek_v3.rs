@@ -97,6 +97,11 @@ unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastDeepSeekV3Pretoken
         self.pos = pos;
         n
     }
+
+    #[inline]
+    fn remaining_bytes_hint(&self) -> Option<usize> {
+        Some(self.bytes.len().saturating_sub(self.pos))
+    }
 }
 
 /// If the char at `pos` is `\p{L}` or `\p{M}` within the region, return the

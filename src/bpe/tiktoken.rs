@@ -100,27 +100,48 @@ fn nfc_segment<'a>(seg: &'a [u8], buf: &'a mut String) -> &'a [u8] {
 }
 
 /// Cache-value packing (shared by the short-pretoken table and decode in
-/// the encode loop). `val` low byte: token count in bits 0-6 plus a
-/// "spilled" flag in bit 7. Inline values (1-4 tokens; only the first ID
-/// must fit 24 bits — true of every real vocab) carry tokens 1-2 in `val`
-/// bits 8-31 and 32-63 and tokens 3-4 in `ext`'s two u32 lanes; spilled
-/// values carry the token-arena offset in `val`'s high 32 bits and leave
-/// `ext` unused.
-const VAL_SPILL: u64 = 0x80;
+/// the encode loop). `val` is emit-ready: token 1 in bits 0-23 (only the
+/// first ID must fit 24 bits — true of every real vocab) and token 2 in
+/// bits 32-63, exactly the two u32 lanes the probe/emit loop stores for
+/// every hit, so the hot loop's lane store is one AND clearing the
+/// metadata byte instead of a shift/OR re-pack. That byte carries the
+/// token count in bits 24-30 plus a "spilled" flag in bit 31; tokens 3-4
+/// ride `ext`'s two u32 lanes verbatim, and spilled values leave bits
+/// 0-23 zero and carry the token-arena offset in `val`'s high 32 bits.
+/// Every real entry has `val != 0` (a nonzero count or the spill flag),
+/// and a real inline entry's low 32 bits land in [1, 2^31) (count in bits
+/// 24-30, spill flag in bit 31), so the emit loop's fast predicate —
+/// inline ∧ not the empty-slot false hit — is one unsigned range test on
+/// `val`'s low half instead of separate spill/zero checks.
+const VAL_SPILL: u64 = 0x8000_0000;
+
+/// Clears `val`'s metadata byte (count + spill flag, bits 24-31), leaving
+/// the emit-ready token-1/token-2 lanes. One AArch64 logical-and
+/// immediate (a rotated run of 56 ones), replacing the two-op
+/// shift/mask/OR the old layout needed per probe hit.
+const VAL_TOKEN_MASK: u64 = 0xFFFF_FFFF_00FF_FFFF;
+
+/// Maximum token count one short pretoken (≤ 15 bytes) can encode to:
+/// merges only ever reduce the ≤ 15 seeded byte symbols. Bounds every
+/// short-route emit in the probe/emit loop (fast lanes, spill copies,
+/// miss results), which is what sizes the loop's output slack: reserving
+/// `SHORT_EMIT_MAX` tokens per chunk pretoken covers every short slow-path
+/// event of the chunk, so only the (unbounded) long route ever reserves.
+const SHORT_EMIT_MAX: usize = SHORT_MERGE_MAX - 1;
 
 #[inline(always)]
 fn pack_val_inline(symbols: &[TokenId]) -> Option<(u64, u64)> {
     match *symbols {
-        [a] if a.0 < (1 << 24) => Some((1 | ((a.0 as u64) << 8), 0)),
+        [a] if a.0 < (1 << 24) => Some(((1 << 24) | a.0 as u64, 0)),
         [a, b] if a.0 < (1 << 24) => {
-            Some((2 | ((a.0 as u64) << 8) | ((b.0 as u64) << 32), 0))
+            Some(((2 << 24) | a.0 as u64 | ((b.0 as u64) << 32), 0))
         }
         [a, b, c] if a.0 < (1 << 24) => Some((
-            3 | ((a.0 as u64) << 8) | ((b.0 as u64) << 32),
+            (3 << 24) | a.0 as u64 | ((b.0 as u64) << 32),
             c.0 as u64,
         )),
         [a, b, c, d] if a.0 < (1 << 24) => Some((
-            4 | ((a.0 as u64) << 8) | ((b.0 as u64) << 32),
+            (4 << 24) | a.0 as u64 | ((b.0 as u64) << 32),
             c.0 as u64 | ((d.0 as u64) << 32),
         )),
         _ => None,
@@ -134,18 +155,6 @@ fn pack_val_inline(symbols: &[TokenId]) -> Option<(u64, u64)> {
 fn token_ids_as_u32s(toks: &[TokenId]) -> &[u32] {
     // SAFETY: TokenId is #[repr(transparent)] over u32.
     unsafe { std::slice::from_raw_parts(toks.as_ptr() as *const u32, toks.len()) }
-}
-
-/// Unpack an inline value's four token lanes (lanes past the count are
-/// another key's leftovers; callers truncate by the count).
-#[inline(always)]
-fn unpack_val_lanes(val: u64, ext: u64) -> [u32; 4] {
-    [
-        (val >> 8) as u32 & 0xFF_FFFF,
-        (val >> 32) as u32,
-        ext as u32,
-        (ext >> 32) as u32,
-    ]
 }
 
 /// Overwrite the short-cache entry of every added-token content of 1..=15
@@ -346,8 +355,8 @@ impl Tokenizer {
 
     /// BPE-encode one short pretoken (1..=15 bytes) into `buf`, returning
     /// its token count: byte remapping, then the short merge loop. This is
-    /// exactly the computation [`Self::encode_pretoken_miss`] performs for
-    /// short keys — shared with [`Self::seeded_pretoken_cache`] so the
+    /// exactly the computation [`Self::encode_pretoken_miss_short`]
+    /// performs — shared with [`Self::seeded_pretoken_cache`] so the
     /// vocab seed can never disagree with a cold miss.
     #[inline]
     fn merge_short(
@@ -402,7 +411,7 @@ impl Tokenizer {
         pack_val_inline(symbols).unwrap_or_else(|| {
             let offset = token_arena.len() as u64;
             token_arena.extend_from_slice(symbols);
-            (VAL_SPILL | symbols.len() as u64 | (offset << 32), 0)
+            (VAL_SPILL | ((symbols.len() as u64) << 24) | (offset << 32), 0)
         })
     }
 
@@ -515,6 +524,38 @@ impl Tokenizer {
             added_matcher: self.added_matcher.clone(),
             normalize_nfc: self.normalize_nfc,
             ignore_merges: self.ignore_merges,
+        }
+    }
+
+    /// Pre-size the miss caches for `expected_bytes` of upcoming input,
+    /// from the same Heaps'-law distinct-pretoken estimate as
+    /// [`Self::fork_sized`] (distinct(n) ≈ 3.45·n^0.62, calibrated on OWT)
+    /// but without its per-worker headroom and 2^22-slot clamp: the
+    /// single-pass cache sees the whole input, and pow2 rounding at the
+    /// 3/4-load threshold provides the slack. A cold 10 GB run otherwise
+    /// doubles its short table ~7 times en route to 2^23 slots,
+    /// re-zeroing ~512 MB across the ladder and re-walking ~6.4M live
+    /// entries into DRAM-cold allocations; sizing once pays a single grow
+    /// of the ~50k-entry seed table. Capacity hints only: every structure
+    /// still grows on demand, so a wrong estimate (more or fewer distinct
+    /// pretokens than OWT-like text) changes allocation, never results.
+    /// The distinct clamp bounds the pre-sized table at 2^24 slots
+    /// (512 MB) for pathological inputs; the table grows past it as ever.
+    ///
+    /// Driven by [`PretokenSpans::remaining_bytes_hint`] at the top of
+    /// both encode loops; repeated calls (one per added-token segment)
+    /// are cheap no-ops once the capacities suffice.
+    fn reserve_caches_for_input(&mut self, expected_bytes: usize) {
+        let distinct = (3.45 * (expected_bytes as f64).powf(0.62)) as usize;
+        self.pretoken_cache.reserve_entries(distinct.min(1 << 23));
+        let arena_cap = (expected_bytes / 256).min(1 << 24);
+        if self.token_arena.capacity() < arena_cap {
+            self.token_arena.reserve(arena_cap - self.token_arena.len());
+        }
+        let long_cap = (expected_bytes / 8192).min(1 << 20);
+        if self.pretoken_cache_long.capacity() < long_cap {
+            self.pretoken_cache_long
+                .reserve(long_cap - self.pretoken_cache_long.len());
         }
     }
 
@@ -793,6 +834,9 @@ impl Tokenizer {
         mut pretokens: impl PretokenSpans<'i>,
         mut f: impl FnMut(&[TokenId]),
     ) {
+        if let Some(hint) = pretokens.remaining_bytes_hint() {
+            self.reserve_caches_for_input(hint);
+        }
         let mut batch = SpanBatch::new();
         let mut out: Vec<u32> = Vec::new();
         let mut ends = [0usize; PRETOKEN_CHUNK];
@@ -840,6 +884,9 @@ impl Tokenizer {
         mut pretokens: impl PretokenSpans<'i>,
         out: &mut Vec<u32>,
     ) {
+        if let Some(hint) = pretokens.remaining_bytes_hint() {
+            self.reserve_caches_for_input(hint);
+        }
         let mut batch = SpanBatch::new();
         loop {
             let cache = &self.pretoken_cache;
@@ -866,10 +913,13 @@ impl Tokenizer {
     /// (per-pretoken slicing in [`Self::memoized_encode`]; a no-op closure
     /// in the flat variant).
     ///
-    /// Slack invariant: `out.capacity() >= cursor + 4 * (iterations
-    /// left)`, established by the reserve below and re-established by the
-    /// slow path after any reallocation, so the two 8-byte stores are
-    /// always in bounds.
+    /// Slack invariant: `out.capacity() >= cursor + SHORT_EMIT_MAX *
+    /// (iterations left)`, established by the reserve below and
+    /// re-established by the slow path's long route after any
+    /// reallocation. Every pretoken on a short-key route (fast lanes,
+    /// spill copies, misses) emits at most SHORT_EMIT_MAX tokens, so the
+    /// two 8-byte fast-path stores are always in bounds and the short
+    /// slow path never touches `out`'s length or capacity.
     #[inline(always)]
     fn probe_emit_chunk(
         &mut self,
@@ -884,14 +934,21 @@ impl Tokenizer {
         if n == 0 {
             return;
         }
-        out.reserve(4 * n);
-        let mut w = out.len();
+        out.reserve(SHORT_EMIT_MAX * n);
         // Loop-invariant raw cursors. The slow path's `&mut self` call is
         // the only thing that can move `out`'s buffer or the cache's slot
         // array, so both are refreshed there and nowhere else; without
         // these the compiler reloaded the Vec pointer, table base, and
         // mask from the stack on every iteration.
         let mut dst = out.as_mut_ptr();
+        // The write cursor walks as a pointer: the fast iteration then
+        // pays one `p += len` bump instead of a separate `dst + w*4`
+        // store-address add. The element count `w` only materializes
+        // where it is observed (the slow route's Vec cursor, `record`,
+        // the final set_len) as `p - dst`; a no-op `record` (the flat
+        // variant) leaves that derivation dead and LLVM deletes it.
+        // SAFETY: out.len() <= capacity.
+        let mut p = unsafe { dst.add(out.len()) };
         let mut table = self.pretoken_cache.probe_view();
         // Probe-stage prefetch: promote the pair's line L2 -> L1 a fixed
         // short distance ahead (the fill phase staged it into L2; D only
@@ -914,23 +971,29 @@ impl Tokenizer {
             // (the parallel-array layout walked three load streams here).
             let (key, h) = (batch.entries[i].key, batch.entries[i].meta);
             let (val, ext, found) = table.probe_pair(key, h);
-            // `key != 0` folds the long-pretoken route in AND guards the
-            // empty-slot sentinel (probe_pair matches key 0 against empty
-            // slots); on !found the lanes below are another entry's, dead
-            // because the cursor does not advance.
-            let fast = found & (val & VAL_SPILL == 0) & (key != 0);
-            // Lanes 1-2 packed into one u64 store, lanes 3-4 are `ext`
-            // verbatim (little-endian lane order, like the raw key load in
-            // `pack_pretoken_key`); the two u64 writes fuse into one 16 B
-            // `stp`.
-            let ab = ((val >> 8) & 0x00FF_FFFF) | (val & 0xFFFF_FFFF_0000_0000);
-            // SAFETY: the slack invariant leaves >= 4 u32s past `w`.
+            // A real inline entry is exactly `val`'s low 32 bits landing
+            // in [1, 2^31): nonzero — rejects the empty-slot false hit
+            // (probe_pair matches key 0 against empty slots, whose val
+            // reads 0), which also folds the long-pretoken route in —
+            // and the spill flag (bit 31) clear. One unsigned range test
+            // covers both rejections. On !found the lanes below are
+            // another entry's, dead because the cursor does not advance.
+            let fast = found & ((val as u32).wrapping_sub(1) < 0x7FFF_FFFF);
+            // Lanes 1-2 are `val` with the metadata byte cleared (the
+            // stored layout is emit-ready — see VAL_TOKEN_MASK), lanes
+            // 3-4 are `ext` verbatim (little-endian lane order, like the
+            // raw key load in `pack_pretoken_key`); the two u64 writes
+            // fuse into one 16 B `stp`.
+            let ab = val & VAL_TOKEN_MASK;
+            // SAFETY: the slack invariant leaves >= 4 u32s past `p`.
             unsafe {
-                let p = dst.add(w);
                 (p as *mut u64).write_unaligned(ab);
                 (p.add(2) as *mut u64).write_unaligned(ext);
+                // The bump stays in bounds: a fast advance writes <= 4
+                // lanes of the SHORT_EMIT_MAX-lane slack, and a rejected
+                // pretoken leaves the cursor where the slack starts.
+                p = p.add(if fast { ((val >> 24) & 0x7F) as usize } else { 0 });
             }
-            w += if fast { (val & 0x7F) as usize } else { 0 };
             if !fast {
                 // Cold: reconstruct the span from the entry. For key == 0
                 // `h` is really the span length, but the slow path never
@@ -940,26 +1003,42 @@ impl Tokenizer {
                 // SAFETY: entry `i` was written by this chunk's fill, so
                 // `ptr` points at a live span of the input's lifetime.
                 let bytes = unsafe { batch.span(i) };
-                w = self.probe_emit_slow(bytes, key, h, out, w);
+                // SAFETY: p and dst point into the same live allocation.
+                let w = unsafe { p.offset_from(dst) } as usize;
+                let w = self.probe_emit_slow(bytes, key, h, out, w);
                 dst = out.as_mut_ptr();
+                // SAFETY: w <= out.len() (probe_emit_slow returned a live
+                // length) <= capacity.
+                p = unsafe { dst.add(w) };
                 table = self.pretoken_cache.probe_view();
             }
-            record(i, w);
+            // SAFETY: p and dst point into the same live allocation.
+            record(i, unsafe { p.offset_from(dst) } as usize);
         }
-        // SAFETY: w <= capacity by the slack invariant, and every element
-        // below `w` was written (fast advances never skip lanes; the slow
-        // path appends through Vec).
-        unsafe { out.set_len(w) };
+        // SAFETY: p - dst <= capacity by the slack invariant, and every
+        // element below it was written (fast advances never skip lanes;
+        // the slow path's short route wrote its tokens at the raw cursor,
+        // its long route appended through Vec).
+        unsafe { out.set_len(p.offset_from(dst) as usize) };
     }
 
     /// Everything [`Self::probe_emit_chunk`]'s fast predicate rejects.
     /// Appends this pretoken's tokens at cursor `w` and returns the new
-    /// cursor, re-establishing the emit loop's slack invariant.
+    /// cursor.
     ///
     /// `h` is only meaningful (and only read) when `key != 0`: the long
     /// route keys on `bytes` and passes literal zeros to the miss path.
     /// The emit loop relies on this and forwards the batch entry's `meta`
     /// (the span length when `key == 0`) without filtering it.
+    ///
+    /// Short-key events (probe walk, spill, miss) write at the raw cursor
+    /// and never touch `out.len` or its capacity: a ≤ 15-byte pretoken
+    /// encodes to at most SHORT_EMIT_MAX tokens, which the chunk's slack
+    /// invariant already covers — nothing on the short route can
+    /// reallocate `out`, so the emit loop's `dst` also stays valid across
+    /// it (it refreshes `table` regardless: the cache insert may grow).
+    /// Only the long route, whose emit count is unbounded, keeps the
+    /// Vec-cursor dance and re-establishes the slack invariant.
     #[cold]
     #[inline(never)]
     fn probe_emit_slow(
@@ -970,30 +1049,51 @@ impl Tokenizer {
         out: &mut Vec<u32>,
         w: usize,
     ) -> usize {
-        // SAFETY: elements below `w` are initialized and w <= capacity
-        // (emit-loop invariant); Vec append methods need len in sync.
-        unsafe { out.set_len(w) };
         if key != 0 {
+            // SAFETY: the chunk's slack invariant leaves >= SHORT_EMIT_MAX
+            // u32s past `w` (see probe_emit_chunk), which bounds every
+            // short-route write below (inline stores, spill/miss copies).
+            let dst = unsafe { out.as_mut_ptr().add(w) };
             // A miss hands back the insert slot its walk found, so the
             // miss path's insert skips re-walking the (just-touched)
             // chain.
             match self.pretoken_cache.get_or_slot(key, h) {
                 Ok((val, ext)) => {
-                    let len = (val & 0x7F) as usize;
+                    let len = ((val >> 24) & 0x7F) as usize;
                     if val & VAL_SPILL == 0 {
-                        out.extend_from_slice(&unpack_val_lanes(val, ext)[..len]);
+                        // The fast path's two-lane store, verbatim (lane
+                        // order documented there).
+                        let ab = val & VAL_TOKEN_MASK;
+                        // SAFETY: 4 lanes <= SHORT_EMIT_MAX; see dst above.
+                        unsafe {
+                            (dst as *mut u64).write_unaligned(ab);
+                            (dst.add(2) as *mut u64).write_unaligned(ext);
+                        }
                     } else {
                         let start = (val >> 32) as usize;
-                        // SAFETY: recorded right after appending `len`
-                        // tokens at `start`; the arena never shrinks.
-                        let toks =
-                            unsafe { self.token_arena.get_unchecked(start..start + len) };
-                        out.extend_from_slice(token_ids_as_u32s(toks));
+                        debug_assert!(len <= SHORT_EMIT_MAX);
+                        // SAFETY: `start..start + len` was recorded right
+                        // after appending `len` tokens at `start`, and the
+                        // arena never shrinks. dst is in bounds per its
+                        // note above, and `out` and the arena are distinct
+                        // live allocations, so the copy cannot overlap.
+                        unsafe {
+                            let toks = self.token_arena.get_unchecked(start..start + len);
+                            std::ptr::copy_nonoverlapping(
+                                toks.as_ptr() as *const u32,
+                                dst,
+                                len,
+                            );
+                        }
                     }
+                    w + len
                 }
-                Err(slot) => self.encode_pretoken_miss(bytes, key, h, slot, out),
+                Err(slot) => w + self.encode_pretoken_miss_short(bytes, key, h, slot, dst),
             }
         } else {
+            // SAFETY: elements below `w` are initialized and w <= capacity
+            // (emit-loop invariant); Vec append methods need len in sync.
+            unsafe { out.set_len(w) };
             // Long pretokens (> 15 bytes, rare) always spill to the arena;
             // their token counts can exceed the packed-value range, so
             // they bypass it entirely.
@@ -1006,95 +1106,114 @@ impl Tokenizer {
                     };
                     out.extend_from_slice(token_ids_as_u32s(toks));
                 }
-                None => self.encode_pretoken_miss(bytes, 0, 0, 0, out),
+                None => self.encode_pretoken_miss_long(bytes, out),
             }
+            // The only route that can reallocate `out` mid-chunk, and the
+            // only one that must re-establish the slack invariant.
+            out.reserve(SHORT_EMIT_MAX * PRETOKEN_CHUNK);
+            out.len()
         }
-        out.reserve(4 * PRETOKEN_CHUNK);
-        out.len()
     }
 
-    /// Cache-miss path of the probe/emit loop: BPE-encode `bytes`, record
-    /// it in the table `key` routes to (the short-pretoken table, or the
-    /// long map when `key == 0`), and append its tokens to `out`. `slot`
-    /// is the short-cache insert position reported by the failed
-    /// `get_or_slot` probe (meaningful only when `key != 0`); nothing
-    /// here touches the short cache before the insert, so it stays valid.
+    /// Cache-miss path of the probe/emit loop, short pretokens (≤ 15
+    /// bytes, the overwhelming majority of misses): straight to byte
+    /// symbols and the merge loop (`merge_short`, shared with the vocab
+    /// seed) in a stack buffer, record the encoding in the short cache,
+    /// and copy the tokens to `dst` (the emit loop's raw output cursor —
+    /// see [`Self::probe_emit_slow`]). Returns the token count. `slot` is
+    /// the short-cache insert position reported by the failed
+    /// `get_or_slot` probe; nothing here touches the short cache before
+    /// the insert, so it stays valid.
+    ///
+    /// The cache is pre-seeded with the seed encoding of every short
+    /// vocab entry (see `seeded_pretoken_cache`), so a miss here is never
+    /// a whole vocab word — but nothing depends on that: `seed_symbols`
+    /// computes the correct encoding for any bytes under either
+    /// `ignore_merges` setting.
     #[inline(never)]
-    fn encode_pretoken_miss(
+    fn encode_pretoken_miss_short(
         &mut self,
         bytes: &[u8],
         key: u128,
         h: u64,
         slot: usize,
-        out: &mut Vec<u32>,
-    ) {
-        if key != 0 {
-            // Short pretoken (≤ 15 bytes, the overwhelming majority of
-            // misses): straight to byte symbols and the merge loop
-            // (`merge_short`, shared with the vocab seed), in a stack
-            // buffer instead of the `Vec` scratch. The cache is pre-seeded
-            // with the seed encoding of every short vocab entry (see
-            // `seeded_pretoken_cache`), so a miss here is never a whole
-            // vocab word — but nothing depends on that: `seed_symbols`
-            // computes the correct encoding for any bytes under either
-            // `ignore_merges` setting.
-            let mut buf = [TokenId(0); SHORT_MERGE_MAX];
-            let n = Self::seed_symbols(
-                self.byte_remapping.as_ref(),
-                self.pair_ranks.as_deref(),
-                &self.merges,
-                self.ignore_merges,
-                &self.vocab_inv,
-                bytes,
-                &mut buf,
-            );
-            let symbols = &buf[..n];
-            let (val, ext) = Self::pack_val(symbols, &mut self.token_arena);
-            self.pretoken_cache.insert_at(slot, key, h, val, ext);
-            out.extend_from_slice(token_ids_as_u32s(symbols));
-        } else {
-            // Long pretoken (> 15 bytes, rare): remap and run the merge
-            // loop. Without `ignore_merges`, deliberately NO
-            // whole-pretoken reverse-vocab (`vocab_inv`) shortcut here — a
-            // vocab entry is not guaranteed to be derivable from its own
-            // merges (qwen3_5 has ~50 entries > 15 bytes, multi-char CJK
-            // phrases, that HF `tokenizers` without `ignore_merges`
-            // encodes as their merge decomposition, never as the single
-            // ID), so any such shortcut diverges from HF and from the
-            // pre-cache baseline. The same rule holds for short keys via
-            // the seeded merge results above. Do not reintroduce it. With
-            // `ignore_merges` set, the shortcut IS HF's semantics, so it
-            // applies — gated on the flag.
-            let symbols = &mut self.symbol_scratch;
-            symbols.clear();
-            if self.ignore_merges
-                && let Some(&id) = self.vocab_inv.get(bytes)
-            {
-                symbols.push(id);
-            } else {
-                match self.byte_remapping.as_ref() {
-                    Some(br) => symbols.extend(bytes.iter().map(|&b| br.mapping[b as usize])),
-                    None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
-                }
-                match self.pair_ranks.as_deref() {
-                    Some(table) => bpe_merge_symbols_by_rank(
-                        &|a, b| table.rank(a, b),
-                        symbols,
-                        &mut self.merge_scratch,
-                    ),
-                    None => bpe_merge_symbols_with_scratch(
-                        &self.merges,
-                        symbols,
-                        &mut self.merge_scratch,
-                    ),
-                }
-            }
-            let len = symbols.len() as u32;
-            let offset = self.token_arena.len() as u32;
-            self.token_arena.extend_from_slice(symbols);
-            self.pretoken_cache_long.insert(bytes.into(), (offset, len));
-            out.extend_from_slice(token_ids_as_u32s(symbols));
+        dst: *mut u32,
+    ) -> usize {
+        debug_assert_ne!(key, 0);
+        let mut buf = [TokenId(0); SHORT_MERGE_MAX];
+        let n = Self::seed_symbols(
+            self.byte_remapping.as_ref(),
+            self.pair_ranks.as_deref(),
+            &self.merges,
+            self.ignore_merges,
+            &self.vocab_inv,
+            bytes,
+            &mut buf,
+        );
+        let symbols = &buf[..n];
+        let (val, ext) = Self::pack_val(symbols, &mut self.token_arena);
+        self.pretoken_cache.insert_at(slot, key, h, val, ext);
+        // Fixed 60-byte copy instead of a by-`n` one: the constant counts
+        // inline to four 16-byte vector copies, while a variable n lowers
+        // to a memcpy call. Lanes past `n` hold stale merge symbols and
+        // are dead — the cursor advances by `n` only, and a later store or
+        // the chunk's final `set_len` discards them (the same idiom as
+        // the fast path's unconditional 4-lane store).
+        // SAFETY: `buf` is 16 u32s, so lanes 0..12 and 11..15 are readable;
+        // the slack invariant covers 15 u32s (= SHORT_EMIT_MAX) past `dst`,
+        // and `buf` is a stack slot that never aliases `out`.
+        unsafe {
+            let src = buf.as_ptr() as *const u32;
+            std::ptr::copy_nonoverlapping(src, dst, 12);
+            std::ptr::copy_nonoverlapping(src.add(11), dst.add(11), 4);
         }
+        n
+    }
+
+    /// Cache-miss path for long pretokens (> 15 bytes, rare): remap and
+    /// run the merge loop, spill the encoding to the token arena, record
+    /// it in the long map, and append the tokens to `out`. Without
+    /// `ignore_merges`, deliberately NO whole-pretoken reverse-vocab
+    /// (`vocab_inv`) shortcut here — a vocab entry is not guaranteed to
+    /// be derivable from its own merges (qwen3_5 has ~50 entries > 15
+    /// bytes, multi-char CJK phrases, that HF `tokenizers` without
+    /// `ignore_merges` encodes as their merge decomposition, never as the
+    /// single ID), so any such shortcut diverges from HF and from the
+    /// pre-cache baseline. The same rule holds for short keys via the
+    /// seeded merge results above. Do not reintroduce it. With
+    /// `ignore_merges` set, the shortcut IS HF's semantics, so it
+    /// applies — gated on the flag.
+    #[inline(never)]
+    fn encode_pretoken_miss_long(&mut self, bytes: &[u8], out: &mut Vec<u32>) {
+        let symbols = &mut self.symbol_scratch;
+        symbols.clear();
+        if self.ignore_merges
+            && let Some(&id) = self.vocab_inv.get(bytes)
+        {
+            symbols.push(id);
+        } else {
+            match self.byte_remapping.as_ref() {
+                Some(br) => symbols.extend(bytes.iter().map(|&b| br.mapping[b as usize])),
+                None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
+            }
+            match self.pair_ranks.as_deref() {
+                Some(table) => bpe_merge_symbols_by_rank(
+                    &|a, b| table.rank(a, b),
+                    symbols,
+                    &mut self.merge_scratch,
+                ),
+                None => bpe_merge_symbols_with_scratch(
+                    &self.merges,
+                    symbols,
+                    &mut self.merge_scratch,
+                ),
+            }
+        }
+        let len = symbols.len() as u32;
+        let offset = self.token_arena.len() as u32;
+        self.token_arena.extend_from_slice(symbols);
+        self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+        out.extend_from_slice(token_ids_as_u32s(symbols));
     }
 
     pub fn decode(&self, v: &[TokenId]) -> impl Iterator<Item = u8> {
@@ -1286,7 +1405,7 @@ mod tests {
             // the entry's own ID (GPT-2 has no duplicate byte strings and,
             // added-token overwrites included, no entry whose cached value
             // differs from its own ID).
-            assert_eq!(val, 1 | ((id as u64) << 8), "vocab entry {id}");
+            assert_eq!(val, (1 << 24) | id as u64, "vocab entry {id}");
             assert_eq!(ext, 0, "vocab entry {id}");
             seeded += 1;
         }

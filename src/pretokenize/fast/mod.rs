@@ -90,6 +90,11 @@ macro_rules! impl_mask_pretoken_spans {
                     prefetch,
                 )
             }
+
+            #[inline]
+            fn remaining_bytes_hint(&self) -> Option<usize> {
+                Some(self.bytes.len().saturating_sub(self.state.pos))
+            }
         }
     };
 }

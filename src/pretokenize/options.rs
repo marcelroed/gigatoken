@@ -158,5 +158,20 @@ unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispat
             FastPretokenizerDispatch::Nemotron(it) => it.fill_spans_keyed(batch, prefetch),
         }
     }
+
+    #[inline]
+    fn remaining_bytes_hint(&self) -> Option<usize> {
+        use crate::pretokenize::PretokenSpans;
+        match self {
+            FastPretokenizerDispatch::R50k(it) => it.remaining_bytes_hint(),
+            FastPretokenizerDispatch::Cl100k(it) => it.remaining_bytes_hint(),
+            FastPretokenizerDispatch::Qwen2(it) => it.remaining_bytes_hint(),
+            FastPretokenizerDispatch::Qwen35(it) => it.remaining_bytes_hint(),
+            FastPretokenizerDispatch::Olmo3(it) => it.remaining_bytes_hint(),
+            FastPretokenizerDispatch::DeepSeekV3(it) => it.remaining_bytes_hint(),
+            FastPretokenizerDispatch::O200k(it) => it.remaining_bytes_hint(),
+            FastPretokenizerDispatch::Nemotron(it) => it.remaining_bytes_hint(),
+        }
+    }
 }
 
