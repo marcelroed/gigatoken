@@ -93,18 +93,42 @@ fn build_class_table() -> Box<[u8]> {
         .collect()
 }
 
+/// Pre-resolved handle to the packed class table. The static is a
+/// `LazyLock<Box<[u8]>>`, so every bare [`class_of`] call pays the
+/// lazy-init state check plus a dependent load of the Box pointer before
+/// the table load itself; per-char classify loops resolve the handle once
+/// and index the slice directly.
+#[derive(Clone, Copy)]
+pub(crate) struct ClassTable(&'static [u8]);
+
+impl ClassTable {
+    #[inline]
+    pub(crate) fn get() -> Self {
+        Self(&CLASS_TABLE)
+    }
+
+    /// [`class_of`] without the per-call static resolution. `cp` must be
+    /// a valid scalar value (guaranteed when decoded from valid UTF-8).
+    #[inline(always)]
+    pub(crate) fn class_of(self, cp: u32) -> CharClass {
+        debug_assert!(cp < 0x110000);
+        // SAFETY: `self.0` is CLASS_TABLE (the only constructor), sized
+        // 0x110000 / 4; cp >> 2 is in range for any scalar value.
+        let byte = unsafe { *self.0.get_unchecked((cp >> 2) as usize) };
+        match (byte >> ((cp & 3) << 1)) & 3 {
+            0 => CharClass::Letter,
+            1 => CharClass::Number,
+            2 => CharClass::Whitespace,
+            _ => CharClass::Other,
+        }
+    }
+}
+
 /// Classify a codepoint with one table load. `cp` must be a valid scalar
 /// value (guaranteed when decoded from valid UTF-8).
 #[inline(always)]
 pub(crate) fn class_of(cp: u32) -> CharClass {
-    debug_assert!(cp < 0x110000);
-    let byte = unsafe { *CLASS_TABLE.get_unchecked((cp >> 2) as usize) };
-    match (byte >> ((cp & 3) << 1)) & 3 {
-        0 => CharClass::Letter,
-        1 => CharClass::Number,
-        2 => CharClass::Whitespace,
-        _ => CharClass::Other,
-    }
+    ClassTable::get().class_of(cp)
 }
 
 // ---------------------------------------------------------------------------
@@ -132,12 +156,7 @@ pub(crate) enum DsCharClass {
 /// letters, everything else as in [`class_of`].
 #[inline(always)]
 pub(crate) fn class_of_marks_join(cp: u32) -> CharClass {
-    match ds_class_of(cp) {
-        DsCharClass::Letter | DsCharClass::Mark => CharClass::Letter,
-        DsCharClass::Number => CharClass::Number,
-        DsCharClass::Whitespace => CharClass::Whitespace,
-        DsCharClass::PunctSym | DsCharClass::Other => CharClass::Other,
-    }
+    DsClassTable::get().class_of_marks_join(cp)
 }
 
 /// 4-bit class per codepoint, 2 codepoints per byte (~544 KiB total).
@@ -172,20 +191,52 @@ fn build_ds_class_table() -> Box<[u8]> {
         .collect()
 }
 
+/// Pre-resolved handle to the packed DeepSeek class table — same
+/// LazyLock-hoist rationale as [`ClassTable`].
+#[derive(Clone, Copy)]
+pub(crate) struct DsClassTable(&'static [u8]);
+
+impl DsClassTable {
+    #[inline]
+    pub(crate) fn get() -> Self {
+        Self(&DS_CLASS_TABLE)
+    }
+
+    /// [`ds_class_of`] without the per-call static resolution. `cp` must
+    /// be a valid scalar value (guaranteed when decoded from valid UTF-8).
+    #[inline(always)]
+    pub(crate) fn ds_class_of(self, cp: u32) -> DsCharClass {
+        debug_assert!(cp < 0x110000);
+        // SAFETY: `self.0` is DS_CLASS_TABLE (the only constructor), sized
+        // 0x110000 / 2; cp >> 1 is in range for any scalar value.
+        let byte = unsafe { *self.0.get_unchecked((cp >> 1) as usize) };
+        match (byte >> ((cp & 1) << 2)) & 0xF {
+            0 => DsCharClass::Letter,
+            1 => DsCharClass::Number,
+            2 => DsCharClass::Whitespace,
+            3 => DsCharClass::Mark,
+            4 => DsCharClass::PunctSym,
+            _ => DsCharClass::Other,
+        }
+    }
+
+    /// [`class_of_marks_join`] without the per-call static resolution.
+    #[inline(always)]
+    pub(crate) fn class_of_marks_join(self, cp: u32) -> CharClass {
+        match self.ds_class_of(cp) {
+            DsCharClass::Letter | DsCharClass::Mark => CharClass::Letter,
+            DsCharClass::Number => CharClass::Number,
+            DsCharClass::Whitespace => CharClass::Whitespace,
+            DsCharClass::PunctSym | DsCharClass::Other => CharClass::Other,
+        }
+    }
+}
+
 /// Classify a codepoint for the DeepSeek scheme with one table load. `cp`
 /// must be a valid scalar value (guaranteed when decoded from valid UTF-8).
 #[inline(always)]
 pub(crate) fn ds_class_of(cp: u32) -> DsCharClass {
-    debug_assert!(cp < 0x110000);
-    let byte = unsafe { *DS_CLASS_TABLE.get_unchecked((cp >> 1) as usize) };
-    match (byte >> ((cp & 1) << 2)) & 0xF {
-        0 => DsCharClass::Letter,
-        1 => DsCharClass::Number,
-        2 => DsCharClass::Whitespace,
-        3 => DsCharClass::Mark,
-        4 => DsCharClass::PunctSym,
-        _ => DsCharClass::Other,
-    }
+    DsClassTable::get().ds_class_of(cp)
 }
 
 // ---------------------------------------------------------------------------

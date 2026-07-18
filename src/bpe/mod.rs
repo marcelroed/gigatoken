@@ -248,6 +248,39 @@ impl PairRankTable {
             idx = (idx + 1) & self.mask;
         }
     }
+
+    /// `prefetcht0` the first line [`Self::rank`] would load for `(a, b)`:
+    /// the dense cell when both sides sit in the grid, else the first
+    /// sparse probe slot. The short-merge loop's refresh lookups sit on a
+    /// serial dependency chain and their slot-load consumers are ~5-7% of
+    /// cold cycles on Zen 5 (profiling/zen5_st_profile.md §4.3); both
+    /// refresh pairs are known before the list surgery, so issuing their
+    /// prefetches first overlaps the load latency with the surgery and
+    /// with each other. Address math mirrors `rank` exactly (same bounds:
+    /// dense idx < dense.len(), slot idx < slots.len() via `shift`), so
+    /// every prefetched address lies within the table's allocations.
+    /// x86_64 only; a no-op elsewhere (aarch64 uses the NEON merge core).
+    #[inline(always)]
+    pub(crate) fn prefetch_rank(&self, a: TokenId, b: TokenId) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `_mm_prefetch` does not dereference; both index
+        // computations are the bounded ones from `rank` (see its SAFETY
+        // comments), so the address stays inside the live allocation.
+        unsafe {
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let addr = if (a.0 | b.0) >> self.dense_log2 == 0 {
+                let idx = ((a.0 as usize) << self.dense_log2) | b.0 as usize;
+                self.dense.as_ptr().add(idx) as *const i8
+            } else {
+                let key = ((a.0 as u64) << PAIR_ID_BITS) | b.0 as u64;
+                let idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize;
+                self.slots.as_ptr().add(idx) as *const i8
+            };
+            _mm_prefetch(addr, _MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (a, b);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -507,8 +540,14 @@ pub(crate) const SHORT_MERGE_MAX: usize = 16;
 /// Kept separate from the Vec-based [`bpe_merge_symbols_small`] (16..=32
 /// symbols): the domains are disjoint and unification was measured as a
 /// regression risk to this tuned miss path.
+///
+/// `prefetch_rank` is [`PairRankTable::prefetch_rank`] when a table backs
+/// `get_rank`, and a no-op closure for the HashMap fallback — the merge
+/// scan itself stays identical either way (restructuring it was measured
+/// negative; the prefetch only reorders when the refresh loads issue).
 pub(crate) fn bpe_merge_symbols_short_scalar(
     get_rank: impl Fn(TokenId, TokenId) -> u32,
+    prefetch_rank: impl Fn(TokenId, TokenId),
     symbols: &mut [TokenId; SHORT_MERGE_MAX],
     n: usize,
 ) -> usize {
@@ -539,10 +578,27 @@ pub(crate) fn bpe_merge_symbols_short_scalar(
             break;
         }
         let i = best_i;
-        symbols[i] = TokenId(best);
-        // Unlink the right element of the merged pair.
+        // Both refresh pairs are fixed the moment `best` is chosen:
+        // (best, symbols[new_right]) and (symbols[left], best). Their rank
+        // lines are the serial chain's next loads (their consumers are
+        // ~5-7% of cold cycles, profiling/zen5_st_profile.md §4.3), so
+        // request both before the list surgery. List indices are strictly
+        // increasing, so new_right > i and the surgery's `prev[new_right]`
+        // store cannot alias `prev[i]` — reading `left` early is safe.
+        // `symbols[new_right]` / `symbols[left]` are read only behind the
+        // same `< n` guards the refresh uses: active positions holding
+        // live tokens, never garbage lanes.
         let dead = next[i] as usize;
         let new_right = next[dead] as usize;
+        let left = prev[i] as usize;
+        if new_right < n {
+            prefetch_rank(TokenId(best), symbols[new_right]);
+        }
+        if left < n {
+            prefetch_rank(symbols[left], TokenId(best));
+        }
+        symbols[i] = TokenId(best);
+        // Unlink the right element of the merged pair.
         next[i] = new_right as u8;
         ranks[dead] = u32::MAX;
         // Refresh the two pairs now touching the merged symbol.
@@ -552,7 +608,6 @@ pub(crate) fn bpe_merge_symbols_short_scalar(
         } else {
             ranks[i] = u32::MAX;
         }
-        let left = prev[i] as usize;
         if left < n {
             ranks[left] = get_rank(symbols[left], symbols[i]);
         }
@@ -1118,7 +1173,12 @@ mod tests {
 
             let mut scalar = [TokenId(0); SHORT_MERGE_MAX];
             scalar[..n].copy_from_slice(&init);
-            let len = bpe_merge_symbols_short_scalar(|a, b| table.rank(a, b), &mut scalar, n);
+            let len = bpe_merge_symbols_short_scalar(
+                |a, b| table.rank(a, b),
+                |a, b| table.prefetch_rank(a, b),
+                &mut scalar,
+                n,
+            );
             assert_eq!(&scalar[..len], &reference[..], "scalar diverged: {init:?}");
 
             #[cfg(target_arch = "aarch64")]

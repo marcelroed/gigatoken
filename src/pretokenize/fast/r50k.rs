@@ -287,6 +287,11 @@ fn extended_masks(
 ) -> (u64, u64) {
     let wsa = ws64;
 
+    // Class-table LazyLock resolved once; the per-char classify below is
+    // then a bare slice index.
+    let ct = unicode::ClassTable::get();
+    let class = move |cp| ct.class_of(cp);
+
     // Bit-0 carries via the prev-char walk-back; a char straddling into
     // this batch claims its continuation bytes with its class. Without
     // this, every batch following a unicode char became a bad zone at
@@ -300,7 +305,7 @@ fn extended_masks(
     } else {
         // SAFETY: scan > 0 on this branch, and the classifier's
         // scan + 70 <= len batch guard covers pos + 3 <= len.
-        let (cls, _lead, end) = unsafe { mask::char_through(bytes, scan, unicode::class_of) };
+        let (cls, _lead, end) = unsafe { mask::char_through(bytes, scan, class) };
         let chm = if end > scan { (1u64 << (end - scan)) - 1 } else { 0 };
         claim.cont = chm;
         match cls {
@@ -330,7 +335,7 @@ fn extended_masks(
     // SAFETY: this classifier's scan + 70 <= len batch guard is exactly
     // `classify_uni_chars`' contract.
     let uni = unsafe {
-        mask::classify_uni_chars::<true, false>(bytes, scan, hi64 & !claim.cont, unicode::class_of)
+        mask::classify_uni_chars::<true, false>(bytes, scan, hi64 & !claim.cont, class)
     };
 
     // Effective per-byte classes: every byte of a classified char carries

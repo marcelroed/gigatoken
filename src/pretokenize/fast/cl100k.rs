@@ -37,14 +37,20 @@ impl MaskScheme for Cl100kScheme {
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
-        batch_masks(bytes, scan, true, unicode::class_of)
+        // Class-table LazyLock resolved once per batch; the extended
+        // path's per-char classify is then a bare slice index.
+        let ct = unicode::ClassTable::get();
+        batch_masks(bytes, scan, true, move |cp| ct.class_of(cp))
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn batch_masks_x86<const AVX512: bool>(bytes: &[u8], scan: usize) -> (u64, u64) {
+        // Class-table LazyLock resolved once per batch; the extended
+        // path's per-char classify is then a bare slice index.
+        let ct = unicode::ClassTable::get();
         // SAFETY: the caller detected the tier (trait contract).
-        unsafe { batch_masks_x86::<AVX512>(bytes, scan, true, unicode::class_of) }
+        unsafe { batch_masks_x86::<AVX512>(bytes, scan, true, move |cp| ct.class_of(cp)) }
     }
 }
 

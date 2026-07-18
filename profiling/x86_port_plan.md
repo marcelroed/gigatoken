@@ -453,3 +453,78 @@ re-taught: back-to-back NON-interleaved sessions on this box can differ
 by ~4% from post-compile thermal state — a standalone triple-run of the
 rebased binary first read as a 4% regression that interleaving inverted.
 Never compare across sessions; interleave or it didn't happen.
+
+## 8. Zen 5 round 2: the §7 leftovers + the qwen2-family classifier
+
+Fresh profile on main @ b092ad7 (worktree `encode-profiling`) reproduced
+the §7 residual shape exactly (gpt2 1 GB: 833 cold / 1122 warm; fill
+44.7% / emit 38.7% / merge_short 16.8% cold), plus a first profile of the
+qwen2-scheme path (Qwen3-8B tokenizer, same corpus: 720 cold / 965 warm —
+the gap is classification: `batch_masks_avx512::<class_of>` 17.6% warm +
+`family_extended_masks` 8.1%, vs r50k's 13.1% total). All changes below
+interleaved min-of-4/5 at 1 GB, token counts bit-identical throughout.
+
+Applied:
+
+1. **`vpcompressb` flatten_bits (§5.5) — gpt2 +3-6% cold / +4-8% warm;
+   carries to every mask scheme.** New `fill_spans_two_phase_crc_avx512`
+   shim (`+avx512vbmi2`, gated on `avx512_fill_available()`, dispatched
+   once per fill) monomorphizes the fill with `const X86_AVX512`; phase A's
+   8-octet BIT_POS LUT walk becomes compress-iota + widen + `vpaddw rel` +
+   two unconditional 64 B stores (BOUND_BUF slack grown 144 → 208 for the
+   128-lane scribble; worst-case cursor analysis in the comment).
+2. **Rank-slot prefetch in the short-merge refresh (§5.4a) — cold +0.8%,
+   warm neutral.** After the min-rank scan picks `best`, both refresh
+   pairs' first rank addresses (dense cell or first sparse slot) are known
+   before the list surgery; `PairRankTable::prefetch_rank` issues both
+   `prefetcht0`s there, overlapping the two serial loads with the surgery.
+3. **Family classifier: LazyLock hoist + 2-byte fast lane — qwen2 warm
+   +1.3%, cold +0.5%; r50k neutral.** Per-char `class_of` paid a LazyLock
+   state check + Box-pointer load before the table index; schemes now
+   resolve a `ClassTable` handle once per batch and pass a capturing
+   closure. `classify_uni_chars` gained a lead `< 0xE0` lane (inline
+   2-byte decode, constant masks) — western corpora's dominant non-ASCII
+   case. Family fuzz differentials (all four schemes) + 100 MB OWT
+   streaming differentials green.
+
+Tried, measured, and REVERTED:
+
+- **AVX-512 masked key load in phase B (§5.6): −36% warm / −30% cold.**
+  The scalar pack's 16-byte load address depends only on `prev`, so it
+  issues before `tok_len` resolves; `vmovdqu8 {k}{z}` made the load wait
+  on the boundary→len→kmask chain and added a `vpextrq` GPR crossing
+  before the CRC — ~90% of loop samples piled on the masked load and its
+  dependents. Overlapped work became serialized. Do not re-try (comment
+  at the phase-B loop records this).
+
+Full-dataset (11.9 GB OWT, page cache warm, interleaved ×2), before →
+after this round:
+
+| bench | before | after |
+|---|---|---|
+| encode_st full pass 0 (gpt2) | 936-942 MB/s | **1005-1009 MB/s (+7.2%)** |
+| encode_st full pass 0 (Qwen3-8B) | 805-810 MB/s | **862-863 MB/s (+7.0%)** |
+| gpt2 1 GB cold / warm | 827 / 1120 | 879 / 1210 (+6% / +8%) |
+| Qwen3-8B 1 GB cold / warm | 711 / 960 | 759 / 1043 (+6.7% / +8.6%) |
+
+Counts: 2717102153 (gpt2 full), 2624517214 (Qwen3-8B full), 228107519 /
+220398751 @ 1 GB — identical on every build. Still open: §5.7 PGO for
+cold I-cache; qwen2 carry-forwarding across sequential batches (assessed,
+skipped — the fill walker's rewinds make the invalidation story unsafe
+and the sequential-case saving is ~10 L1-hot ops per batch).
+
+Rebase note: this round was rebased onto a4bcfcb's x86-tier fill
+monomorphization; the `const X86_AVX512` bool + `_crc_avx512` shim above
+became a fourth tier value `X86_TIER_AVX512_VBMI2` (wrapper
+`fill_spans_two_phase_avx512_vbmi2_crc` = AVX-512 tier features +
+`avx512vbmi2`, still gated once per fill on `avx512_fill_available()`;
+plain-AVX-512 CPUs without VBMI2 keep the `X86_TIER_AVX512` wrapper and
+scalar flatten), and the classifier hoist moved into the schemes'
+collapsed `batch_masks_x86` bodies (a silent rebase hazard: git
+auto-applied the hoist only to the aarch64 `batch_masks`, leaving the
+hot x86 bodies on the bare classifier — caught in review of the merged
+tree). Numbers above predate the rebase; post-rebase interleaved re-A/B
+vs the new main (which a4bcfcb itself sped up to 851 cold / ~1162 warm
+gpt2, 747 / ~1020 qwen at 1 GB): gpt2 895 / ~1241 (+5.2% / +6.5%),
+qwen 780 / ~1074 (+4.3% / +5.4%); full-file gpt2 ~1002-1027 vs ~974,
+qwen 889 vs ~847 MB/s. Counts unchanged on every build.

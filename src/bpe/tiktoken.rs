@@ -387,9 +387,15 @@ impl Tokenizer {
             // scan's `rank < best` branches predict well on Zen 5. See
             // profiling/x86_port_plan.md §6.
             #[cfg(not(target_arch = "aarch64"))]
-            Some(table) => bpe_merge_symbols_short_scalar(|a, b| table.rank(a, b), buf, n),
+            Some(table) => bpe_merge_symbols_short_scalar(
+                |a, b| table.rank(a, b),
+                |a, b| table.prefetch_rank(a, b),
+                buf,
+                n,
+            ),
             None => bpe_merge_symbols_short_scalar(
                 |a, b| merges.get(&(a, b)).map_or(u32::MAX, |m| m.0),
+                |_, _| {},
                 buf,
                 n,
             ),
