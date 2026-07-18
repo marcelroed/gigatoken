@@ -1,6 +1,6 @@
 [package]
 name = "gigatoken"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 license = "MIT"
 
@@ -32,7 +32,15 @@ zstd = "0.13"
 spm_precompiled = "0.1.4"
 simdutf = "0.7.0"
 winnow = { version = "1", features = ["simd"] }
-parquet = { version = "59.1.0", default-features = false, features = ["arrow", "snap", "zstd", "flate2", "lz4", "brotli", "flate2-rust_backend"] }
+parquet = { version = "59.1.0", default-features = false, features = [
+    "arrow",
+    "snap",
+    "zstd",
+    "flate2",
+    "lz4",
+    "brotli",
+    "flate2-rust_backend",
+] }
 arrow-array = "59"
 arrow-schema = "59"
 
