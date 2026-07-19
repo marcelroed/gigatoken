@@ -66,6 +66,25 @@ impl PretokenizerType {
         }
     }
 
+    /// The scheme named by a lowercase identifier, as used by loaders whose
+    /// source format carries no split regex (e.g. tiktoken-rank repos, whose
+    /// regex lives in remote code) and the Python bindings. Accepts each
+    /// variant's canonical name plus the common tiktoken aliases.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "gpt2" | "r50k" => PretokenizerType::GPT2,
+            "gpt4" | "cl100k" => PretokenizerType::GPT4,
+            "qwen2" => PretokenizerType::Qwen2,
+            "qwen35" => PretokenizerType::Qwen35,
+            "olmo3" => PretokenizerType::Olmo3,
+            "deepseek_v3" => PretokenizerType::DeepSeekV3,
+            "o200k" => PretokenizerType::O200k,
+            "nemotron" => PretokenizerType::Nemotron,
+            "kimi" => PretokenizerType::Kimi,
+            _ => return None,
+        })
+    }
+
     /// Identify the scheme from the ordered list of `Split` regexes found in
     /// a HuggingFace `tokenizer.json` pre_tokenizer. Returns `None` for
     /// unknown patterns.

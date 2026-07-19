@@ -154,10 +154,12 @@ class BPETokenizer:
     @staticmethod
     def from_tiktoken(path: str | Path) -> "BPETokenizer": ...
     @staticmethod
-    def from_kimi(model_path: str | Path, config_path: str | Path) -> "BPETokenizer":
-        """Load a moonshotai Kimi-style tokenizer: `tiktoken.model` ranks
-        plus the special tokens from a tokenizer_config.json, with the Kimi
-        pretokenizer (the K2-family repos ship no tokenizer.json)."""
+    def from_tiktoken_model(model_path: str | Path, config_path: str | Path, pretokenizer: str) -> "BPETokenizer":
+        """Load from a tiktoken rank file plus a tokenizer_config.json
+        carrying the special tokens — the layout of repos that ship no
+        tokenizer.json (e.g. the moonshotai Kimi line) — with the named
+        pretokenizer scheme ("gpt2", "gpt4", "qwen2", "qwen35", "olmo3",
+        "deepseek_v3", "o200k", "nemotron", or "kimi")."""
     @staticmethod
     def from_hf(path: str | Path) -> "BPETokenizer": ...
     def __repr__(self) -> str: ...

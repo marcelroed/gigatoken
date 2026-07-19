@@ -38,7 +38,7 @@ pub fn load_tiktoken(file_path: impl AsRef<Path>) -> Result<Tokenizer> {
     Ok(tokenizer)
 }
 
-/// The fields of a HuggingFace tokenizer_config.json a tiktoken.model repo
+/// The fields of a HuggingFace tokenizer_config.json a tiktoken-rank repo
 /// needs: the special tokens (there is no tokenizer.json to carry them).
 #[derive(serde::Deserialize)]
 struct TokenizerConfigJson {
@@ -51,20 +51,21 @@ struct AddedTokenJson {
     content: String,
 }
 
-/// Load a moonshotai Kimi-style tokenizer: a `tiktoken.model` rank file
-/// plus a `tokenizer_config.json` whose `added_tokens_decoder` carries the
-/// special tokens (the repos ship no tokenizer.json; the pretokenizer
-/// regex lives in their `tokenization_kimi.py` and is the [`Kimi`
-/// scheme](PretokenizerType::Kimi)). Every Kimi/Moonlight repo shares one
-/// rank file and differs only in this special-token map.
-pub fn load_kimi(
+/// Load a tokenizer from a tiktoken rank file plus a HuggingFace
+/// `tokenizer_config.json` whose `added_tokens_decoder` carries the special
+/// tokens — the layout of repos that ship no tokenizer.json (e.g. the
+/// moonshotai Kimi/Moonlight line's `tiktoken.model`). The pretokenizer
+/// scheme is passed by the caller: such repos define their split regex only
+/// in remote code, so no shipped file can name it.
+pub fn load_tiktoken_model(
     model_path: impl AsRef<Path>,
     config_path: impl AsRef<Path>,
+    pretokenizer: PretokenizerType,
 ) -> Result<Tokenizer> {
     let rank_vocab = load_tiktoken_ranks(model_path)?;
     let n_ranks = rank_vocab.len() as u32;
     let mut tokenizer = Tokenizer::from_ranks(rank_vocab)?;
-    tokenizer.set_pretokenizer_type(PretokenizerType::Kimi);
+    tokenizer.set_pretokenizer_type(pretokenizer);
     let config_path = config_path.as_ref();
     let config: TokenizerConfigJson = sonic_rs::from_slice(
         &std::fs::read(config_path)

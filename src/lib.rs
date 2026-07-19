@@ -71,13 +71,23 @@ impl BPETokenizer {
             workers: WorkerPool::new(),
         })
     }
-    /// Load a moonshotai Kimi-style tokenizer: `tiktoken.model` ranks plus
-    /// the special tokens from a tokenizer_config.json, with the Kimi
-    /// pretokenizer (the K2-family repos ship no tokenizer.json).
+    /// Load from a tiktoken rank file plus a tokenizer_config.json carrying
+    /// the special tokens — the layout of repos that ship no tokenizer.json
+    /// (e.g. the moonshotai Kimi line) — with the named pretokenizer scheme.
     #[staticmethod]
-    fn from_kimi(model_path: PathBuf, config_path: PathBuf) -> PyResult<Self> {
+    fn from_tiktoken_model(
+        model_path: PathBuf,
+        config_path: PathBuf,
+        pretokenizer: &str,
+    ) -> PyResult<Self> {
+        let scheme = pretokenize::PretokenizerType::from_name(pretokenizer).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown pretokenizer scheme {pretokenizer:?}; expected one of \
+                 gpt2, gpt4, qwen2, qwen35, olmo3, deepseek_v3, o200k, nemotron, kimi"
+            ))
+        })?;
         Ok(Self {
-            tokenizer: load_tokenizer::tiktoken::load_kimi(&model_path, &config_path)?,
+            tokenizer: load_tokenizer::tiktoken::load_tiktoken_model(&model_path, &config_path, scheme)?,
             workers: WorkerPool::new(),
         })
     }

@@ -6,7 +6,7 @@ import json
 import os
 from typing import TYPE_CHECKING, Any
 
-from gigatoken._load.hf import capture_named_special_tokens, to_tokenizer_json, try_load_kimi
+from gigatoken._load.hf import capture_named_special_tokens, to_tokenizer_json, try_load_from_config
 from gigatoken._parallel import resolve_parallel
 from gigatoken.gigatoken_rs import BPETokenizer, PadTruncate, SentencePieceTokenizer, load_hf_json
 
@@ -68,18 +68,16 @@ class Tokenizer:
         elif isinstance(tokenizer, _BACKEND_TYPES):
             self._backend = tokenizer
         else:
-            try:
-                data = to_tokenizer_json(tokenizer)
-            except Exception:
-                # No tokenizer.json: a moonshot-style repo (Kimi/Moonlight)
-                # carries its vocab in tiktoken.model instead.
-                loaded = (
-                    try_load_kimi(tokenizer) if isinstance(tokenizer, (str, os.PathLike)) else None
-                )
-                if loaded is None:
-                    raise
-                self._backend, self._tiktoken_specials = loaded
-                return
+            if isinstance(tokenizer, (str, os.PathLike)):
+                # Config-driven dispatch: tokenizer_config.json names the
+                # tokenizer implementation (tokenizer_class/auto_map); repos
+                # of a registered line (e.g. Kimi/Moonlight) ship no
+                # tokenizer.json and load from their line's vocab file.
+                loaded = try_load_from_config(tokenizer)
+                if loaded is not None:
+                    self._backend, self._tiktoken_specials = loaded
+                    return
+            data = to_tokenizer_json(tokenizer)
             self._backend = load_hf_json(data)
             self._hf_json = data
             if not isinstance(tokenizer, (str, os.PathLike)):

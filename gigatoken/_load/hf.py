@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeAlias, cast
+from typing import TYPE_CHECKING, NamedTuple, TypeAlias, cast
 
 from gigatoken._load.hub import download_hub_file, looks_like_repo_id
 
@@ -54,43 +54,103 @@ def load_hf_tokenizer(pretrained_model_name_or_path: str) -> transformers.PreTra
     return cast("transformers.PreTrainedTokenizerBase", tokenizer)
 
 
-def try_load_kimi(source: str | os.PathLike[str]) -> "tuple[object, dict[str, int]] | None":
-    """Load a moonshotai Kimi-style tokenizer — `tiktoken.model` ranks plus
-    the special tokens of a sibling tokenizer_config.json declaring the
-    moonshot `TikTokenTokenizer` class (the K2/VL/Moonlight repos ship no
-    tokenizer.json; they all share one rank file and the Kimi pretokenizer
-    from their remote code). Accepts a Hub repo id, a directory, or a path
-    to the tiktoken.model itself. Returns `(BPETokenizer, special_tokens)`,
-    or None when `source` is not such a tokenizer."""
+class TokenizerLine(NamedTuple):
+    """A tokenizer line whose repos ship no tokenizer.json, identified by the
+    tokenizer_config.json `tokenizer_class` and remote-code `auto_map` module.
+    The split regex of such a line lives only in its remote code — no shipped
+    file declares it — so each entry names the matching pretokenizer scheme
+    implemented in Rust (`PretokenizerType`)."""
+
+    tokenizer_class: str
+    auto_map_modules: tuple[str, ...]
+    vocab_file: str
+    pretokenizer: str
+
+
+# The registered lines. Add an entry (and, if needed, a Rust scheme) to
+# support a new non-tokenizer.json tokenizer family.
+TOKENIZER_LINES = (
+    # moonshotai Kimi/Moonlight (K2/K2.5/K2.6/K2.7, Linear, VL, Moonlight):
+    # one shared rank file, per-repo specials, Kimi split regex.
+    TokenizerLine(
+        tokenizer_class="TikTokenTokenizer",
+        auto_map_modules=("tokenization_kimi", "tokenization_moonshot"),
+        vocab_file="tiktoken.model",
+        pretokenizer="kimi",
+    ),
+)
+
+
+def _match_tokenizer_line(config: dict[str, object]) -> TokenizerLine | None:
+    """The registered line a tokenizer_config.json identifies, or None.
+
+    Matches on `tokenizer_class`, and when the config carries a remote-code
+    `auto_map`, also on its module name — the class name alone is just the
+    remote class's chosen name, which another org could reuse for a
+    different regex."""
+    auto_map = config.get("auto_map")
+    entry = auto_map.get("AutoTokenizer") if isinstance(auto_map, dict) else None
+    if isinstance(entry, (list, tuple)):
+        entry = next((e for e in entry if e), None)
+    module = str(entry).split(".")[0] if entry else None
+    for line in TOKENIZER_LINES:
+        if config.get("tokenizer_class") != line.tokenizer_class:
+            continue
+        if module is not None and module not in line.auto_map_modules:
+            continue
+        return line
+    return None
+
+
+def try_load_from_config(source: str | os.PathLike[str]) -> "tuple[object, dict[str, int]] | None":
+    """Config-driven dispatch: resolve `source`'s tokenizer_config.json and,
+    when it identifies a registered [`TokenizerLine`], load that line's vocab
+    file with its pretokenizer scheme and the config's special tokens.
+
+    Accepts a Hub repo id, a directory, or a path to a registered vocab file
+    itself (e.g. a tiktoken.model, with the config as its sibling). Returns
+    `(BPETokenizer, special_tokens)`, or None when the config is absent or
+    identifies no registered line — then the tokenizer.json path applies."""
     import json
 
     from gigatoken.gigatoken_rs import BPETokenizer, hub_file
 
     path = Path(cast("str | os.PathLike[str]", source))
-    if path.is_file() and path.name == "tiktoken.model":
-        model, config = path, path.parent / "tokenizer_config.json"
+    is_repo = False
+    if path.is_file() and any(path.name == line.vocab_file for line in TOKENIZER_LINES):
+        config = path.parent / "tokenizer_config.json"
     elif path.is_dir():
-        model, config = path / "tiktoken.model", path / "tokenizer_config.json"
+        config = path / "tokenizer_config.json"
     elif isinstance(source, str) and looks_like_repo_id(source):
+        is_repo = True
         try:
-            model = hub_file(source, "tiktoken.model")
             config = hub_file(source, "tokenizer_config.json")
         except Exception:
+            # No config in the repo (or it is unreachable): nothing to
+            # dispatch on; let the tokenizer.json path report the failure.
             return None
     else:
         return None
-    if not (model.is_file() and config.is_file()):
+    if not config.is_file():
         return None
     config_json = json.loads(config.read_bytes())
-    if config_json.get("tokenizer_class") != "TikTokenTokenizer":
-        # A tiktoken rank file with some other remote-code tokenizer class:
-        # its pretokenizer regex is unknown, so don't guess.
+    line = _match_tokenizer_line(config_json)
+    if line is None:
         return None
-    specials = {
-        str(t["content"]): int(i)
-        for i, t in (config_json.get("added_tokens_decoder") or {}).items()
-    }
-    return BPETokenizer.from_kimi(model, config), specials
+    if is_repo:
+        model = hub_file(cast(str, source), line.vocab_file)
+    elif path.is_dir():
+        model = path / line.vocab_file
+    elif path.name == line.vocab_file:
+        model = path
+    else:
+        # A vocab-file path of one line whose sibling config identifies
+        # another: trust the config and load its line's vocab file.
+        model = path.parent / line.vocab_file
+    if not model.is_file():
+        return None
+    specials = {str(t["content"]): int(i) for i, t in (config_json.get("added_tokens_decoder") or {}).items()}
+    return BPETokenizer.from_tiktoken_model(model, config, line.pretokenizer), specials
 
 
 def to_tokenizer_json(source: TokenizerJsonSource) -> str | bytes:

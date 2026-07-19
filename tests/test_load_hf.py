@@ -34,7 +34,17 @@ def hub_server(gpt2_tokenizer_path):
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             requests.append((self.path, self.headers.get("Authorization")))
-            if self.path == "/openai-community/gpt2/resolve/main/tokenizer.json":
+            if self.path == "/openai-community/gpt2/resolve/main/tokenizer_config.json":
+                # Non-LFS files answer directly with 200 + x-repo-commit, no
+                # CDN redirect. The config-first dispatch fetches this before
+                # tokenizer.json; a plain class name routes to the json path.
+                body = b'{"tokenizer_class": "GPT2Tokenizer"}'
+                self.send_response(200)
+                self.send_header("x-repo-commit", commit)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/openai-community/gpt2/resolve/main/tokenizer.json":
                 self.send_response(302)
                 self.send_header("x-repo-commit", commit)
                 self.send_header("Location", "/cdn/tokenizer.json")
@@ -60,11 +70,12 @@ def hub_server(gpt2_tokenizer_path):
 
 
 def test_tokenizer_from_repo_id_downloads_into_cache(monkeypatch, tmp_path, hub_server):
-    """On a cache miss the file is fetched from the endpoint (no
-    huggingface_hub involved) and lands in the standard HF cache layout under
-    the commit from x-repo-commit; the token travels only to the resolve URL,
-    not to the redirect target; a reload is served from the cache with no
-    request. HF_HOME points at an empty directory so the fast path misses."""
+    """On a cache miss the files (the tokenizer_config.json dispatch probe,
+    then tokenizer.json) are fetched from the endpoint (no huggingface_hub
+    involved) and land in the standard HF cache layout under the commit from
+    x-repo-commit; the token travels only to the resolve URL, not to the
+    redirect target; a reload is served from the cache with no request.
+    HF_HOME points at an empty directory so the fast path misses."""
     endpoint, commit, requests = hub_server
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", str(tmp_path))
@@ -74,6 +85,7 @@ def test_tokenizer_from_repo_id_downloads_into_cache(monkeypatch, tmp_path, hub_
     tokenizer = Tokenizer("openai-community/gpt2")
     assert tokenizer.decode(tokenizer.encode("Hello, world!")) == b"Hello, world!"
     assert requests == [
+        ("/openai-community/gpt2/resolve/main/tokenizer_config.json", "Bearer hf_testtoken"),
         ("/openai-community/gpt2/resolve/main/tokenizer.json", "Bearer hf_testtoken"),
         ("/cdn/tokenizer.json", None),
     ]
@@ -84,7 +96,7 @@ def test_tokenizer_from_repo_id_downloads_into_cache(monkeypatch, tmp_path, hub_
 
     tokenizer = Tokenizer("openai-community/gpt2")
     assert tokenizer.decode(tokenizer.encode("Hello, world!")) == b"Hello, world!"
-    assert len(requests) == 2, "second load must be served from the cache"
+    assert len(requests) == 3, "second load must be served from the cache"
 
 
 def test_tokenizer_from_repo_id_cache_fast_path(monkeypatch, tmp_path, gpt2_tokenizer_path):
@@ -101,6 +113,7 @@ def test_tokenizer_from_repo_id_cache_fast_path(monkeypatch, tmp_path, gpt2_toke
     snapshot = repo_dir / "snapshots" / commit
     snapshot.mkdir(parents=True)
     (snapshot / "tokenizer.json").write_bytes(gpt2_tokenizer_path.read_bytes())
+    (snapshot / "tokenizer_config.json").write_text('{"tokenizer_class": "GPT2Tokenizer"}')
 
     tokenizer = Tokenizer("openai-community/gpt2")
     assert tokenizer.decode(tokenizer.encode("Hello, world!")) == b"Hello, world!"
