@@ -158,6 +158,24 @@ which remain more expensive to encode than byte-level BPE even with gigatoken's
 internal SP parallelism; ModernBERT is byte-level BPE with a heavier
 pretokenizer than the GPT-2 family.
 
+Each row is one distinct tokenizer (identical vocab/merges/pretokenizer), measured
+on a representative repo. Rows whose tokenizer is shared beyond their own name
+(verified by matching tokenizer definitions across the local HF model cache) cover:
+
+- **Nemotron 3** — Nemotron 3 Nano, Super, and Ultra
+- **Llama 3 / 3.1 / 3.2** — Llama 3 / 3.1 / 3.2, DeepSeek-R1-Distill-Llama, Hermes 3, Saiga, and other Llama-3 finetunes
+- **Llama 3.3** — Llama 3.3, Llama-3.1-Nemotron-Nano-VL, SmolLM3, Kanana 1.5, jina-embeddings-v5, Ultravox
+- **Phi-4-mini** — Phi-4-mini and Phi-4-multimodal
+- **Kimi K2** — Kimi K2 / K2.5 / K2.6 / K2.7, Kimi-Linear, Kimi-VL, Moonlight
+- **Qwen 2 / 2.5** — Qwen 2 and 2.5 (incl. Coder and VL), Qwen3-Coder, Qwen3-VL, DeepSeek-R1 Qwen distills, MiMo V2.5, MiniCPM-o 2.6, InternVL3
+- **Qwen 3** — Qwen 3 (incl. Embedding and Reranker), Qwen2.5-Omni, Qwen3-VL-Embedding, MiMo V2.5 Pro, jina-reranker-m0, pplx-embed, MOSS-TTS, Zeta
+- **GLM 4** — GLM 4.1V, 4.5, and 4.7
+- **DeepSeek V3 / R1 / V4** — DeepSeek V3 / V3.1 / V3.2, R1, V4 Flash and Pro, DeepSeek-VL2
+- **GLM 5** — GLM 5 / 5.2 and GLM-4.7-Flash
+- **Gemma 4** — Gemma 4 (dense, MoE, and E-series) and DiffusionGemma
+- **TinyLlama / Phi-3 (Llama 2)** — TinyLlama, Phi-3-mini, Phi-3.5-mini and Phi-3.5-vision (the Llama 2 vocab)
+- **Gemma 3** — Gemma 3 (270M–27B) and EmbeddingGemma
+
 </details>
 <!-- benchmarks:end -->
 

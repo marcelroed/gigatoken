@@ -20,9 +20,9 @@ render rewrites the block between <!-- benchmarks:start --> and
 <!-- benchmarks:end --> in the repo README (appending a section when the
 markers are absent): one collapsible table per (cpu, dataset) with family
 display names, throughput per implementation, and gigatoken's speedup vs
-HF/tiktoken, plus coverage footnotes from benchmarks/families.json
-(regenerate with `sweep.py --scan-families`). Rows without a gigatoken
-measurement are skipped.
+HF/tiktoken, plus hand-curated coverage footnotes (COVERS below, written
+from the `sweep.py --scan-families` data in benchmarks/families.json).
+Rows without a gigatoken measurement are skipped.
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 
@@ -192,27 +191,25 @@ DISPLAY = {
     "google/gemma-4-E4B-it": "Gemma 4",
 }
 
-# Trailing repo-name tokens that mark a quant/format re-release, not a model.
-QUANT_TOKEN = re.compile(
-    r"(?i)^(awq|gptq|gguf|bf16|fp8|nvfp4|mxfp8|int\d+|\d+bit|w\d+a\d+(-g\d+)?"
-    r"|quantized(\.w\d+a\d+)?|dynamic|qat|ct|block|bnb)$"
-)
-
-
-def covered_names(repos: list[str]) -> list[str]:
-    """Org-stripped, quant-deduped model names for a coverage footnote."""
-    names, seen = [], set()
-    for repo in repos:
-        if "internal-testing" in repo or repo.split("/")[-1].lower().startswith("tiny-"):
-            continue
-        parts = repo.split("/")[-1].split("-")
-        while len(parts) > 1 and QUANT_TOKEN.match(parts[-1]):
-            parts.pop()
-        name = "-".join(parts)
-        if name.lower() not in seen:
-            seen.add(name.lower())
-            names.append(name)
-    return names
+# Hand-curated coverage per row, written from the verified scan data in
+# benchmarks/families.json (regenerate the raw data with
+# `sweep.py --scan-families` and update these lines when it changes). Only
+# rows whose coverage goes beyond their display name are listed.
+COVERS = {
+    "meta-llama/Llama-3.1-8B": "Llama 3 / 3.1 / 3.2, DeepSeek-R1-Distill-Llama, Hermes 3, Saiga, and other Llama-3 finetunes",
+    "meta-llama/Llama-3.3-70B-Instruct": "Llama 3.3, Llama-3.1-Nemotron-Nano-VL, SmolLM3, Kanana 1.5, jina-embeddings-v5, Ultravox",
+    "Qwen/Qwen2-1.5B-Instruct": "Qwen 2 and 2.5 (incl. Coder and VL), Qwen3-Coder, Qwen3-VL, DeepSeek-R1 Qwen distills, MiMo V2.5, MiniCPM-o 2.6, InternVL3",
+    "Qwen/Qwen3-8B": "Qwen 3 (incl. Embedding and Reranker), Qwen2.5-Omni, Qwen3-VL-Embedding, MiMo V2.5 Pro, jina-reranker-m0, pplx-embed, MOSS-TTS, Zeta",
+    "deepseek-ai/DeepSeek-V3": "DeepSeek V3 / V3.1 / V3.2, R1, V4 Flash and Pro, DeepSeek-VL2",
+    "zai-org/GLM-4.7": "GLM 4.1V, 4.5, and 4.7",
+    "zai-org/GLM-5.2": "GLM 5 / 5.2 and GLM-4.7-Flash",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "Nemotron 3 Nano, Super, and Ultra",
+    "moonshotai/Kimi-K2-Instruct": "Kimi K2 / K2.5 / K2.6 / K2.7, Kimi-Linear, Kimi-VL, Moonlight",
+    "microsoft/Phi-4-mini-instruct": "Phi-4-mini and Phi-4-multimodal",
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": "TinyLlama, Phi-3-mini, Phi-3.5-mini and Phi-3.5-vision (the Llama 2 vocab)",
+    "google/gemma-3-4b-it": "Gemma 3 (270M–27B) and EmbeddingGemma",
+    "google/gemma-4-E4B-it": "Gemma 4 (dense, MoE, and E-series) and DiffusionGemma",
+}
 
 
 def fmt_speed(mb_per_s: float | None) -> str:
@@ -230,7 +227,7 @@ def fmt_ratio(giga: float | None, other: float | None) -> str:
     return f"{ratio:,.0f}×" if ratio >= 10 else f"{ratio:.1f}×"
 
 
-def render_table(cpu: str, dataset: str, tokenizers: dict, families: dict, coverage: bool) -> str | None:
+def render_table(cpu: str, dataset: str, tokenizers: dict) -> str | None:
     rows = []
     corpus_bytes = 0
     for repo, by_dataset in tokenizers.items():
@@ -239,21 +236,14 @@ def render_table(cpu: str, dataset: str, tokenizers: dict, families: dict, cover
             continue
         corpus_bytes = max(corpus_bytes, group["gigatoken"].get("bytes", 0))
         speeds = {lib: rec.get("mb_per_s") for lib, rec in group.items()}
-        # Coverage: the cache scan (families.json) when available, else the
-        # sweep's own shared_with candidates.
-        covers = families.get(repo) or next(
-            (rec["shared_with"] for rec in group.values() if rec.get("shared_with")), []
-        )
-        rows.append((repo, speeds, covers))
+        rows.append((repo, speeds))
     if not rows:
         return None
     rows.sort(key=lambda row: row[1].get("gigatoken") or 0, reverse=True)
 
-    coverage_notes = []
-    for repo, _, covers in rows:
-        names = covered_names(covers)
-        if len(names) > 1:
-            coverage_notes.append(f"- **{DISPLAY.get(repo, repo)}** — {', '.join(names)}")
+    coverage_notes = [
+        f"- **{DISPLAY.get(repo, repo)}** — {COVERS[repo]}" for repo, _ in rows if repo in COVERS
+    ]
 
     size = f" ({corpus_bytes / 1e9:.1f} GB)" if corpus_bytes else ""
     lines = [
@@ -269,7 +259,7 @@ def render_table(cpu: str, dataset: str, tokenizers: dict, families: dict, cover
         "| Tokenizer | gigatoken | HF tokenizers | tiktoken | vs HF | vs tiktoken |",
         "|---|---:|---:|---:|---:|---:|",
     ]
-    for repo, speeds, _ in rows:
+    for repo, speeds in rows:
         giga, hf, tik = speeds.get("gigatoken"), speeds.get("hf"), speeds.get("tiktoken")
         lines.append(
             f"| {DISPLAY.get(repo, repo)} | {fmt_speed(giga)} | {fmt_speed(hf)} | {fmt_speed(tik)} "
@@ -282,11 +272,12 @@ def render_table(cpu: str, dataset: str, tokenizers: dict, families: dict, cover
         "internal SP parallelism; ModernBERT is byte-level BPE with a heavier",
         "pretokenizer than the GPT-2 family.",
     ]
-    if coverage and coverage_notes:
+    if coverage_notes:
         lines += [
             "",
-            "Each row benchmarks one distinct tokenizer (identical vocab/merges/pretokenizer),",
-            "measured on the family's representative repo. Models verified to share it:",
+            "Each row is one distinct tokenizer (identical vocab/merges/pretokenizer), measured",
+            "on a representative repo. Rows whose tokenizer is shared beyond their own name",
+            "(verified by matching tokenizer definitions across the local HF model cache) cover:",
             "",
         ] + coverage_notes
     lines += ["", "</details>"]
@@ -297,16 +288,12 @@ def cmd_render(args) -> None:
     results = load_results(args.results)
     if not results:
         raise SystemExit(f"{args.results}: no results to render")
-    families = {}
-    if os.path.exists(args.families):
-        with open(args.families) as f:
-            families = json.load(f)
 
     tables = []
     for cpu, tokenizers in results.items():
         datasets = sorted({ds for by_dataset in tokenizers.values() for ds in by_dataset})
         for dataset in datasets:
-            table = render_table(cpu, dataset, tokenizers, families, args.coverage)
+            table = render_table(cpu, dataset, tokenizers)
             if table is not None:
                 tables.append(table)
     block = "\n".join([START, "## Benchmarks", ""] + tables + [END])
@@ -337,9 +324,7 @@ def main() -> None:
 
     render = sub.add_parser("render", help="rewrite the README benchmark table from the results file")
     render.add_argument("--results", default=DEFAULT_RESULTS)
-    render.add_argument("--families", default=DEFAULT_FAMILIES, help="coverage map from sweep.py --scan-families; optional")
     render.add_argument("--readme", default=DEFAULT_README)
-    render.add_argument("--coverage", action="store_true", help="append the per-family model coverage footnotes")
     render.set_defaults(func=cmd_render)
 
     args = parser.parse_args()
