@@ -115,6 +115,18 @@ Additionally, Gigatoken uses concurrent data structures to use multiprocessing i
 \* All reference speeds in this section are measured on an M4 Pro CPU
 -->
 
+## Citation
+If you use Gigatoken in your research, please cite it as:
+
+```bibtex
+@software{roed2026gigatoken,
+  author = {Marcel R{\o}d},
+  title = {{G}igatoken: SIMD and Cache Hierarchies for 1000x Faster Byte-Pair Encoding Tokenization on Modern CPUs},
+  url = {https://github.com/marcelroed/gigatoken},
+  year = {2026},
+}
+```
+
 ---
 
 <details>
