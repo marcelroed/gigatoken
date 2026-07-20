@@ -12,6 +12,7 @@ import platform
 import re
 import subprocess
 import time
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -41,11 +42,14 @@ _TRUNCATION_GUARD_TOKENS = 100
 _SIZE_UNITS = {"": 1, "k": 10**3, "m": 10**6, "g": 10**9, "t": 10**12}
 
 
-def _parse_size(text: str) -> int:
-    """Parse a decimal byte size like '100MB', '2.5GB', or '1000000'."""
+def _parse_size(text: str) -> int | None:
+    """Parse a decimal byte size like '100MB', '2.5GB', or '1000000';
+    'none' means no limit."""
+    if text.strip().lower() in ("none", "unlimited"):
+        return None
     match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kmgt]?)i?b?\s*", text.lower())
     if match is None:
-        raise typer.BadParameter(f"cannot parse size {text!r}; expected something like 100MB")
+        raise typer.BadParameter(f"cannot parse size {text!r}; expected something like 100MB (or 'none')")
     return int(float(match.group(1)) * _SIZE_UNITS[match.group(2)])
 
 
@@ -100,6 +104,52 @@ def _cpu_info() -> str:
     return ", ".join(parts)
 
 
+def _available_memory_bytes() -> int | None:
+    """A best-effort estimate of the memory currently available without
+    swapping, or None where it cannot be determined."""
+    system = platform.system()
+    if system == "Linux":
+        try:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+    elif system == "Darwin":
+        # Free + inactive + purgeable + speculative pages are all reclaimable
+        # on demand, matching what Linux reports as MemAvailable.
+        try:
+            page_size = int(subprocess.run(["sysctl", "-n", "hw.pagesize"], capture_output=True, text=True, check=True).stdout)
+            pages = 0
+            for line in subprocess.run(["vm_stat"], capture_output=True, text=True, check=True).stdout.splitlines():
+                key, _, value = line.partition(":")
+                if key.strip() in ("Pages free", "Pages inactive", "Pages purgeable", "Pages speculative"):
+                    pages += int(value.strip().rstrip("."))
+            return pages * page_size
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            pass
+    return None
+
+
+def _warn_if_memory_tight(total_bytes: int, comparing: bool, limit_bytes: int | None) -> None:
+    """Warn when the default in-memory benchmark looks unlikely to fit: the
+    raw file bytes plus roughly as much again for the encoded token ids,
+    plus per-document bytes/str/id copies of the comparison subset."""
+    available = _available_memory_bytes()
+    if available is None:
+        return
+    needed = 2 * total_bytes
+    if comparing:
+        needed += 3 * (min(limit_bytes, total_bytes) if limit_bytes is not None else total_bytes)
+    if needed > available:
+        typer.secho(
+            f"warning: this run may need ~{needed / 1e9:.1f} GB of memory but only ~{available / 1e9:.1f} GB looks available; "
+            "consider --stream-from-disk to avoid holding the input files in memory",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+
 def _load_tokenizer(spec: str) -> Tokenizer:
     from gigatoken import Tokenizer
 
@@ -110,26 +160,24 @@ def _load_tokenizer(spec: str) -> Tokenizer:
     return Tokenizer(spec)
 
 
-def _read_docs(files: list[Path], separator: str | None) -> list[bytes]:
-    """One document per file, or the separator-split (separator dropped,
-    empty documents skipped) pieces of each file in order, as raw bytes."""
-    docs: list[bytes] = []
-    for file in files:
-        raw = file.read_bytes()
+def _split_docs(raws: Iterable[bytes], separator: str | None) -> Iterator[bytes]:
+    """One document per input, or the separator-split (separator dropped,
+    empty documents skipped) pieces of each input in order, as raw bytes.
+    Lazy, so a byte-limited consumer never touches the tail inputs."""
+    for raw in raws:
         if separator is None:
-            docs.append(raw)
+            yield raw
         else:
-            docs.extend(piece for piece in raw.split(separator.encode("utf-8")) if piece)
-    return docs
+            yield from (piece for piece in raw.split(separator.encode("utf-8")) if piece)
 
 
-def _subset_docs(docs: list[bytes], limit_bytes: int | None) -> tuple[list[bytes], bool]:
+def _subset_docs(docs: Iterable[bytes], limit_bytes: int | None) -> tuple[list[bytes], bool]:
     """The prefix of `docs` totalling at most `limit_bytes`, byte-truncating
     the final document (at a valid UTF-8 boundary) to fill the budget.
     Returns the subset and whether its last document was truncated
     mid-document."""
     if limit_bytes is None:
-        return docs, False
+        return list(docs), False
     subset: list[bytes] = []
     used = 0
     for doc in docs:
@@ -166,20 +214,18 @@ def _report(name: str, seconds: float, n_bytes: int, n_tokens: int) -> None:
 def bench(
     tokenizer: str = typer.Argument(..., help="tokenizer.json path or directory, HuggingFace repo id, .tiktoken file, or sentencepiece .model file"),
     files: list[Path] = typer.Argument(..., exists=True, dir_okay=False, readable=True, help="UTF-8 text files to encode"),
-    in_memory: bool = typer.Option(False, "--in-memory", help="read the files into memory before timing, excluding disk IO from the measurement"),
-    compare_to: Optional[str] = typer.Option(None, help="also benchmark another library on the same data (in memory); only 'hf' is supported"),
-    comparison_limit: Optional[str] = typer.Option(None, help="cap the bytes fed to the comparison tokenizer, e.g. 100MB"),
+    stream_from_disk: bool = typer.Option(False, "--stream-from-disk", help="stream the files from disk inside the timed region instead of reading them into memory up front, so disk IO counts toward the measurement"),
+    compare_to: Optional[str] = typer.Option(None, help="also benchmark another library on the same data; only 'hf' is supported"),
+    comparison_limit: str = typer.Option("100MB", help="cap the bytes fed to the comparison tokenizer, e.g. 100MB; 'none' compares on everything"),
     validate: bool = typer.Option(False, "--validate", help="check that HuggingFace token ids match gigatoken's on the comparison subset (implies --compare-to hf)"),
-    separator: Optional[str] = typer.Option(None, help='document separator to split the files on, e.g. "<|endoftext|>"; whole files are single documents otherwise'),
+    doc_separator: Optional[str] = typer.Option(None, "--doc-separator", help='document separator to split the files on, e.g. "<|endoftext|>"; whole files are single documents otherwise'),
 ) -> None:
     """Measure the time to encode FILES with TOKENIZER."""
     if validate and compare_to is None:
         compare_to = "hf"
     if compare_to not in (None, "hf"):
         raise typer.BadParameter("only --compare-to hf is supported")
-    if comparison_limit is not None and compare_to is None:
-        raise typer.BadParameter("--comparison-limit requires --compare-to hf (or --validate)")
-    limit_bytes = _parse_size(comparison_limit) if comparison_limit is not None else None
+    limit_bytes = _parse_size(comparison_limit)
 
     typer.echo(f"{_label('cpu')}: {_cpu_info()}")
 
@@ -192,21 +238,22 @@ def bench(
     # gigatoken pass. A separator is handed to gigatoken along with the whole
     # files (documents are split inside Rust, during the encode itself) —
     # never pre-split into per-document objects here, which is several times
-    # slower. Without --in-memory the files are also read inside Rust via
-    # encode_files, so timing includes disk IO. Byte counts are whole-file
-    # bytes, separators included.
-    if in_memory:
-        raws = [file.read_bytes() for file in files]
-        gt_bytes = sum(len(raw) for raw in raws)
-        start = time.perf_counter()
-        encoded = gt_tokenizer.encode_batch(BytesSource(raws, separator=separator))
-        gt_seconds = time.perf_counter() - start
-    else:
-        gt_bytes = sum(file.stat().st_size for file in files)
+    # slower. By default the files are read into memory before timing,
+    # excluding disk IO from the measurement; with --stream-from-disk they
+    # are instead read inside Rust via encode_files, so timing includes disk
+    # IO. Byte counts are whole-file bytes, separators included.
+    gt_bytes = sum(file.stat().st_size for file in files)
+    if stream_from_disk:
         # Bare paths keep their extension-based format detection (.jsonl).
-        source = list(files) if separator is None else TextFileSource(list(files), separator=separator)
+        source = list(files) if doc_separator is None else TextFileSource(list(files), separator=doc_separator)
         start = time.perf_counter()
         encoded = gt_tokenizer.encode_files(source)
+        gt_seconds = time.perf_counter() - start
+    else:
+        _warn_if_memory_tight(gt_bytes, comparing=compare_to is not None, limit_bytes=limit_bytes)
+        raws = [file.read_bytes() for file in files]
+        start = time.perf_counter()
+        encoded = gt_tokenizer.encode_batch(BytesSource(raws, separator=doc_separator))
         gt_seconds = time.perf_counter() - start
     _report("gigatoken", gt_seconds, gt_bytes, int(ak.count(encoded)))
 
@@ -227,19 +274,29 @@ def bench(
     hf_tokenizer = HFTokenizer.from_str(hf_json.decode("utf-8") if isinstance(hf_json, bytes) else hf_json)
 
     # The comparison needs one Python object per document (tokenizers takes
-    # a str per document, and validation compares per-document ids), so here
-    # — outside any timed region — the files are split in Python.
-    docs = _read_docs(files, separator)
-    subset, last_truncated = _subset_docs(docs, limit_bytes)
+    # a str per document, and validation compares per-document ids), so the
+    # files are split in Python. In the default in-memory mode that happens
+    # outside the timed region, mirroring the gigatoken pass; with
+    # --stream-from-disk gigatoken's timing included reading and splitting
+    # the files, so to keep the comparison fair hf's timed region covers
+    # reading, splitting, and decoding too (lazily, so at most the
+    # comparison subset is read from disk).
+    if stream_from_disk:
+        start = time.perf_counter()
+        subset, last_truncated = _subset_docs(_split_docs((file.read_bytes() for file in files), doc_separator), limit_bytes)
+        hf_docs = [doc.decode("utf-8") for doc in subset]  # tokenizers only accepts str
+        hf_encodings = hf_tokenizer.encode_batch(hf_docs, add_special_tokens=False)
+        hf_seconds = time.perf_counter() - start
+    else:
+        subset, last_truncated = _subset_docs(_split_docs(raws, doc_separator), limit_bytes)
+        hf_docs = [doc.decode("utf-8") for doc in subset]  # tokenizers only accepts str
+        start = time.perf_counter()
+        hf_encodings = hf_tokenizer.encode_batch(hf_docs, add_special_tokens=False)
+        hf_seconds = time.perf_counter() - start
     if not subset:
         typer.secho("error: --comparison-limit is smaller than the first document; nothing to compare", fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
     subset_bytes = sum(len(doc) for doc in subset)
-    hf_docs = [doc.decode("utf-8") for doc in subset]  # tokenizers only accepts str
-
-    start = time.perf_counter()
-    hf_encodings = hf_tokenizer.encode_batch(hf_docs, add_special_tokens=False)
-    hf_seconds = time.perf_counter() - start
     hf_ids = [encoding.ids for encoding in hf_encodings]
     _report("hf", hf_seconds, subset_bytes, sum(len(ids) for ids in hf_ids))
     speedup = (gt_bytes / gt_seconds) / (subset_bytes / hf_seconds)

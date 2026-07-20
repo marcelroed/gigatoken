@@ -71,8 +71,7 @@ gunzip owt_train.txt.gz
 
 ```bash
 uvx --with tokenizers gigatoken bench 'openai-community/gpt2' owt_train.txt \
-    --in-memory --validate --comparison-limit 100MB \
-    --separator "<|endoftext|>"
+    --validate --doc-separator "<|endoftext|>"
 ```
 ```bash
       cpu: Apple M4 Max, 16 cores
