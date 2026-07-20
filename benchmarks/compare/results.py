@@ -1,0 +1,350 @@
+"""Best-results store and README table for the throughput benchmarks.
+
+Stdlib-only (run with `uv run --no-project`). Two subcommands:
+
+    uv run --no-project benchmarks/compare/results.py merge run.jsonl [...]
+    uv run --no-project benchmarks/compare/results.py render
+
+merge folds measurement JSONL (from measure.py, files or stdin) into
+benchmarks/results.json, nested cpu -> tokenizer (HF repo id) -> dataset
+(file basename) -> implementation {gigatoken, hf, tiktoken}. Within one
+input batch, consecutive records on the same cpu/tokenizer/file with each
+library appearing at most once form a *comparison set* — one interleaved
+round. A set replaces the stored group only if its gigatoken throughput
+beats the stored group's, so every stored group is one coherent round — the
+best one, as judged by gigatoken — never a mix of libraries from different
+rounds. Records without a "cpu" field are attributed to --cpu, which
+defaults to this machine.
+
+render rewrites the block between <!-- benchmarks:start --> and
+<!-- benchmarks:end --> in the repo README (appending a section when the
+markers are absent): one collapsible table per (cpu, dataset) with family
+display names, throughput per implementation, and gigatoken's speedup vs
+HF/tiktoken, plus coverage footnotes from benchmarks/families.json
+(regenerate with `sweep.py --scan-families`). Rows without a gigatoken
+measurement are skipped.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BENCH_DIR = os.path.dirname(HERE)
+DEFAULT_RESULTS = os.path.join(BENCH_DIR, "results.json")
+DEFAULT_FAMILIES = os.path.join(BENCH_DIR, "families.json")
+DEFAULT_README = os.path.join(os.path.dirname(BENCH_DIR), "README.md")
+START, END = "<!-- benchmarks:start -->", "<!-- benchmarks:end -->"
+
+
+def cpu_label() -> str:
+    """Identify the CPU this benchmark ran on, e.g. "Apple M4 Max (16 cores)"."""
+    import platform
+
+    name = None
+    system = platform.system()
+    if system == "Darwin":
+        out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True)
+        name = out.stdout.strip() or None
+    elif system == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        name = line.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+    name = name or platform.processor() or platform.machine() or "unknown"
+    return f"{name} ({os.cpu_count()} cores)"
+
+
+# --- merge -----------------------------------------------------------------
+
+
+def read_records(origin: str, lines, cpu_fallback: str) -> list[dict]:
+    records = []
+    for lineno, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"{origin}:{lineno}: invalid JSON: {e}")
+        if not isinstance(rec, dict) or not all(k in rec for k in ("library", "tokenizer", "file")):
+            raise SystemExit(f"{origin}:{lineno}: not a measure.py record (needs library/tokenizer/file)")
+        rec.setdefault("cpu", cpu_fallback)
+        records.append(rec)
+    return records
+
+
+def fits(cur: dict, rec: dict) -> bool:
+    return rec["library"] not in cur["libs"] and (rec["cpu"], rec["tokenizer"], rec["file"]) == (
+        cur["cpu"],
+        cur["tokenizer"],
+        cur["file"],
+    )
+
+
+def comparison_sets(records: list[dict]) -> list[dict]:
+    sets: list[dict] = []
+    for rec in records:
+        if not sets or not fits(sets[-1], rec):
+            sets.append({"cpu": rec["cpu"], "tokenizer": rec["tokenizer"], "file": rec["file"], "libs": {}})
+        sets[-1]["libs"][rec["library"]] = rec
+    return sets
+
+
+def stored_entry(rec: dict) -> dict:
+    return {k: v for k, v in rec.items() if k not in ("library", "cpu")}
+
+
+def merge_set(results: dict, cset: dict) -> tuple[str, bool]:
+    dataset = os.path.basename(cset["file"])
+    by_dataset = results.setdefault(cset["cpu"], {}).setdefault(cset["tokenizer"], {})
+    stored = by_dataset.get(dataset)
+    new_g = cset["libs"].get("gigatoken", {}).get("mb_per_s")
+    old_g = (stored or {}).get("gigatoken", {}).get("mb_per_s")
+    if stored is not None:
+        if new_g is None:
+            return "kept (set has no gigatoken measurement to judge by)", False
+        if old_g is not None and new_g <= old_g:
+            return f"kept (gigatoken {new_g} <= stored {old_g} MB/s)", False
+    by_dataset[dataset] = {lib: stored_entry(rec) for lib, rec in sorted(cset["libs"].items())}
+    if stored is None:
+        return f"stored ({', '.join(sorted(cset['libs']))})", True
+    if old_g is None:
+        return f"updated (stored group had no gigatoken; now {new_g} MB/s)", True
+    return f"updated (gigatoken {new_g} > {old_g} MB/s)", True
+
+
+def load_results(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"{path}: invalid JSON: {e}")
+
+
+def save_results(path: str, results: dict) -> None:
+    with open(path, "w") as f:
+        json.dump(results, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def cmd_merge(args) -> None:
+    cpu = args.cpu or cpu_label()
+    batches = []
+    if args.jsonl:
+        for path in args.jsonl:
+            with open(path) as f:
+                batches.append(read_records(path, f, cpu))
+    else:
+        batches.append(read_records("<stdin>", sys.stdin, cpu))
+
+    results = load_results(args.results)
+    changed = 0
+    for records in batches:
+        for cset in comparison_sets(records):
+            outcome, wrote = merge_set(results, cset)
+            changed += wrote
+            print(f"{cset['cpu']} / {cset['tokenizer']} / {os.path.basename(cset['file'])}: {outcome}")
+    if changed:
+        save_results(args.results, results)
+    print(f"{changed} group(s) written to {args.results}" if changed else f"{args.results} unchanged")
+
+
+# --- render ----------------------------------------------------------------
+
+# Family display name per benchmarked repo; rows fall back to the repo id.
+DISPLAY = {
+    "openai-community/gpt2": "GPT-2",
+    "answerdotai/ModernBERT-base": "ModernBERT",
+    "meta-llama/Llama-3.1-8B": "Llama 3 / 3.1 / 3.2",
+    "meta-llama/Llama-3.3-70B-Instruct": "Llama 3.3",
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct": "Llama 4",
+    "Qwen/Qwen2-1.5B-Instruct": "Qwen 2 / 2.5",
+    "Qwen/Qwen3-8B": "Qwen 3",
+    "Qwen/Qwen3.5-9B": "Qwen 3.5 / 3.6",
+    "deepseek-ai/DeepSeek-V3": "DeepSeek V3 / R1 / V4",
+    "zai-org/GLM-4.7": "GLM 4",
+    "zai-org/GLM-5.2": "GLM 5",
+    "openai/gpt-oss-20b": "GPT-OSS",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "Nemotron 3",
+    "allenai/Olmo-3-1025-7B": "OLMo 2 / 3",
+    "moonshotai/Kimi-K2-Instruct": "Kimi K2",
+    "tencent/Hy3": "Hunyuan 3",
+    "microsoft/phi-4": "Phi-4",
+    "microsoft/Phi-4-mini-instruct": "Phi-4-mini",
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": "TinyLlama / Phi-3 (Llama 2)",
+    "codellama/CodeLlama-7b-hf": "CodeLlama",
+    "mistralai/Mistral-7B-Instruct-v0.3": "Mistral 7B v0.3",
+    "unsloth/gemma-2b": "Gemma 1",
+    "google/gemma-3-4b-it": "Gemma 3",
+    "google/gemma-4-E4B-it": "Gemma 4",
+}
+
+# Trailing repo-name tokens that mark a quant/format re-release, not a model.
+QUANT_TOKEN = re.compile(
+    r"(?i)^(awq|gptq|gguf|bf16|fp8|nvfp4|mxfp8|int\d+|\d+bit|w\d+a\d+(-g\d+)?"
+    r"|quantized(\.w\d+a\d+)?|dynamic|qat|ct|block|bnb)$"
+)
+
+
+def covered_names(repos: list[str]) -> list[str]:
+    """Org-stripped, quant-deduped model names for a coverage footnote."""
+    names, seen = [], set()
+    for repo in repos:
+        if "internal-testing" in repo or repo.split("/")[-1].lower().startswith("tiny-"):
+            continue
+        parts = repo.split("/")[-1].split("-")
+        while len(parts) > 1 and QUANT_TOKEN.match(parts[-1]):
+            parts.pop()
+        name = "-".join(parts)
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            names.append(name)
+    return names
+
+
+def fmt_speed(mb_per_s: float | None) -> str:
+    if mb_per_s is None:
+        return "—"
+    if mb_per_s >= 1000:
+        return f"{mb_per_s / 1000:.2f} GB/s"
+    return f"{mb_per_s:.1f} MB/s"
+
+
+def fmt_ratio(giga: float | None, other: float | None) -> str:
+    if giga is None or not other:
+        return "—"
+    ratio = giga / other
+    return f"{ratio:,.0f}×" if ratio >= 10 else f"{ratio:.1f}×"
+
+
+def render_table(cpu: str, dataset: str, tokenizers: dict, families: dict, coverage: bool) -> str | None:
+    rows = []
+    corpus_bytes = 0
+    for repo, by_dataset in tokenizers.items():
+        group = by_dataset.get(dataset)
+        if group is None or "gigatoken" not in group:
+            continue
+        corpus_bytes = max(corpus_bytes, group["gigatoken"].get("bytes", 0))
+        speeds = {lib: rec.get("mb_per_s") for lib, rec in group.items()}
+        # Coverage: the cache scan (families.json) when available, else the
+        # sweep's own shared_with candidates.
+        covers = families.get(repo) or next(
+            (rec["shared_with"] for rec in group.values() if rec.get("shared_with")), []
+        )
+        rows.append((repo, speeds, covers))
+    if not rows:
+        return None
+    rows.sort(key=lambda row: row[1].get("gigatoken") or 0, reverse=True)
+
+    coverage_notes = []
+    for repo, _, covers in rows:
+        names = covered_names(covers)
+        if len(names) > 1:
+            coverage_notes.append(f"- **{DISPLAY.get(repo, repo)}** — {', '.join(names)}")
+
+    size = f" ({corpus_bytes / 1e9:.1f} GB)" if corpus_bytes else ""
+    lines = [
+        "<details>",
+        f"<summary><b>Encoding throughput on {dataset}{size} — {cpu}</b></summary>",
+        "",
+        "Best of 3 interleaved rounds, one fresh process per measurement, all libraries with",
+        "parallelism enabled. gigatoken encodes the whole file un-split; HuggingFace",
+        "`tokenizers` (`encode_batch_fast`) gets the first 100 MB and tiktoken",
+        "(`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.",
+        "tiktoken rows exist only for tokenizers with official support.",
+        "",
+        "| Tokenizer | gigatoken | HF tokenizers | tiktoken | vs HF | vs tiktoken |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for repo, speeds, _ in rows:
+        giga, hf, tik = speeds.get("gigatoken"), speeds.get("hf"), speeds.get("tiktoken")
+        lines.append(
+            f"| {DISPLAY.get(repo, repo)} | {fmt_speed(giga)} | {fmt_speed(hf)} | {fmt_speed(tik)} "
+            f"| {fmt_ratio(giga, hf)} | {fmt_ratio(giga, tik)} |"
+        )
+    lines += [
+        "",
+        "The slowest rows are the SentencePiece-based tokenizers (Mistral 7B and below),",
+        "which remain more expensive to encode than byte-level BPE even with gigatoken's",
+        "internal SP parallelism; ModernBERT is byte-level BPE with a heavier",
+        "pretokenizer than the GPT-2 family.",
+    ]
+    if coverage and coverage_notes:
+        lines += [
+            "",
+            "Each row benchmarks one distinct tokenizer (identical vocab/merges/pretokenizer),",
+            "measured on the family's representative repo. Models verified to share it:",
+            "",
+        ] + coverage_notes
+    lines += ["", "</details>"]
+    return "\n".join(lines)
+
+
+def cmd_render(args) -> None:
+    results = load_results(args.results)
+    if not results:
+        raise SystemExit(f"{args.results}: no results to render")
+    families = {}
+    if os.path.exists(args.families):
+        with open(args.families) as f:
+            families = json.load(f)
+
+    tables = []
+    for cpu, tokenizers in results.items():
+        datasets = sorted({ds for by_dataset in tokenizers.values() for ds in by_dataset})
+        for dataset in datasets:
+            table = render_table(cpu, dataset, tokenizers, families, args.coverage)
+            if table is not None:
+                tables.append(table)
+    block = "\n".join([START, "## Benchmarks", ""] + tables + [END])
+
+    with open(args.readme) as f:
+        readme = f.read()
+    start, end = readme.find(START), readme.find(END)
+    if start == -1 and end == -1:
+        readme = readme.rstrip("\n") + "\n\n" + block + "\n"
+    elif start != -1 and end > start:
+        readme = readme[:start] + block + readme[end + len(END):]
+    else:
+        raise SystemExit(f"{args.readme}: malformed benchmark markers ({START} / {END})")
+    with open(args.readme, "w") as f:
+        f.write(readme)
+    print(f"wrote {len(tables)} table(s) to {args.readme}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    merge = sub.add_parser("merge", help="fold measurement JSONL into the results file")
+    merge.add_argument("jsonl", nargs="*", help="JSONL measurement files; stdin if omitted")
+    merge.add_argument("--results", default=DEFAULT_RESULTS, help="results JSON file to update (default: %(default)s)")
+    merge.add_argument("--cpu", default=None, help="CPU label for records that lack one (default: this machine)")
+    merge.set_defaults(func=cmd_merge)
+
+    render = sub.add_parser("render", help="rewrite the README benchmark table from the results file")
+    render.add_argument("--results", default=DEFAULT_RESULTS)
+    render.add_argument("--families", default=DEFAULT_FAMILIES, help="coverage map from sweep.py --scan-families; optional")
+    render.add_argument("--readme", default=DEFAULT_README)
+    render.add_argument("--coverage", action="store_true", help="append the per-family model coverage footnotes")
+    render.set_defaults(func=cmd_render)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
