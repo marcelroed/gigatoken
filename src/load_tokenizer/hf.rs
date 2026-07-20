@@ -200,7 +200,50 @@ pub enum HfTokenizer {
     SentencePiece(SentencePieceBPE),
 }
 
+/// Probes `model.type` alone, so an unsupported model family (WordPiece,
+/// Unigram, ...) is refused by name BEFORE the full BPE-shaped schema is
+/// applied —
+/// those files are valid JSON with a different `model.vocab`/`merges`
+/// shape, and the full parse would report a misleading deserializer error
+/// ("missing field `merges`", "invalid type: sequence, expected a map").
+#[derive(Deserialize)]
+struct ModelTypeProbe {
+    #[serde(default)]
+    model: Option<ModelTypeOnly>,
+}
+
+#[derive(Deserialize)]
+struct ModelTypeOnly {
+    #[serde(rename = "type")]
+    model_type: Option<String>,
+    /// Family markers for untyped legacy files (pre-0.9 `tokenizers`
+    /// omitted `model.type`): `unk_id` only exists on Unigram models
+    /// (e.g. t5-small, xlm-roberta) and `max_input_chars_per_word` only on
+    /// WordPiece (e.g. bert-base-uncased). `continuing_subword_prefix`
+    /// would NOT work for WordPiece detection: BPE serializes it too (the
+    /// original gpt2 upload has `"continuing_subword_prefix": ""`).
+    unk_id: Option<u64>,
+    max_input_chars_per_word: Option<u64>,
+}
+
 fn parse_tokenizer_json(data: &[u8]) -> Result<TokenizerJson> {
+    if let Ok(ModelTypeProbe { model: Some(m) }) = sonic_rs::from_slice::<ModelTypeProbe>(data) {
+        let family = match m.model_type.as_deref() {
+            Some("BPE") => None,
+            Some(other) => Some(other.to_string()),
+            None if m.unk_id.is_some() => Some("Unigram (untyped legacy file)".to_string()),
+            None if m.max_input_chars_per_word.is_some() => {
+                Some("WordPiece (untyped legacy file)".to_string())
+            }
+            None => None, // untyped BPE (pre-0.9 GPT-2-style files)
+        };
+        if let Some(family) = family {
+            return Err(eyre::eyre!(
+                "Unsupported model type \"{family}\": gigatoken supports BPE tokenizers \
+                 (byte-level, or SentencePiece-style with byte_fallback)"
+            ));
+        }
+    }
     // Inline the deserializer's own message (offending field, position,
     // snippet): the first line is often all that surfaces in test summaries
     // and short tracebacks.
@@ -764,6 +807,39 @@ mod tests {
         let json = br#"{"model": {"vocab": {"a": 0}, "merges": []}}"#;
         let tj = parse_tokenizer_json(json).unwrap();
         assert_eq!(tj.model.model_type, "BPE");
+    }
+
+    /// Unsupported model families must be refused by name, not with the
+    /// deserializer's shape error for the BPE schema (WordPiece has no
+    /// `merges`; Unigram's vocab is a `[piece, score]` list, not a map).
+    #[test]
+    fn test_unsupported_model_type_named_in_error() {
+        let wordpiece = br#"{"model": {"type": "WordPiece", "unk_token": "[UNK]",
+            "vocab": {"[UNK]": 0, "hello": 1}}}"#;
+        let unigram = br#"{"model": {"type": "Unigram", "unk_id": 0,
+            "vocab": [["<unk>", 0.0], ["hello", -3.1]]}}"#;
+        // Pre-0.9 tokenizers files omit model.type; the family is inferred
+        // from its marker fields (t5-small / bert-base-uncased shapes).
+        let untyped_unigram = br#"{"model": {"unk_id": 0, "vocab": [["<unk>", 0.0]]}}"#;
+        let untyped_wordpiece: &[u8] = b"{\"model\": {\"unk_token\": \"[UNK]\",
+            \"continuing_subword_prefix\": \"##\", \"max_input_chars_per_word\": 100,
+            \"vocab\": {\"[UNK]\": 0}}}";
+        for (json, name) in [
+            (&wordpiece[..], "WordPiece"),
+            (&unigram[..], "Unigram"),
+            (&untyped_unigram[..], "Unigram (untyped legacy file)"),
+            (&untyped_wordpiece[..], "WordPiece (untyped legacy file)"),
+        ] {
+            let err = match parse_tokenizer_json(json) {
+                Ok(_) => panic!("expected {name} to be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(&format!("Unsupported model type \"{name}\"")),
+                "unhelpful {name} error: {err}"
+            );
+            assert!(!err.contains("missing field"), "shape error leaked: {err}");
+        }
     }
 
     #[test]
