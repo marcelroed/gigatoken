@@ -212,13 +212,19 @@ COVERS = {
 }
 
 
-# README table order (results.json sorts CPU keys alphabetically); new
-# machines go underneath the existing tables. Unlisted CPUs sort last.
+# README table order (results.json sorts CPU keys alphabetically); unlisted
+# CPUs sort last.
 CPU_ORDER = [
+    "AMD EPYC 9565 72-Core Processor (288 cores)",
     "Apple M4 Max (16 cores)",
     "AMD Ryzen 7 9800X3D 8-Core Processor (16 cores)",
-    "AMD EPYC 9565 72-Core Processor (288 cores)",
 ]
+
+# Hand-curated table headings where the raw cpu_label() is misleading (the
+# EPYC's 288 comes from os.cpu_count() counting SMT threads over two sockets).
+CPU_DISPLAY = {
+    "AMD EPYC 9565 72-Core Processor (288 cores)": "AMD EPYC 9565 72-Core Processor x 2 sockets (144 cores)",
+}
 
 
 def fmt_speed(mb_per_s: float | None) -> str:
@@ -236,7 +242,7 @@ def fmt_ratio(giga: float | None, other: float | None) -> str:
     return f"{ratio:,.0f}×" if ratio >= 10 else f"{ratio:.1f}×"
 
 
-def render_table(cpu: str, dataset: str, tokenizers: dict, include_notes: bool = True) -> str | None:
+def render_table(cpu: str, dataset: str, tokenizers: dict) -> str | None:
     rows = []
     corpus_bytes = 0
     for repo, by_dataset in tokenizers.items():
@@ -250,20 +256,10 @@ def render_table(cpu: str, dataset: str, tokenizers: dict, include_notes: bool =
         return None
     rows.sort(key=lambda row: row[1].get("gigatoken") or 0, reverse=True)
 
-    coverage_notes = [
-        f"- **{DISPLAY.get(repo, repo)}** — {COVERS[repo]}" for repo, _ in rows if repo in COVERS
-    ]
-
     size = f" ({corpus_bytes / 1e9:.1f} GB)" if corpus_bytes else ""
     lines = [
         "<details>",
-        f"<summary><b>Encoding throughput on {dataset}{size} — {cpu}</b></summary>",
-        "",
-        "Best of 3 interleaved rounds, one fresh process per measurement, all libraries with parallelism enabled.",
-        "Gigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.",
-        "HuggingFace tokenizers (`encode_batch_fast`) gets the first 100 MB and tiktoken (`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.",
-        "This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout.",
-        "Tiktoken rows are currently only filled in for tokenizers with official support.",
+        f"<summary><b>Encoding throughput on {dataset}{size} — {CPU_DISPLAY.get(cpu, cpu)}</b></summary>",
         "",
         "| Tokenizer | gigatoken | HF tokenizers | tiktoken | vs HF | vs tiktoken |",
         "|---|---:|---:|---:|---:|---:|",
@@ -274,17 +270,29 @@ def render_table(cpu: str, dataset: str, tokenizers: dict, include_notes: bool =
             f"| {DISPLAY.get(repo, repo)} | {fmt_speed(giga)} | {fmt_speed(hf)} | {fmt_speed(tik)} "
             f"| {fmt_ratio(giga, hf)} | {fmt_ratio(giga, tik)} |"
         )
-    lines += [
+    lines += ["", "</details>"]
+    return "\n".join(lines)
+
+
+def render_notes(repos: set[str]) -> str:
+    """The shared methodology/coverage spoiler placed beneath the tables."""
+    coverage_notes = [f"- **{DISPLAY.get(repo, repo)}** — {COVERS[repo]}" for repo in COVERS if repo in repos]
+    lines = [
+        "<details>",
+        "<summary><b>Benchmark details</b></summary>",
+        "",
+        "Best of 3 interleaved rounds, one fresh process per measurement, all libraries with parallelism enabled.",
+        "Gigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.",
+        "HuggingFace tokenizers (`encode_batch_fast`) gets the first 100 MB and tiktoken (`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.",
+        "This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout.",
+        "Tiktoken rows are currently only filled in for tokenizers with official support.",
         "",
         "The slowest rows are the SentencePiece-based tokenizers (the Gemma, Llama 2,",
         "and Mistral vocabs), which remain more expensive to encode than byte-level",
-        "BPE even with gigatoken's",
-        "internal SP parallelism; ModernBERT is byte-level BPE with a heavier",
-        "pretokenizer than the GPT-2 family.",
+        "BPE even with gigatoken's internal SP parallelism; ModernBERT is byte-level",
+        "BPE with a heavier pretokenizer than the GPT-2 family.",
     ]
-    if not include_notes:
-        lines += ["", "Per-row model coverage is listed under the first table."]
-    elif coverage_notes:
+    if coverage_notes:
         lines += [
             "",
             "Each row is one distinct tokenizer (identical vocab/merges/pretokenizer), measured",
@@ -308,10 +316,16 @@ def cmd_render(args) -> None:
     for cpu, tokenizers in sorted(results.items(), key=lambda kv: cpu_rank(kv[0])):
         datasets = sorted({ds for by_dataset in tokenizers.values() for ds in by_dataset})
         for dataset in datasets:
-            table = render_table(cpu, dataset, tokenizers, include_notes=not tables)
+            table = render_table(cpu, dataset, tokenizers)
             if table is not None:
                 tables.append(table)
-    block = "\n".join([START, "## Benchmarks", ""] + tables + [END])
+    tabled_repos = {
+        repo
+        for tokenizers in results.values()
+        for repo, by_dataset in tokenizers.items()
+        if any("gigatoken" in group for group in by_dataset.values())
+    }
+    block = "\n".join([START, "## Benchmarks", ""] + tables + [render_notes(tabled_repos), END])
 
     with open(args.readme) as f:
         readme = f.read()

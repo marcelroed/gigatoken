@@ -125,117 +125,7 @@ Additionally, Gigatoken uses concurrent data structures to use multiprocessing i
 ## Benchmarks
 
 <details>
-<summary><b>Encoding throughput on owt_train.txt (11.9 GB) — Apple M4 Max (16 cores)</b></summary>
-
-Best of 3 interleaved rounds, one fresh process per measurement, all libraries with parallelism enabled.
-Gigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.
-HuggingFace tokenizers (`encode_batch_fast`) gets the first 100 MB and tiktoken (`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.
-This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout.
-Tiktoken rows are currently only filled in for tokenizers with official support.
-
-| Tokenizer | gigatoken | HF tokenizers | tiktoken | vs HF | vs tiktoken |
-|---|---:|---:|---:|---:|---:|
-| GPT-2 | 8.79 GB/s | 6.9 MB/s | 62.8 MB/s | 1,268× | 140× |
-| Nemotron 3 | 7.82 GB/s | 10.9 MB/s | — | 715× | — |
-| Phi-4 | 7.76 GB/s | 7.7 MB/s | — | 1,012× | — |
-| Llama 3 / 3.1 / 3.2 | 7.60 GB/s | 11.2 MB/s | — | 676× | — |
-| OLMo 2 / 3 | 7.56 GB/s | 5.8 MB/s | — | 1,299× | — |
-| Llama 3.3 | 7.50 GB/s | 15.7 MB/s | — | 479× | — |
-| Phi-4-mini | 6.97 GB/s | 7.2 MB/s | — | 964× | — |
-| Kimi K2 | 6.88 GB/s | — | — | — | — |
-| Llama 4 | 6.81 GB/s | 11.6 MB/s | — | 590× | — |
-| Qwen 2 / 2.5 | 6.37 GB/s | 5.8 MB/s | — | 1,105× | — |
-| Qwen 3 | 6.36 GB/s | 6.9 MB/s | — | 918× | — |
-| Qwen 3.5 / 3.6 | 6.31 GB/s | 6.3 MB/s | — | 994× | — |
-| GPT-OSS | 6.20 GB/s | 20.2 MB/s | 87.2 MB/s | 306× | 71× |
-| GLM 4 | 6.17 GB/s | 15.8 MB/s | — | 392× | — |
-| DeepSeek V3 / R1 / V4 | 5.68 GB/s | 7.2 MB/s | — | 788× | — |
-| GLM 5 | 5.55 GB/s | 12.2 MB/s | — | 456× | — |
-| ModernBERT | 2.64 GB/s | 5.8 MB/s | — | 452× | — |
-| Mistral 7B v0.3 | 1.99 GB/s | 95.1 MB/s | — | 21× | — |
-| Gemma 4 | 1.82 GB/s | 85.2 MB/s | — | 21× | — |
-| CodeLlama | 1.73 GB/s | 80.2 MB/s | — | 22× | — |
-| TinyLlama / Phi-3 (Llama 2) | 1.69 GB/s | 80.1 MB/s | — | 21× | — |
-| Gemma 1 | 1.42 GB/s | 85.7 MB/s | — | 17× | — |
-| Gemma 3 | 1.38 GB/s | 82.2 MB/s | — | 17× | — |
-
-The slowest rows are the SentencePiece-based tokenizers (the Gemma, Llama 2,
-and Mistral vocabs), which remain more expensive to encode than byte-level
-BPE even with gigatoken's
-internal SP parallelism; ModernBERT is byte-level BPE with a heavier
-pretokenizer than the GPT-2 family.
-
-Each row is one distinct tokenizer (identical vocab/merges/pretokenizer), measured
-on a representative repo. Rows whose tokenizer is shared beyond their own name
-(verified by matching tokenizer definitions across the local HF model cache) cover:
-
-- **Nemotron 3** — Nemotron 3 Nano, Super, and Ultra
-- **Llama 3 / 3.1 / 3.2** — Llama 3 / 3.1 / 3.2, DeepSeek-R1-Distill-Llama, Hermes 3, Saiga, and other Llama-3 finetunes
-- **Llama 3.3** — Llama 3.3, Llama-3.1-Nemotron-Nano-VL, SmolLM3, Kanana 1.5, jina-embeddings-v5, Ultravox
-- **Phi-4-mini** — Phi-4-mini and Phi-4-multimodal
-- **Kimi K2** — Kimi K2 / K2.5 / K2.6 / K2.7, Kimi-Linear, Kimi-VL, Moonlight
-- **Qwen 2 / 2.5** — Qwen 2 and 2.5 (incl. Coder and VL), Qwen3-Coder, Qwen3-VL, DeepSeek-R1 Qwen distills, MiMo V2.5, MiniCPM-o 2.6, InternVL3
-- **Qwen 3** — Qwen 3 (incl. Embedding and Reranker), Qwen2.5-Omni, Qwen3-VL-Embedding, MiMo V2.5 Pro, jina-reranker-m0, pplx-embed, MOSS-TTS, Zeta
-- **GLM 4** — GLM 4.1V, 4.5, and 4.7
-- **DeepSeek V3 / R1 / V4** — DeepSeek V3 / V3.1 / V3.2, R1, V4 Flash and Pro, DeepSeek-VL2
-- **GLM 5** — GLM 5 / 5.2 and GLM-4.7-Flash
-- **Gemma 4** — Gemma 4 (dense, MoE, and E-series) and DiffusionGemma
-- **TinyLlama / Phi-3 (Llama 2)** — TinyLlama, Phi-3-mini, Phi-3.5-mini and Phi-3.5-vision (the Llama 2 vocab)
-- **Gemma 3** — Gemma 3 (270M–27B) and EmbeddingGemma
-
-</details>
-<details>
-<summary><b>Encoding throughput on owt_train.txt (11.9 GB) — AMD Ryzen 7 9800X3D 8-Core Processor (16 cores)</b></summary>
-
-Best of 3 interleaved rounds, one fresh process per measurement, all libraries with parallelism enabled.
-Gigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.
-HuggingFace tokenizers (`encode_batch_fast`) gets the first 100 MB and tiktoken (`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.
-This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout.
-Tiktoken rows are currently only filled in for tokenizers with official support.
-
-| Tokenizer | gigatoken | HF tokenizers | tiktoken | vs HF | vs tiktoken |
-|---|---:|---:|---:|---:|---:|
-| GPT-2 | 6.27 GB/s | 59.0 MB/s | 92.1 MB/s | 106× | 68× |
-| Phi-4 | 6.09 GB/s | 55.4 MB/s | — | 110× | — |
-| OLMo 2 / 3 | 6.06 GB/s | 55.4 MB/s | — | 109× | — |
-| Phi-4-mini | 5.80 GB/s | 54.6 MB/s | — | 106× | — |
-| GPT-OSS | 5.68 GB/s | 79.6 MB/s | 112.7 MB/s | 71× | 50× |
-| Qwen 3 | 5.34 GB/s | 54.4 MB/s | — | 98× | — |
-| Qwen 2 / 2.5 | 5.30 GB/s | 51.7 MB/s | — | 103× | — |
-| Llama 3.3 | 5.26 GB/s | 79.9 MB/s | — | 66× | — |
-| Llama 3 / 3.1 / 3.2 | 5.24 GB/s | 79.5 MB/s | — | 66× | — |
-| Kimi K2 | 5.23 GB/s | — | — | — | — |
-| Qwen 3.5 / 3.6 | 5.22 GB/s | 51.6 MB/s | — | 101× | — |
-| Nemotron 3 | 5.20 GB/s | 79.0 MB/s | — | 66× | — |
-| GLM 5 | 5.05 GB/s | 79.5 MB/s | — | 63× | — |
-| GLM 4 | 5.04 GB/s | 79.5 MB/s | — | 63× | — |
-| Llama 4 | 5.03 GB/s | 78.2 MB/s | — | 64× | — |
-| DeepSeek V3 / R1 / V4 | 4.21 GB/s | 51.6 MB/s | — | 82× | — |
-| ModernBERT | 2.84 GB/s | 52.1 MB/s | — | 54× | — |
-| Mistral 7B v0.3 | 1.47 GB/s | 91.6 MB/s | — | 16× | — |
-| Gemma 4 | 1.45 GB/s | 78.8 MB/s | — | 18× | — |
-| CodeLlama | 1.38 GB/s | 85.2 MB/s | — | 16× | — |
-| TinyLlama / Phi-3 (Llama 2) | 1.37 GB/s | 84.9 MB/s | — | 16× | — |
-| Gemma 1 | 1.14 GB/s | 84.9 MB/s | — | 13× | — |
-| Gemma 3 | 1.12 GB/s | 83.0 MB/s | — | 13× | — |
-
-The slowest rows are the SentencePiece-based tokenizers (the Gemma, Llama 2,
-and Mistral vocabs), which remain more expensive to encode than byte-level
-BPE even with gigatoken's
-internal SP parallelism; ModernBERT is byte-level BPE with a heavier
-pretokenizer than the GPT-2 family.
-
-Per-row model coverage is listed under the first table.
-
-</details>
-<details>
-<summary><b>Encoding throughput on owt_train.txt (11.9 GB) — AMD EPYC 9565 72-Core Processor (288 cores)</b></summary>
-
-Best of 3 interleaved rounds, one fresh process per measurement, all libraries with parallelism enabled.
-Gigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.
-HuggingFace tokenizers (`encode_batch_fast`) gets the first 100 MB and tiktoken (`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.
-This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout.
-Tiktoken rows are currently only filled in for tokenizers with official support.
+<summary><b>Encoding throughput on owt_train.txt (11.9 GB) — AMD EPYC 9565 72-Core Processor x 2 sockets (144 cores)</b></summary>
 
 | Tokenizer | gigatoken | HF tokenizers | tiktoken | vs HF | vs tiktoken |
 |---|---:|---:|---:|---:|---:|
@@ -263,13 +153,98 @@ Tiktoken rows are currently only filled in for tokenizers with official support.
 | Gemma 3 | 3.43 GB/s | 357.2 MB/s | — | 9.6× | — |
 | Gemma 1 | 2.51 GB/s | 342.2 MB/s | — | 7.3× | — |
 
+</details>
+<details>
+<summary><b>Encoding throughput on owt_train.txt (11.9 GB) — Apple M4 Max (16 cores)</b></summary>
+
+| Tokenizer | gigatoken | HF tokenizers | tiktoken | vs HF | vs tiktoken |
+|---|---:|---:|---:|---:|---:|
+| GPT-2 | 8.79 GB/s | 6.9 MB/s | 62.8 MB/s | 1,268× | 140× |
+| Nemotron 3 | 7.82 GB/s | 10.9 MB/s | — | 715× | — |
+| Phi-4 | 7.76 GB/s | 7.7 MB/s | — | 1,012× | — |
+| Llama 3 / 3.1 / 3.2 | 7.60 GB/s | 11.2 MB/s | — | 676× | — |
+| OLMo 2 / 3 | 7.56 GB/s | 5.8 MB/s | — | 1,299× | — |
+| Llama 3.3 | 7.50 GB/s | 15.7 MB/s | — | 479× | — |
+| Phi-4-mini | 6.97 GB/s | 7.2 MB/s | — | 964× | — |
+| Kimi K2 | 6.88 GB/s | — | — | — | — |
+| Llama 4 | 6.81 GB/s | 11.6 MB/s | — | 590× | — |
+| Qwen 2 / 2.5 | 6.37 GB/s | 5.8 MB/s | — | 1,105× | — |
+| Qwen 3 | 6.36 GB/s | 6.9 MB/s | — | 918× | — |
+| Qwen 3.5 / 3.6 | 6.31 GB/s | 6.3 MB/s | — | 994× | — |
+| GPT-OSS | 6.20 GB/s | 20.2 MB/s | 87.2 MB/s | 306× | 71× |
+| GLM 4 | 6.17 GB/s | 15.8 MB/s | — | 392× | — |
+| DeepSeek V3 / R1 / V4 | 5.68 GB/s | 7.2 MB/s | — | 788× | — |
+| GLM 5 | 5.55 GB/s | 12.2 MB/s | — | 456× | — |
+| ModernBERT | 2.64 GB/s | 5.8 MB/s | — | 452× | — |
+| Mistral 7B v0.3 | 1.99 GB/s | 95.1 MB/s | — | 21× | — |
+| Gemma 4 | 1.82 GB/s | 85.2 MB/s | — | 21× | — |
+| CodeLlama | 1.73 GB/s | 80.2 MB/s | — | 22× | — |
+| TinyLlama / Phi-3 (Llama 2) | 1.69 GB/s | 80.1 MB/s | — | 21× | — |
+| Gemma 1 | 1.42 GB/s | 85.7 MB/s | — | 17× | — |
+| Gemma 3 | 1.38 GB/s | 82.2 MB/s | — | 17× | — |
+
+</details>
+<details>
+<summary><b>Encoding throughput on owt_train.txt (11.9 GB) — AMD Ryzen 7 9800X3D 8-Core Processor (16 cores)</b></summary>
+
+| Tokenizer | gigatoken | HF tokenizers | tiktoken | vs HF | vs tiktoken |
+|---|---:|---:|---:|---:|---:|
+| GPT-2 | 6.27 GB/s | 59.0 MB/s | 92.1 MB/s | 106× | 68× |
+| Phi-4 | 6.09 GB/s | 55.4 MB/s | — | 110× | — |
+| OLMo 2 / 3 | 6.06 GB/s | 55.4 MB/s | — | 109× | — |
+| Phi-4-mini | 5.80 GB/s | 54.6 MB/s | — | 106× | — |
+| GPT-OSS | 5.68 GB/s | 79.6 MB/s | 112.7 MB/s | 71× | 50× |
+| Qwen 3 | 5.34 GB/s | 54.4 MB/s | — | 98× | — |
+| Qwen 2 / 2.5 | 5.30 GB/s | 51.7 MB/s | — | 103× | — |
+| Llama 3.3 | 5.26 GB/s | 79.9 MB/s | — | 66× | — |
+| Llama 3 / 3.1 / 3.2 | 5.24 GB/s | 79.5 MB/s | — | 66× | — |
+| Kimi K2 | 5.23 GB/s | — | — | — | — |
+| Qwen 3.5 / 3.6 | 5.22 GB/s | 51.6 MB/s | — | 101× | — |
+| Nemotron 3 | 5.20 GB/s | 79.0 MB/s | — | 66× | — |
+| GLM 5 | 5.05 GB/s | 79.5 MB/s | — | 63× | — |
+| GLM 4 | 5.04 GB/s | 79.5 MB/s | — | 63× | — |
+| Llama 4 | 5.03 GB/s | 78.2 MB/s | — | 64× | — |
+| DeepSeek V3 / R1 / V4 | 4.21 GB/s | 51.6 MB/s | — | 82× | — |
+| ModernBERT | 2.84 GB/s | 52.1 MB/s | — | 54× | — |
+| Mistral 7B v0.3 | 1.47 GB/s | 91.6 MB/s | — | 16× | — |
+| Gemma 4 | 1.45 GB/s | 78.8 MB/s | — | 18× | — |
+| CodeLlama | 1.38 GB/s | 85.2 MB/s | — | 16× | — |
+| TinyLlama / Phi-3 (Llama 2) | 1.37 GB/s | 84.9 MB/s | — | 16× | — |
+| Gemma 1 | 1.14 GB/s | 84.9 MB/s | — | 13× | — |
+| Gemma 3 | 1.12 GB/s | 83.0 MB/s | — | 13× | — |
+
+</details>
+<details>
+<summary><b>Benchmark details</b></summary>
+
+Best of 3 interleaved rounds, one fresh process per measurement, all libraries with parallelism enabled.
+Gigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.
+HuggingFace tokenizers (`encode_batch_fast`) gets the first 100 MB and tiktoken (`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.
+This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout.
+Tiktoken rows are currently only filled in for tokenizers with official support.
+
 The slowest rows are the SentencePiece-based tokenizers (the Gemma, Llama 2,
 and Mistral vocabs), which remain more expensive to encode than byte-level
-BPE even with gigatoken's
-internal SP parallelism; ModernBERT is byte-level BPE with a heavier
-pretokenizer than the GPT-2 family.
+BPE even with gigatoken's internal SP parallelism; ModernBERT is byte-level
+BPE with a heavier pretokenizer than the GPT-2 family.
 
-Per-row model coverage is listed under the first table.
+Each row is one distinct tokenizer (identical vocab/merges/pretokenizer), measured
+on a representative repo. Rows whose tokenizer is shared beyond their own name
+(verified by matching tokenizer definitions across the local HF model cache) cover:
+
+- **Llama 3 / 3.1 / 3.2** — Llama 3 / 3.1 / 3.2, DeepSeek-R1-Distill-Llama, Hermes 3, Saiga, and other Llama-3 finetunes
+- **Llama 3.3** — Llama 3.3, Llama-3.1-Nemotron-Nano-VL, SmolLM3, Kanana 1.5, jina-embeddings-v5, Ultravox
+- **Qwen 2 / 2.5** — Qwen 2 and 2.5 (incl. Coder and VL), Qwen3-Coder, Qwen3-VL, DeepSeek-R1 Qwen distills, MiMo V2.5, MiniCPM-o 2.6, InternVL3
+- **Qwen 3** — Qwen 3 (incl. Embedding and Reranker), Qwen2.5-Omni, Qwen3-VL-Embedding, MiMo V2.5 Pro, jina-reranker-m0, pplx-embed, MOSS-TTS, Zeta
+- **DeepSeek V3 / R1 / V4** — DeepSeek V3 / V3.1 / V3.2, R1, V4 Flash and Pro, DeepSeek-VL2
+- **GLM 4** — GLM 4.1V, 4.5, and 4.7
+- **GLM 5** — GLM 5 / 5.2 and GLM-4.7-Flash
+- **Nemotron 3** — Nemotron 3 Nano, Super, and Ultra
+- **Kimi K2** — Kimi K2 / K2.5 / K2.6 / K2.7, Kimi-Linear, Kimi-VL, Moonlight
+- **Phi-4-mini** — Phi-4-mini and Phi-4-multimodal
+- **TinyLlama / Phi-3 (Llama 2)** — TinyLlama, Phi-3-mini, Phi-3.5-mini and Phi-3.5-vision (the Llama 2 vocab)
+- **Gemma 3** — Gemma 3 (270M–27B) and EmbeddingGemma
+- **Gemma 4** — Gemma 4 (dense, MoE, and E-series) and DiffusionGemma
 
 </details>
 <!-- benchmarks:end -->
