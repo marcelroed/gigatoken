@@ -2,7 +2,7 @@
 
 <div align="center">
 
-~300-1000x faster than HuggingFace's tokenizers, drop-in replacement.
+~1000x faster than HuggingFace's tokenizers, drop-in replacement.
 
 *Tokenize your text data at GB/s!*
 
@@ -220,17 +220,14 @@ Additionally, Gigatoken uses concurrent data structures to use multiprocessing i
 Best of 3 interleaved rounds, one fresh process per measurement, all libraries with parallelism enabled.
 Gigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.
 HuggingFace tokenizers (`encode_batch_fast`) gets the first 100 MB and tiktoken (`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.
-This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout.
+This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout processing.
 Tiktoken rows are currently only filled in for tokenizers with official support.
 
-The slowest rows are the SentencePiece-based tokenizers (the Gemma, Llama 2,
-and Mistral vocabs), which remain more expensive to encode than byte-level
-BPE even with gigatoken's internal SP parallelism; ModernBERT is byte-level
-BPE with a heavier pretokenizer than the GPT-2 family.
+The slowest rows are the SentencePiece-based tokenizers, which are only somewhat optimized in Gigatoken.
 
-Each row is one distinct tokenizer (identical vocab/merges/pretokenizer), measured
-on a representative repo. Rows whose tokenizer is shared beyond their own name
-(verified by matching tokenizer definitions across the local HF model cache) cover:
+Each row is one distinct tokenizer (identical vocab/merges/pretokenizer), measured on a representative repo.
+If you don't see your tokenizer here, it's likely based on some existing one.
+For instance:
 
 - **Llama 3 / 3.1 / 3.2** — Llama 3 / 3.1 / 3.2, DeepSeek-R1-Distill-Llama, Hermes 3, Saiga, and other Llama-3 finetunes
 - **Llama 3.3** — Llama 3.3, Llama-3.1-Nemotron-Nano-VL, SmolLM3, Kanana 1.5, jina-embeddings-v5, Ultravox

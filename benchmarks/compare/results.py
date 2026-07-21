@@ -284,20 +284,17 @@ def render_notes(repos: set[str]) -> str:
         "Best of 3 interleaved rounds, one fresh process per measurement, all libraries with parallelism enabled.",
         "Gigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.",
         "HuggingFace tokenizers (`encode_batch_fast`) gets the first 100 MB and tiktoken (`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.",
-        "This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout.",
+        "This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout processing.",
         "Tiktoken rows are currently only filled in for tokenizers with official support.",
         "",
-        "The slowest rows are the SentencePiece-based tokenizers (the Gemma, Llama 2,",
-        "and Mistral vocabs), which remain more expensive to encode than byte-level",
-        "BPE even with gigatoken's internal SP parallelism; ModernBERT is byte-level",
-        "BPE with a heavier pretokenizer than the GPT-2 family.",
+        "The slowest rows are the SentencePiece-based tokenizers, which are only somewhat optimized in Gigatoken.",
     ]
     if coverage_notes:
         lines += [
             "",
-            "Each row is one distinct tokenizer (identical vocab/merges/pretokenizer), measured",
-            "on a representative repo. Rows whose tokenizer is shared beyond their own name",
-            "(verified by matching tokenizer definitions across the local HF model cache) cover:",
+            "Each row is one distinct tokenizer (identical vocab/merges/pretokenizer), measured on a representative repo.",
+            "If you don't see your tokenizer here, it's likely based on some existing one.",
+            "For instance:",
             "",
         ] + coverage_notes
     lines += ["", "</details>"]
