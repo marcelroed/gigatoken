@@ -281,13 +281,13 @@ def render_notes(repos: set[str]) -> str:
         "<details>",
         "<summary><b>Benchmark details</b></summary>",
         "",
-        "Best of 3 interleaved rounds, one fresh process per measurement, all libraries with parallelism enabled.",
+        "OWT (openwebtext) was chosen because it's roughly representative of the text you get after extraction from CommonCrawl documents.",
         "Gigatoken encodes the whole file un-split, and is thus doing more work than the other tokenizers to find the split boundaries and automatically parallelize.",
         "HuggingFace tokenizers (`encode_batch_fast`) gets the first 100 MB and tiktoken (`encode_ordinary_batch`) the first 1 GB, both presplit on `<|endoftext|>`.",
         "This is fair because neither of the compared tokenizers do caching, meaning the speed is roughly uniform throughout processing.",
         "Tiktoken rows are currently only filled in for tokenizers with official support.",
         "",
-        "The slowest rows are the SentencePiece-based tokenizers, which are only somewhat optimized in Gigatoken.",
+        "The slowest rows are the SentencePiece-based tokenizers, which are not well optimized in Gigatoken.",
     ]
     if coverage_notes:
         lines += [
