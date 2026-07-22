@@ -1,0 +1,38 @@
+name: ci-tokenforge
+
+on:
+  push:
+    branches: [main, feat/wordpiece-sp-tokenizers]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test (nightly, edition 2024)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace
+        run: cargo build --workspace --all-targets
+      - name: Test workspace
+        run: cargo test --workspace
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+  bench-smoke:
+    name: cargo bench compile (no run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile benches
+        run: cargo bench --workspace --no-run
