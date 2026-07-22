@@ -1,0 +1,11 @@
+[package]
+name = "gigatoken-sp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fast SentencePiece unigram (Viterbi) tokenizer — a clean alternative to gigatoken's BPE-based SP path."
+
+[dependencies]
+rayon = "1.11"
+
+[workspace]

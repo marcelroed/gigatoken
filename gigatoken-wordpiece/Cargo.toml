@@ -1,0 +1,11 @@
+[package]
+name = "gigatoken-wordpiece"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fast WordPiece tokenizer (BERT-family) — fills gigatoken's missing WordPiece support."
+
+[dependencies]
+rayon = "1.11"
+
+[workspace]

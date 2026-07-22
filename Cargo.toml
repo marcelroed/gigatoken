@@ -126,3 +126,8 @@ harness = false
 
 [lints.rust]
 unused = "allow"
+
+# New workspace members: fill gigatoken's documented WordPiece/SentencePiece gaps.
+[workspace]
+members = ["gigatoken-wordpiece", "gigatoken-sp"]
+resolver = "2"
