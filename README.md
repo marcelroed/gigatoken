@@ -58,72 +58,6 @@ tokens = tokenizer.encode_files(file_source)
 Using the Gigatoken API lets the Rust implementation read data directly, and skips as much overhead as possible while allowing for maximum parallelism.
 Keep in mind that passing Python data structures through this API still incurs the overhead of reading from Python.
 
-
-## FAQ
-### Q: Did you just way over-optimize for a specific CPU and tokenizer? How is it so fast?
-No, I way over-optimized for every combination of these!
-The results are very consistent across CPUs (modern x86 and ARM), and across specific tokenizers.
-
-The major improvements are in optimizing heavily an implementation that usually is outsourced to a Regex engine (pretokenization) using SIMD, minimizing branching and other tricks, as well as heavily optimizing caching of pretoken mappings (if a word has been seen before, look it up its encoded tokens efficiently).
-Caching is a very hard problem in this domain since the cache grows very quickly, and pretoken distributions are very long-tailed.
-
-Finally, interactions with Python are minimized, and threads have minimal interactions with each other.
-
-
-### Q: How can I quickly check if my tokenizer is supported?
-You can try it out without installing anything! The following command will validate and time tokenization for a given HuggingFace model repo: 
-
-```bash
-# Download your data
-wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz  # Just an example!
-gunzip owt_train.txt.gz
-```
-
-```bash
-uvx --with tokenizers gigatoken bench 'openai-community/gpt2' owt_train.txt \
-    --validate --doc-separator "<|endoftext|>"
-```
-```bash
-      cpu: Apple M4 Max, 16 cores
-gigatoken:    1.432 s |   11920.51 MB at  8327.05 MB/s |  2701.65 Mtok at 1887.23 Mtok/s
-       hf:   16.250 s |     100.00 MB at     6.15 MB/s |    22.76 Mtok at    1.40 Mtok/s
-gigatoken is 1353.13x faster than hf
-validation OK: 20401 documents match
-```
-
-```bash
-      cpu: AMD EPYC 9565 72-Core Processor, 144 cores, 2 sockets
-gigatoken:    0.486 s |   11920.51 MB at 24532.45 MB/s |  2701.65 Mtok at 5564.94 Mtok/s
-       hf:    4.033 s |     100.00 MB at    24.80 MB/s |    22.76 Mtok at    5.63 Mtok/s
-gigatoken is 989.21x faster than hf
-validation OK: 20401 documents match
-```
-At the rates we see on the EPYC CPU, you could tokenize the [entirety of Common Crawl](https://arxiv.org/pdf/2211.04325) (often considered to be the entire internet, 130 trillion tokens) in just under 6.5 hours!
-
-This example uses the train sample from [this dataset](https://huggingface.co/datasets/stanford-cs336/owt-sample), and the CLI by default subsets to the first 100MB of the file for validation and comparison with HF.
-You can see help for these flags with `uvx gigatoken bench --help`.
-You might need to run your commands twice on macOS to get a good reading, since the first run will always perform a security scan, which will slow down the Rust code.
-
-
-### Q: I've found a mismatch/slow use-case, is this expected?
-Most likely not! Despite reasonably wide testing I don't have every use-case on hand, so please report anything you find in a [GitHub Issue](https://github.com/marcelroed/gigatoken/issues) so I can address it as soon as possible.
-
-
-<!--
-## How does Gigatoken work?
-
-Gigatoken came from a few observations:
-* A majority of the time in current tokenizers is spent on pretokenization -> 
-
-Gigatoken implements pretokenizers that run at >2GB/s/thread
-
-Gigatoken is faster than other libraries due to algorithmic and systems changes.
-One key benefit of using Gigatoken is that it replaces the regex expression used by almost all tokenizers to do pre-tokenization with a custom implementation of the exact same method.
-This is a serious bottleneck for other implementations, and is a big part in this library's breakneck speeds.
-Additionally, Gigatoken uses concurrent data structures to use multiprocessing in more places.
-\* All reference speeds in this section are measured on an M4 Pro CPU
--->
-
 <!-- benchmarks:start -->
 ## Benchmarks
 
@@ -248,6 +182,73 @@ For instance:
 
 </details>
 <!-- benchmarks:end -->
+
+
+## FAQ
+### Q: Did you just way over-optimize for a specific CPU and tokenizer? How is it so fast?
+No, I way over-optimized for every combination of these!
+The results are very consistent across CPUs (modern x86 and ARM), and across specific tokenizers.
+
+The major improvements are in optimizing heavily an implementation that usually is outsourced to a Regex engine (pretokenization) using SIMD, minimizing branching and other tricks, as well as heavily optimizing caching of pretoken mappings (if a word has been seen before, look it up its encoded tokens efficiently).
+Caching is a very hard problem in this domain since the cache grows very quickly, and pretoken distributions are very long-tailed.
+
+Some gains are also achieved from minimizing interactions with Python, and avoiding communication between threads.
+
+
+### Q: How can I quickly check if my tokenizer is supported?
+You can try it out without installing anything! The following command will validate and time tokenization for a given HuggingFace model repo: 
+
+```bash
+# Download your data
+wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz  # Just an example!
+gunzip owt_train.txt.gz
+```
+
+```bash
+uvx --with tokenizers gigatoken bench 'openai-community/gpt2' owt_train.txt \
+    --validate --doc-separator "<|endoftext|>"
+```
+```bash
+      cpu: Apple M4 Max, 16 cores
+gigatoken:    1.432 s |   11920.51 MB at  8327.05 MB/s |  2701.65 Mtok at 1887.23 Mtok/s
+       hf:   16.250 s |     100.00 MB at     6.15 MB/s |    22.76 Mtok at    1.40 Mtok/s
+gigatoken is 1353.13x faster than hf
+validation OK: 20401 documents match
+```
+
+```bash
+      cpu: AMD EPYC 9565 72-Core Processor, 144 cores, 2 sockets
+gigatoken:    0.486 s |   11920.51 MB at 24532.45 MB/s |  2701.65 Mtok at 5564.94 Mtok/s
+       hf:    4.033 s |     100.00 MB at    24.80 MB/s |    22.76 Mtok at    5.63 Mtok/s
+gigatoken is 989.21x faster than hf
+validation OK: 20401 documents match
+```
+At the rates we see on the EPYC CPU, you could tokenize the [entirety of Common Crawl](https://arxiv.org/pdf/2211.04325) (often considered to be the entire internet, 130 trillion tokens) in just under 6.5 hours!
+
+This example uses the train sample from [this dataset](https://huggingface.co/datasets/stanford-cs336/owt-sample), and the CLI by default subsets to the first 100MB of the file for validation and comparison with HF.
+You can see help for these flags with `uvx gigatoken bench --help`.
+You might need to run your commands twice on macOS to get a good reading, since the first run will always perform a security scan, which will slow down the Rust code.
+
+
+### Q: I've found a mismatch/slow use-case, is this expected?
+Most likely not! Despite reasonably wide testing I don't have every use-case on hand, so please report anything you find in a [GitHub Issue](https://github.com/marcelroed/gigatoken/issues) so I can address it as soon as possible.
+
+
+<!--
+## How does Gigatoken work?
+
+Gigatoken came from a few observations:
+* A majority of the time in current tokenizers is spent on pretokenization -> 
+
+Gigatoken implements pretokenizers that run at >2GB/s/thread
+
+Gigatoken is faster than other libraries due to algorithmic and systems changes.
+One key benefit of using Gigatoken is that it replaces the regex expression used by almost all tokenizers to do pre-tokenization with a custom implementation of the exact same method.
+This is a serious bottleneck for other implementations, and is a big part in this library's breakneck speeds.
+Additionally, Gigatoken uses concurrent data structures to use multiprocessing in more places.
+\* All reference speeds in this section are measured on an M4 Pro CPU
+-->
+
 
 ## Citation
 If you use Gigatoken in your research, please cite it as:
