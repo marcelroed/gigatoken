@@ -146,6 +146,32 @@ def olmo3_tokenizer_path() -> Path:
     return _hf_tokenizer_json("allenai/Olmo-3-1025-7B")
 
 
+@pytest.fixture(scope="session")
+def nemotron_right_aligned_tokenizer_path(tmp_path_factory) -> Path:
+    """Nemotron 3 with the right-aligned digit-group regex (issue #60), plus
+    every 2- and 3-digit string as a token: Nemotron's own vocab has single
+    digits only, so without them a grouping bug would not change the ids."""
+    path = _hf_tokenizer_json("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    tok = json.loads(path.read_text())
+    split = tok["pre_tokenizer"]["pretokenizers"][0]["pattern"]
+    right_aligned = split["Regex"].replace(
+        r"|\p{N}|", r"|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}|"
+    )
+    assert right_aligned != split["Regex"]
+    split["Regex"] = right_aligned
+    model = tok["model"]
+    next_id = 1 + max(*model["vocab"].values(), *(t["id"] for t in tok["added_tokens"]))
+    for n in (2, 3):
+        for i in range(10**n):
+            digits = str(i).zfill(n)
+            model["vocab"][digits] = next_id
+            model["merges"].append([digits[:-1], digits[-1]])
+            next_id += 1
+    out = tmp_path_factory.mktemp("nemotron_right_aligned") / "tokenizer.json"
+    out.write_text(json.dumps(tok, ensure_ascii=False))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # GPT-2 byte <-> unicode helpers (reused by test_bpe_train_compare, etc.)
 # The canonical Python copy of the table lives in gigatoken._hf_compat.

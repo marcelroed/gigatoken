@@ -23,7 +23,7 @@ pub mod r50k;
 pub use cl100k::FastCl100kPretokenizer;
 pub use deepseek_v3::FastDeepSeekV3Pretokenizer;
 pub use kimi::FastKimiPretokenizer;
-pub use nemotron::FastNemotronPretokenizer;
+pub use nemotron::{FastNemotronPretokenizer, FastNemotronRightAlignedPretokenizer};
 pub use o200k::FastO200kPretokenizer;
 pub use olmo3::FastOlmo3Pretokenizer;
 pub use qwen2::FastQwen2Pretokenizer;

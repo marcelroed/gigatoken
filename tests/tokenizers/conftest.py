@@ -51,6 +51,7 @@ TOKENIZER_SPECS = {
         TokenizerSpec(name="glm5_2", eot_text="<|endoftext|>", eot_id=154820),
         TokenizerSpec(name="deepseek_v3", eot_text="<｜end▁of▁sentence｜>", eot_id=1),
         TokenizerSpec(name="deepseek_v4", eot_text="<｜end▁of▁sentence｜>", eot_id=1),
+        TokenizerSpec(name="nemotron_right_aligned", eot_text="</s>", eot_id=2),
     ]
 }
 

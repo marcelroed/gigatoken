@@ -155,7 +155,8 @@ class BPETokenizer:
     def from_tiktoken(path: str | Path, pretokenizer: str, special_tokens: dict[str, int] | None = None) -> "BPETokenizer":
         """Load from a .tiktoken rank file with the named pretokenizer scheme
         ("gpt2", "gpt4", "qwen2", "qwen35", "olmo3", "deepseek_v3", "o200k",
-        "nemotron", or "kimi") and, optionally, the encoding's special tokens
+        "nemotron", "nemotron_right_aligned", or "kimi") and, optionally, the
+        encoding's special tokens
         as {content: id}. The file carries neither, so both are the caller's
         to supply — see `gigatoken.Tokenizer.from_tiktoken`, which knows them
         for the encodings OpenAI publishes."""
