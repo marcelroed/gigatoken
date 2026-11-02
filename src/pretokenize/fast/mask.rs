@@ -566,6 +566,23 @@ pub(crate) fn digit_run_splits3(d: u64) -> u64 {
     b
 }
 
+/// [`digit_run_splits3`] mirrored for right-aligned groups of three: each
+/// run's last digit marks a group end, re-armed 3 back while the run
+/// continues; a group starts after every group end but the run's last,
+/// and at the run start. Exact for runs that end inside the batch.
+#[inline(always)]
+pub(crate) fn digit_run_splits3_right(d: u64) -> u64 {
+    let mut e = d & !(d >> 1); // run ends (last digits)
+    let mut c = d & (d << 1) & (d << 2) & (d << 3); // p-3..p all digits
+    let mut sh = 3u32;
+    while sh < 64 {
+        e |= (e & c) >> sh;
+        c &= c << sh;
+        sh <<= 1;
+    }
+    ((e & (d >> 1)) << 1) | (d & !(d << 1))
+}
+
 // -----------------------------------------------------------------------
 // The batch walker
 // -----------------------------------------------------------------------

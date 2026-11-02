@@ -1,8 +1,8 @@
 use crate::pretokenize::Pretoken;
 use crate::pretokenize::fast::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastKimiPretokenizer,
-    FastNemotronPretokenizer, FastO200kPretokenizer, FastOlmo3Pretokenizer,
-    FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
+    FastNemotronPretokenizer, FastNemotronRightAlignedPretokenizer, FastO200kPretokenizer,
+    FastOlmo3Pretokenizer, FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
 };
 
 /// Which pretokenization scheme (regex) a tokenizer uses.
@@ -16,6 +16,7 @@ pub enum PretokenizerType {
     DeepSeekV3, // Sequence of three Splits (digits, CJK, main); used by DeepSeek V3/V3.1/V4
     O200k,      // o200k_base: case-structured letter runs; GPT-4o, gpt-oss
     Nemotron,   // o200k without contractions, single-digit \p{N}; nvidia Nemotron-3
+    NemotronRightAligned, // Nemotron with right-aligned \p{N} groups of three ("1|234|567")
     Kimi,       // o200k with [\p{Han}]+ runs and no `/` tail absorption; moonshotai Kimi-K2 line
 }
 
@@ -60,6 +61,9 @@ impl PretokenizerType {
             PretokenizerType::Nemotron => {
                 FastPretokenizerDispatch::Nemotron(FastNemotronPretokenizer::new(bytes))
             }
+            PretokenizerType::NemotronRightAligned => FastPretokenizerDispatch::NemotronRightAligned(
+                FastNemotronRightAlignedPretokenizer::new(bytes),
+            ),
             PretokenizerType::Kimi => {
                 FastPretokenizerDispatch::Kimi(FastKimiPretokenizer::new(bytes))
             }
@@ -69,7 +73,7 @@ impl PretokenizerType {
     /// The canonical name of each variant, in variant order — the
     /// identifiers `from_name` accepts (plus the aliases listed there).
     /// Error messages naming the valid schemes derive from this list.
-    pub const NAMES: [&'static str; 9] = [
+    pub const NAMES: [&'static str; 10] = [
         "gpt2",
         "gpt4",
         "qwen2",
@@ -78,6 +82,7 @@ impl PretokenizerType {
         "deepseek_v3",
         "o200k",
         "nemotron",
+        "nemotron_right_aligned",
         "kimi",
     ];
 
@@ -95,6 +100,7 @@ impl PretokenizerType {
             "deepseek_v3" => PretokenizerType::DeepSeekV3,
             "o200k" => PretokenizerType::O200k,
             "nemotron" => PretokenizerType::Nemotron,
+            "nemotron_right_aligned" => PretokenizerType::NemotronRightAligned,
             "kimi" => PretokenizerType::Kimi,
             _ => return None,
         })
@@ -137,6 +143,9 @@ impl PretokenizerType {
             r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+" => {
                 Some(PretokenizerType::Nemotron)
             }
+            r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+" => {
+                Some(PretokenizerType::NemotronRightAligned)
+            }
             _ => None,
         }
     }
@@ -153,6 +162,7 @@ pub enum FastPretokenizerDispatch<'a> {
     DeepSeekV3(FastDeepSeekV3Pretokenizer<'a>),
     O200k(FastO200kPretokenizer<'a>),
     Nemotron(FastNemotronPretokenizer<'a>),
+    NemotronRightAligned(FastNemotronRightAlignedPretokenizer<'a>),
     Kimi(FastKimiPretokenizer<'a>),
 }
 
@@ -170,6 +180,7 @@ impl<'a> Iterator for FastPretokenizerDispatch<'a> {
             FastPretokenizerDispatch::DeepSeekV3(it) => it.next(),
             FastPretokenizerDispatch::O200k(it) => it.next(),
             FastPretokenizerDispatch::Nemotron(it) => it.next(),
+            FastPretokenizerDispatch::NemotronRightAligned(it) => it.next(),
             FastPretokenizerDispatch::Kimi(it) => it.next(),
         }
     }
@@ -196,6 +207,9 @@ unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispat
             FastPretokenizerDispatch::DeepSeekV3(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::O200k(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::Nemotron(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::NemotronRightAligned(it) => {
+                it.fill_spans_keyed(batch, prefetch)
+            }
             FastPretokenizerDispatch::Kimi(it) => it.fill_spans_keyed(batch, prefetch),
         }
     }

@@ -1948,6 +1948,7 @@ mod tests {
             PretokenizerType::DeepSeekV3,
             PretokenizerType::O200k,
             PretokenizerType::Nemotron,
+            PretokenizerType::NemotronRightAligned,
             PretokenizerType::Kimi,
         ];
         let input = "Hello, 世界! café 12345\r\ncan't  stop".as_bytes();

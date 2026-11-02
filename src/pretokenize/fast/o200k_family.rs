@@ -1,15 +1,15 @@
 //! Shared implementation for the o200k regex family: o200k_base (GPT-4o,
-//! gpt-oss), the Nemotron-3 variant, and the Kimi (moonshotai K2) variant.
+//! gpt-oss), the Nemotron-3 variants, and the Kimi (moonshotai K2) variant.
 //! Their patterns share the shape
 //!
 //! `HAN-RUN?|
 //!  [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+SUF?|
 //!  [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*SUF?|
-//!  \p{N}{1,3} or \p{N}| ?[^\s\p{L}\p{N}]+TAIL|\s*[\r\n]+|\s+(?!\S)|\s+`
+//!  DIGITS| ?[^\s\p{L}\p{N}]+TAIL|\s*[\r\n]+|\s+(?!\S)|\s+`
 //!
 //! where `SUF = (?i:'s|'t|'re|'ve|'m|'ll|'d)` exists in o200k and Kimi
-//! (`CONTRACTIONS`), the digit group is `\p{N}{1,3}` for o200k/Kimi vs
-//! `\p{N}` for Nemotron (`DIGITS3`), the absorbed punct tail `TAIL` is
+//! (`CONTRACTIONS`), the digit group `DIGITS` is one of [`DIGITS_1`],
+//! [`DIGITS_3`] or [`DIGITS_3_RIGHT`], the absorbed punct tail `TAIL` is
 //! `[\r\n/]*` for o200k/Nemotron vs `[\r\n]*` for Kimi (`SLASH`), and Kimi
 //! alone (`HAN`) prepends a `[\p{Han}]+` alternative while intersecting
 //! both letter brackets with `[^\p{Han}]` — Han chars form their own runs
@@ -52,6 +52,17 @@
 use super::mask::{self, AsciiMasks};
 use super::{decode_cp, is_ascii_ws, is_digit, is_letter, scan_numbers_max3};
 use crate::pretokenize::unicode::{O200kCharClass, kimi_class_of, o200k_class_of};
+
+/// `DIGITS` = `\p{N}`: every number char is its own token (Nemotron-3).
+pub(crate) const DIGITS_1: u8 = 0;
+/// `DIGITS` = `\p{N}{1,3}`: runs split into groups of three from the left
+/// (o200k, Kimi).
+pub(crate) const DIGITS_3: u8 = 1;
+/// `DIGITS` = `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}`: groups of
+/// three counted back from the run's end, so "1234567" is `1|234|567`
+/// (the right-aligned Nemotron variant). The first alternative matches
+/// at every position of a run, so `\p{N}{1,2}` never applies.
+pub(crate) const DIGITS_3_RIGHT: u8 = 2;
 
 #[inline(always)]
 fn is_upper_ascii(b: u8) -> bool {
@@ -308,14 +319,54 @@ fn ws_token_end(bytes: &[u8], start: usize) -> usize {
     p // `\s+`: single whitespace char before content
 }
 
-/// `\p{N}{1,3}` or `\p{N}` starting at a digit char ending at `first_end`.
+/// The `DIGITS` token starting at `pos`, a number char ending at
+/// `first_end`.
 #[inline(always)]
-fn digit_token_end<const DIGITS3: bool>(bytes: &[u8], first_end: usize) -> usize {
-    if DIGITS3 {
-        scan_numbers_max3(bytes, first_end, 1)
-    } else {
-        first_end
+fn digit_token_end<const DIGITS: u8>(bytes: &[u8], pos: usize, first_end: usize) -> usize {
+    match DIGITS {
+        DIGITS_1 => first_end,
+        DIGITS_3 => scan_numbers_max3(bytes, first_end, 1),
+        _ => right_aligned_digit_end(bytes, pos, first_end),
     }
+}
+
+/// End of the number char at `pos`, if one starts there.
+#[inline(always)]
+fn number_end(bytes: &[u8], pos: usize) -> Option<usize> {
+    let &b = bytes.get(pos)?;
+    if b < 0x80 {
+        return is_digit(b).then_some(pos + 1);
+    }
+    // SAFETY: pos < len and bytes[pos] >= 0x80.
+    let (cp, l) = unsafe { decode_cp(bytes, pos) };
+    (o200k_class_of(cp) == O200kCharClass::Number).then_some(pos + l)
+}
+
+/// [`DIGITS_3_RIGHT`]: at a run start, count the run and take its length
+/// mod 3 (3 when divisible). Every later token of the run starts with a
+/// whole number of groups left, so mid-run (`pos` right after a number
+/// char) it takes 3 without counting, keeping long runs linear.
+fn right_aligned_digit_end(bytes: &[u8], pos: usize, first_end: usize) -> usize {
+    let mid_run = pos > 0 && {
+        // Back up over at most 3 continuation bytes to the char before pos.
+        let mut j = pos - 1;
+        while j > 0 && pos - j < 4 && bytes[j] & 0xC0 == 0x80 {
+            j -= 1;
+        }
+        number_end(bytes, j) == Some(pos)
+    };
+    let limit = if mid_run { 3 } else { usize::MAX };
+    let mut ends = [first_end; 3]; // the end after 1, 2 and 3 chars
+    let (mut n, mut p) = (1, first_end);
+    while n < limit
+        && let Some(q) = number_end(bytes, p)
+    {
+        if n < 3 {
+            ends[n] = q;
+        }
+        (n, p) = (n + 1, q);
+    }
+    ends[(n - 1) % 3]
 }
 
 /// Advance past one token starting at `pos`. Returns the new position.
@@ -323,7 +374,7 @@ fn digit_token_end<const DIGITS3: bool>(bytes: &[u8], first_end: usize) -> usize
 #[inline(always)]
 pub(crate) fn advance_pos<
     const CONTRACTIONS: bool,
-    const DIGITS3: bool,
+    const DIGITS: u8,
     const SLASH: bool,
     const HAN: bool,
 >(
@@ -408,7 +459,7 @@ pub(crate) fn advance_pos<
                 bytes,
                 scan_case_run::<HAN>(bytes, p0, CaseState::U { last_cl_end: p0 }),
             ),
-            O200kCharClass::Number => digit_token_end::<DIGITS3>(bytes, p0),
+            O200kCharClass::Number => digit_token_end::<DIGITS>(bytes, pos, p0),
             // Any non-letter/number char except \r\n may prefix a run
             class => {
                 if let Some((e, st)) = letter_run_first::<HAN>(bytes, p0) {
@@ -425,7 +476,7 @@ pub(crate) fn advance_pos<
 
     // ASCII digit
     if is_digit(b0) {
-        return digit_token_end::<DIGITS3>(bytes, pos + 1);
+        return digit_token_end::<DIGITS>(bytes, pos, pos + 1);
     }
 
     // \r and \n are excluded from the letter-run prefix
@@ -465,6 +516,21 @@ fn smear_up(seed: u64, within: u64) -> u64 {
     while sh < 64 {
         a |= (a << sh) & m;
         m &= m << sh;
+        sh <<= 1;
+    }
+    a
+}
+
+/// [`smear_up`] toward lower bits.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn smear_down(seed: u64, within: u64) -> u64 {
+    let mut a = seed;
+    let mut m = within;
+    let mut sh = 1u32;
+    while sh < 64 {
+        a |= (a >> sh) & m;
+        m &= m >> sh;
         sh <<= 1;
     }
     a
@@ -828,7 +894,7 @@ struct OAsciiExtra {
 #[inline(never)]
 fn o200k_extended_masks<
     const CONTRACTIONS: bool,
-    const DIGITS3: bool,
+    const DIGITS: u8,
     const SLASH: bool,
     const HAN: bool,
 >(
@@ -1002,7 +1068,7 @@ fn o200k_extended_masks<
     uni.mk |= cl.mk;
     uni.han |= cl.han;
 
-    o200k_algebra::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax, cr, uni)
+    o200k_algebra::<CONTRACTIONS, DIGITS, SLASH, HAN>(bytes, scan, am, ax, cr, uni)
 }
 
 /// The o200k family's shared u64 boundary algebra over per-byte class
@@ -1013,7 +1079,7 @@ fn o200k_extended_masks<
 #[inline(always)]
 fn o200k_algebra<
     const CONTRACTIONS: bool,
-    const DIGITS3: bool,
+    const DIGITS: u8,
     const SLASH: bool,
     const HAN: bool,
 >(
@@ -1084,9 +1150,13 @@ fn o200k_algebra<
     let b_letters =
         (lb & !contm & !p_l & !p_s & !p_wt & !absorb) | b_su;
 
-    // --- Digits: `\p{N}{1,3}` or `\p{N}` -------------------------------------
-    let b_digits = if DIGITS3 && am.d & (am.d >> 1) != 0 {
-        mask::digit_run_splits3(am.d)
+    // --- Digits (`DIGITS`) ---------------------------------------------------
+    let b_digits = if DIGITS != DIGITS_1 && am.d & (am.d >> 1) != 0 {
+        if DIGITS == DIGITS_3_RIGHT {
+            mask::digit_run_splits3_right(am.d)
+        } else {
+            mask::digit_run_splits3(am.d)
+        }
     } else {
         am.d
     };
@@ -1142,11 +1212,19 @@ fn o200k_algebra<
     }
 
     // A digit run whose `\p{N}{1,3}` phase did not start inside this batch
-    // (continuation from before it, or after a bad zone) defers.
-    if DIGITS3 {
+    // (continuation from before it, or after a bad zone) defers; so does
+    // a right-aligned run whose end the batch can't see (touching the
+    // batch end or a bad zone, e.g. a non-ASCII digit).
+    if DIGITS != DIGITS_1 {
         let seed = (am.d & (bad << 1)) | (am.d & pd);
         if seed != 0 {
             bad |= smear_up(seed, am.d);
+        }
+    }
+    if DIGITS == DIGITS_3_RIGHT {
+        let seed = am.d & ((bad >> 1) | 1 << 63);
+        if seed != 0 {
+            bad |= smear_down(seed, am.d);
         }
     }
 
@@ -1291,7 +1369,7 @@ fn ascii_batch_carries<const SLASH: bool, const HAN: bool>(bytes: &[u8], scan: u
 #[inline]
 pub(crate) fn batch_masks<
     const CONTRACTIONS: bool,
-    const DIGITS3: bool,
+    const DIGITS: u8,
     const SLASH: bool,
     const HAN: bool,
 >(
@@ -1383,11 +1461,11 @@ pub(crate) fn batch_masks<
         {
             let mut am = am;
             am.hi = mask::movemask64(hiv[0], hiv[1], hiv[2], hiv[3]);
-            return o200k_extended_masks::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax);
+            return o200k_extended_masks::<CONTRACTIONS, DIGITS, SLASH, HAN>(bytes, scan, am, ax);
         }
 
         let cr = ascii_batch_carries::<SLASH, HAN>(bytes, scan);
-        o200k_algebra::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax, cr, OUni::default())
+        o200k_algebra::<CONTRACTIONS, DIGITS, SLASH, HAN>(bytes, scan, am, ax, cr, OUni::default())
     }
 }
 
@@ -1409,7 +1487,7 @@ pub(crate) fn batch_masks<
 pub(crate) unsafe fn batch_masks_x86<
     const AVX512: bool,
     const CONTRACTIONS: bool,
-    const DIGITS3: bool,
+    const DIGITS: u8,
     const SLASH: bool,
     const HAN: bool,
 >(
@@ -1434,11 +1512,11 @@ pub(crate) unsafe fn batch_masks_x86<
         // SAFETY: both detected tiers include the BMI1/BMI2/LZCNT/POPCNT
         // bit features `o200k_extended_masks` re-declares (fn contract).
         return unsafe {
-            o200k_extended_masks::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax)
+            o200k_extended_masks::<CONTRACTIONS, DIGITS, SLASH, HAN>(bytes, scan, am, ax)
         };
     }
     let cr = ascii_batch_carries::<SLASH, HAN>(bytes, scan);
-    o200k_algebra::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax, cr, OUni::default())
+    o200k_algebra::<CONTRACTIONS, DIGITS, SLASH, HAN>(bytes, scan, am, ax, cr, OUni::default())
 }
 
 /// The strict-uppercase and slash masks for `bytes[scan..scan+64]`,
@@ -1494,8 +1572,12 @@ fn ascii_extra_avx2(bytes: &[u8], scan: usize) -> OAsciiExtra {
 mod tests {
     use crate::pretokenize::fast::kimi::KimiScheme;
     use crate::pretokenize::fast::mask::{MaskScheme, MaskState};
+    use super::{DIGITS_1, DIGITS_3_RIGHT};
     use crate::pretokenize::fast::nemotron::NemotronScheme;
     use crate::pretokenize::fast::o200k::O200kScheme;
+
+    type Nemotron = NemotronScheme<DIGITS_1>;
+    type NemotronRight = NemotronScheme<DIGITS_3_RIGHT>;
 
     fn scalar_tokens<S: MaskScheme>(bytes: &[u8]) -> Vec<Vec<u8>> {
         let mut pos = 0;
@@ -1522,7 +1604,12 @@ mod tests {
     fn check_all(buf: &[u8]) {
         for (name, a, b) in [
             ("o200k", scalar_tokens::<O200kScheme>(buf), mask_tokens::<O200kScheme>(buf)),
-            ("nemotron", scalar_tokens::<NemotronScheme>(buf), mask_tokens::<NemotronScheme>(buf)),
+            ("nemotron", scalar_tokens::<Nemotron>(buf), mask_tokens::<Nemotron>(buf)),
+            (
+                "nemotron_right_aligned",
+                scalar_tokens::<NemotronRight>(buf),
+                mask_tokens::<NemotronRight>(buf),
+            ),
             ("kimi", scalar_tokens::<KimiScheme>(buf), mask_tokens::<KimiScheme>(buf)),
         ] {
             if a != b {
@@ -1574,10 +1661,11 @@ mod tests {
         let mut report = format!("(len {}) {:?}", buf.len(), String::from_utf8_lossy(&buf));
         for (name, a, b) in [
             ("o200k", scalar_tokens::<O200kScheme>(&buf), mask_tokens::<O200kScheme>(&buf)),
+            ("nemotron", scalar_tokens::<Nemotron>(&buf), mask_tokens::<Nemotron>(&buf)),
             (
-                "nemotron",
-                scalar_tokens::<NemotronScheme>(&buf),
-                mask_tokens::<NemotronScheme>(&buf),
+                "nemotron_right_aligned",
+                scalar_tokens::<NemotronRight>(&buf),
+                mask_tokens::<NemotronRight>(&buf),
             ),
             ("kimi", scalar_tokens::<KimiScheme>(&buf), mask_tokens::<KimiScheme>(&buf)),
         ] {
@@ -1611,6 +1699,8 @@ mod tests {
             "price: $5.99! 100,000.00 3.14159 2nd 3rd 4th",
             "a\u{2028}b a\u{2028}\n \n\n\t x \n\n ",
             "mixed 1\u{662}3x \u{661}\u{662}\u{663} arabic",
+            "1234567890123456789012345678901234567890123456789012345678901234567890 12",
+            "x 12345678\u{661}12345678 \u{ff11}\u{ff12}\u{ff13}\u{ff14} 1\u{301}234",
             "\u{65e5}\u{672c}\u{8a9e}ABC abc\u{65e5}\u{672c}Def \u{416}\u{416}dz",
             "e\u{301}f !!\u{301}x '\u{301}s x\u{301}'s A\u{301}B",
             // A mark's contextual class reaching a boundary past the ±4
@@ -1629,7 +1719,7 @@ mod tests {
         }
     }
 
-    /// Differential fuzz across both family schemes.
+    /// Differential fuzz across all family schemes.
     #[test]
     fn o200k_family_mask_matches_scalar_fuzz() {
         let pieces: &[&str] = &[
@@ -1644,6 +1734,8 @@ mod tests {
             // Han classes (Kimi): letters, numerals (Nl), symbols (So/Mc)
             "中", "中文", "々", "〆", "𠀀", "〇", "〡", "㆒", "⼀", "⺀",
             "\u{16FF0}", "中's", "1〇", "中\n", "!⼀", "中⼀",
+            // Digit runs of every length mod 3, mixed-script runs
+            "123", "12345", "1234567890", "٣٤٥", "1٢3", "１２",
         ];
         let mut state = 0x243F6A8885A308D3u64;
         let mut rng = move || {
@@ -1674,8 +1766,12 @@ mod tests {
 mod owt_tests {
     use crate::pretokenize::fast::kimi::KimiScheme;
     use crate::pretokenize::fast::mask::{MaskScheme, MaskState};
+    use super::{DIGITS_1, DIGITS_3_RIGHT};
     use crate::pretokenize::fast::nemotron::NemotronScheme;
     use crate::pretokenize::fast::o200k::O200kScheme;
+
+    type Nemotron = NemotronScheme<DIGITS_1>;
+    type NemotronRight = NemotronScheme<DIGITS_3_RIGHT>;
 
     fn check_streaming<S: MaskScheme>(bytes: &[u8], scheme: &str) {
         let mut st = MaskState::new(0);
@@ -1702,7 +1798,8 @@ mod owt_tests {
 
     fn check_streaming_all(bytes: &[u8]) {
         check_streaming::<O200kScheme>(bytes, "o200k");
-        check_streaming::<NemotronScheme>(bytes, "nemotron");
+        check_streaming::<Nemotron>(bytes, "nemotron");
+        check_streaming::<NemotronRight>(bytes, "nemotron_right_aligned");
         check_streaming::<KimiScheme>(bytes, "kimi");
     }
 
@@ -1721,7 +1818,7 @@ mod owt_tests {
         check_streaming_all(&input);
     }
 
-    /// Full-OWT (~12 GB) mask-vs-scalar differential for both schemes.
+    /// Full-OWT (~12 GB) mask-vs-scalar differential for all schemes.
     #[test]
     #[ignore = "reads the full ~12 GB OWT file"]
     fn o200k_family_mask_matches_scalar_owt_full() {
